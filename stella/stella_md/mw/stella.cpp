@@ -136,6 +136,8 @@ int Robot_Fault_Checking_RESET()
         FunctionMotorControlSystem(RESET_CONTROLLE);
         return 1;
     }
+
+    return 0;
 }
 
 int Robot_Setting(int choice)

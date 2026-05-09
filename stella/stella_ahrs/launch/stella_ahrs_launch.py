@@ -41,11 +41,14 @@ def generate_launch_description():
                                 name='stella_ahrs_node',
                                 output='screen',
                                 emulate_tty=True,
+                                parameters=[{
+                                    'read_rate_hz': 200,
+                                    'publish_rate_hz': 50,
+                                }],
                                 namespace='/',
                                 )
 
     return LaunchDescription([
       driver_node,
     ])
-
 

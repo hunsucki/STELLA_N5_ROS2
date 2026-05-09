@@ -28,6 +28,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     package_share_dir = get_package_share_directory('stella_bringup')
     param_file_path = os.path.join(package_share_dir, 'param', 'robot_launch_param.yaml')
+    realsense_config_file_path = os.path.join(package_share_dir, 'param', 'realsense_apriltag.yaml')
     
     # Get parameter from YAML
     with open(param_file_path, 'r') as f:
@@ -39,6 +40,7 @@ def generate_launch_description():
     launch_pointcloud = param.get('launch_pointcloud', False)
     launch_pointcloud_laserscan_filter = param.get('launch_pointcloud_laserscan_filter', False)
     launch_hailo = param.get('launch_hailo', False)
+    launch_linear_motor = param.get('launch_linear_motor', True)
 
     md_pkg_dir = LaunchConfiguration(
         'md_pkg_dir',
@@ -122,18 +124,27 @@ def generate_launch_description():
         # Default realsense launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([depth_pkg_dir, '/rs_launch.py']),
+            launch_arguments={
+                'config_file': realsense_config_file_path,
+            }.items(),
             condition=IfCondition('true' if (launch_realsense and not launch_pointcloud and not launch_hailo) else 'false')
         ),
 
         # Pointcloud realsense launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([depth_pkg_dir, '/pc_rs_launch.py']),
+            launch_arguments={
+                'config_file': realsense_config_file_path,
+            }.items(),
             condition=IfCondition('true' if (launch_realsense and launch_pointcloud and not launch_hailo) else 'false')
         ),
 
         # Hailo realsense launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([depth_pkg_dir, '/hailo_rs_launch.py']),
+            launch_arguments={
+                'config_file': realsense_config_file_path,
+            }.items(),
             condition=IfCondition('true' if (launch_realsense and not launch_pointcloud and launch_hailo) else 'false')
         ),
 
@@ -185,5 +196,13 @@ def generate_launch_description():
             condition=IfCondition('true' if (launch_realsense and not launch_pointcloud and launch_hailo) else 'false')
         ),
 
-    ])
+        # Linear motor control node
+        Node(
+            package='linear_motor',       
+            executable='linear_motor_node', # setup.py에 등록한 이름
+            name='linear_motor_node',
+            output='screen',
+            condition=IfCondition('true' if launch_linear_motor else 'false')
+        ),
 
+    ])

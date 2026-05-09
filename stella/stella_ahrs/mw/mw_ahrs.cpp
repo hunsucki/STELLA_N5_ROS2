@@ -1,23 +1,30 @@
 #include "mw_ahrs.hpp"
 #include "mw_ahrsX1_def.hpp"
 
-static bool AHRS = false;
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
+
+static std::atomic_bool AHRS{false};
+static std::mutex imu_msg_mutex;
 
 namespace ntrex
 {
   void MwAhrsRosDriver::StartReading()
   {
-    AHRS = true;
+    AHRS.store(true);
     sleep(1);
     reading_thread_ = std::thread(&MwAhrsRosDriver::MwAhrsRead, this);
   }
 
   void MwAhrsRosDriver::StopReading()
   {
-    if (AHRS)
+    if (AHRS.load())
     {
-      AHRS = false;
+      AHRS.store(false);
       sleep(1);
+
       if (reading_thread_.joinable())
       {
         reading_thread_.join();
@@ -27,14 +34,20 @@ namespace ntrex
 
   void MwAhrsRosDriver::StartPubing()
   {
-    if (AHRS)
+    if (AHRS.load())
+    {
       publisher_thread_ = std::thread(&MwAhrsRosDriver::publish_topic, this);
+    }
   }
 
   void MwAhrsRosDriver::StopPubing()
   {
+    AHRS.store(false);
+
     if (publisher_thread_.joinable())
+    {
       publisher_thread_.join();
+    }
   }
 
   void MwAhrsRosDriver::MW_AHRS_Covariance(void)
@@ -77,93 +90,131 @@ namespace ntrex
   }
 
   void MwAhrsRosDriver::MwAhrsRead()
+{
+  int read_rate_hz = 200;
+  this->get_parameter("read_rate_hz", read_rate_hz);
+
+  if (read_rate_hz <= 0)
   {
-    while (AHRS)
+    read_rate_hz = 200;
+  }
+
+  rclcpp::WallRate read_rate(read_rate_hz);
+
+  while (rclcpp::ok() && AHRS.load())
+  {
+    unsigned char data[8];
+
+    if (MW_AHRS_Read(data))
     {
-      unsigned char data[8];
+      std::lock_guard<std::mutex> lock(imu_msg_mutex);
 
-      if (MW_AHRS_Read(data))
+      switch ((int)(unsigned char)data[1])
       {
-        switch ((int)(unsigned char)data[1])
-        {
-        case ACC:
-          acc_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 1000.0;
-          acc_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 1000.0;
-          acc_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 1000.0;
+      case ACC:
+        acc_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 1000.0;
+        acc_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 1000.0;
+        acc_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 1000.0;
 
-          imu_data_raw_msg.linear_acceleration.x = imu_data_msg.linear_acceleration.x =
-              acc_value[0] * convertor_g2a;
-          imu_data_raw_msg.linear_acceleration.y = imu_data_msg.linear_acceleration.y =
-              acc_value[1] * convertor_g2a;
-          imu_data_raw_msg.linear_acceleration.z = imu_data_msg.linear_acceleration.z =
-              acc_value[2] * convertor_g2a;
+        imu_data_raw_msg.linear_acceleration.x = imu_data_msg.linear_acceleration.x =
+            acc_value[0] * convertor_g2a;
+        imu_data_raw_msg.linear_acceleration.y = imu_data_msg.linear_acceleration.y =
+            acc_value[1] * convertor_g2a;
+        imu_data_raw_msg.linear_acceleration.z = imu_data_msg.linear_acceleration.z =
+            acc_value[2] * convertor_g2a;
+        break;
 
-          break;
+      case GYO:
+        gyr_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
+        gyr_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
+        gyr_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
 
-        case GYO:
-          gyr_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
-          gyr_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
-          gyr_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
+        imu_data_raw_msg.angular_velocity.x = imu_data_msg.angular_velocity.x =
+            gyr_value[0] * convertor_d2r;
+        imu_data_raw_msg.angular_velocity.y = imu_data_msg.angular_velocity.y =
+            gyr_value[1] * convertor_d2r;
+        imu_data_raw_msg.angular_velocity.z = imu_data_msg.angular_velocity.z =
+            gyr_value[2] * convertor_d2r;
+        break;
 
-          imu_data_raw_msg.angular_velocity.x = imu_data_msg.angular_velocity.x =
-              gyr_value[0] * convertor_d2r;
-          imu_data_raw_msg.angular_velocity.y = imu_data_msg.angular_velocity.y =
-              gyr_value[1] * convertor_d2r;
-          imu_data_raw_msg.angular_velocity.z = imu_data_msg.angular_velocity.z =
-              gyr_value[2] * convertor_d2r;
+      case DEG:
+        deg_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 100.0;
+        deg_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 100.0;
+        deg_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 100.0;
 
-          break;
+        roll = deg_value[0] * convertor_d2r;
+        pitch = deg_value[1] * convertor_d2r;
+        yaw = deg_value[2] * convertor_d2r;
 
-        case DEG:
-          deg_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 100.0;
-          deg_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 100.0;
-          deg_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 100.0;
+        tf_orientation = Euler2Quaternion(roll, pitch, yaw);
 
-          roll = deg_value[0] * convertor_d2r;
-          pitch = mag_value[1] * convertor_d2r;
-          yaw = deg_value[2] * convertor_d2r;
+        imu_yaw_msg.data = deg_value[2];
 
-          tf_orientation = Euler2Quaternion(roll, pitch, yaw);
+        imu_data_msg.orientation.x = tf_orientation.x();
+        imu_data_msg.orientation.y = tf_orientation.y();
+        imu_data_msg.orientation.z = tf_orientation.z();
+        imu_data_msg.orientation.w = tf_orientation.w();
+        break;
 
-          imu_yaw_msg.data = deg_value[2];
+      case MAG:
+        mag_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
+        mag_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
+        mag_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
 
-          imu_data_msg.orientation.x = tf_orientation.x();
-          imu_data_msg.orientation.y = tf_orientation.y();
-          imu_data_msg.orientation.z = tf_orientation.z();
-          imu_data_msg.orientation.w = tf_orientation.w();
-
-          break;
-
-        case MAG:
-          mag_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
-          mag_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
-          mag_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
-
-          imu_magnetic_msg.magnetic_field.x = mag_value[0] / convertor_ut2t;
-          imu_magnetic_msg.magnetic_field.y = mag_value[1] / convertor_ut2t;
-          imu_magnetic_msg.magnetic_field.z = mag_value[2] / convertor_ut2t;
-
-          break;
-        }
+        imu_magnetic_msg.magnetic_field.x = mag_value[0] / convertor_ut2t;
+        imu_magnetic_msg.magnetic_field.y = mag_value[1] / convertor_ut2t;
+        imu_magnetic_msg.magnetic_field.z = mag_value[2] / convertor_ut2t;
+        break;
       }
     }
+
+    read_rate.sleep();
   }
+}
 
   void MwAhrsRosDriver::publish_topic()
   {
-    rclcpp::Rate rate(1000);
+    int publish_rate_hz = 50;
 
-    while (rclcpp::ok() && AHRS)
+    this->get_parameter("publish_rate_hz", publish_rate_hz);
+
+    if (publish_rate_hz <= 0)
+    {
+      publish_rate_hz = 50;
+    }
+
+    rclcpp::Rate rate(publish_rate_hz);
+
+    while (rclcpp::ok() && AHRS.load())
     {
       rclcpp::Time now = this->get_clock()->now();
 
-      imu_data_raw_msg.header.stamp = imu_data_msg.header.stamp = imu_magnetic_msg.header.stamp = now;
-      imu_data_raw_msg.header.frame_id = imu_data_msg.header.frame_id = imu_magnetic_msg.header.frame_id = frame_id_;
+      sensor_msgs::msg::Imu imu_data_raw_copy;
+      sensor_msgs::msg::Imu imu_data_copy;
+      sensor_msgs::msg::MagneticField imu_magnetic_copy;
+      std_msgs::msg::Float64 imu_yaw_copy;
 
-      imu_data_raw_pub_->publish(std::move(imu_data_raw_msg));
-      imu_data_pub_->publish(std::move(imu_data_msg));
-      imu_mag_pub_->publish(std::move(imu_magnetic_msg));
-      imu_yaw_pub_->publish(std::move(imu_yaw_msg));
+      {
+        std::lock_guard<std::mutex> lock(imu_msg_mutex);
+
+        imu_data_raw_msg.header.stamp =
+            imu_data_msg.header.stamp =
+                imu_magnetic_msg.header.stamp = now;
+
+        imu_data_raw_msg.header.frame_id =
+            imu_data_msg.header.frame_id =
+                imu_magnetic_msg.header.frame_id = frame_id_;
+
+        imu_data_raw_copy = imu_data_raw_msg;
+        imu_data_copy = imu_data_msg;
+        imu_magnetic_copy = imu_magnetic_msg;
+        imu_yaw_copy = imu_yaw_msg;
+      }
+
+      imu_data_raw_pub_->publish(imu_data_raw_copy);
+      imu_data_pub_->publish(imu_data_copy);
+      imu_mag_pub_->publish(imu_magnetic_copy);
+      imu_yaw_pub_->publish(imu_yaw_copy);
 
       if (publish_tf_)
       {
@@ -174,10 +225,11 @@ namespace ntrex
         tf.transform.translation.x = 0.0;
         tf.transform.translation.y = 0.0;
         tf.transform.translation.z = 0.0;
-        tf.transform.rotation = imu_data_msg.orientation;
+        tf.transform.rotation = imu_data_copy.orientation;
 
         broadcaster_->sendTransform(tf);
       }
+
       rate.sleep();
     }
   }
@@ -203,7 +255,11 @@ namespace ntrex
 
     long product_id = 0, software_ver = 0, hardware_ver = 0, function_ver = 0;
 
-    long sync_port = CI_USB, sync_period = 10, sync_trmode = CI_Binary, sync_data = 15, FlashWrite = 1;
+    long sync_port = CI_USB;
+    long sync_period = 10;
+    long sync_trmode = CI_Binary;
+    long sync_data = 15;
+    long FlashWrite = 1;
 
     res &= MW_AHRS_GetValI(product_id,   CI_PRODUCT_ID);
     res &= MW_AHRS_GetValI(software_ver, CI_SW_VERSION);
@@ -221,7 +277,7 @@ namespace ntrex
     res &= MW_AHRS_SetValI(sync_data,   CI_SYNC_DATA);
     // res &= MW_AHRS_SetValI(FlashWrite,  CI_SYS_COMMAND);
 
-    // res &= MW_AHRS_NvicReset ();
+    // res &= MW_AHRS_NvicReset();
 
     return res;
   }
@@ -232,7 +288,10 @@ namespace ntrex
 
     res = MW_AHRS_Connect(port, baud_rate);
 
-    if(res) res = MW_AHRS_Setting();
+    if (res)
+    {
+      res = MW_AHRS_Setting();
+    }
 
     if (res)
     {
@@ -241,6 +300,10 @@ namespace ntrex
       this->declare_parameter("magnetic_field_stddev", 0.0);
       this->declare_parameter("orientation_stddev", 0.0);
 
+      this->declare_parameter("read_rate_hz", 200);
+      this->declare_parameter("publish_rate_hz", 50);
+      this->declare_parameter("read_idle_sleep_us", 1000);
+
       this->get_parameter("linear_acceleration_stddev", linear_acceleration_stddev_);
       this->get_parameter("angular_velocity_stddev", angular_velocity_stddev_);
       this->get_parameter("magnetic_field_stddev", magnetic_field_stddev_);
@@ -248,16 +311,16 @@ namespace ntrex
 
       MW_AHRS_Covariance();
 
-      StartReading();
-
-      auto qos = rclcpp::QoS(rclcpp::KeepLast(10)) .reliable() .durability_volatile();
+      auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
 
       imu_data_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", qos);
       imu_data_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", qos);
       imu_mag_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>("imu/mag", qos);
       imu_yaw_pub_ = this->create_publisher<std_msgs::msg::Float64>("imu/yaw", qos);
 
+      StartReading();
       StartPubing();
+
       RCLCPP_INFO(this->get_logger(), "MW-AHRS ROS Init Success");
     }
     else

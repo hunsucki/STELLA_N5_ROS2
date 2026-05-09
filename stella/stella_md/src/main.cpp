@@ -31,7 +31,15 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
   odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", qos);
   odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-  Serial_timer = this->create_wall_timer(1ms, std::bind(&stellaN5_node::serial_callback, this));
+  int monitoring_rate_hz = this->declare_parameter<int>("monitoring_rate_hz", 10);
+  if (monitoring_rate_hz <= 0)
+  {
+    monitoring_rate_hz = 10;
+  }
+
+  auto serial_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(1.0 / monitoring_rate_hz));
+  Serial_timer = this->create_wall_timer(serial_period, std::bind(&stellaN5_node::serial_callback, this));
 }
 
 stellaN5_node::~stellaN5_node()

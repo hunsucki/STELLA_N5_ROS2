@@ -1,6 +1,7 @@
 launch_lidar2: true
 launch_usb_cam: false
-launch_realsense: false
+launch_realsense: true
 launch_pointcloud: false
 launch_pointcloud_laserscan_filter: false
 launch_hailo: false
+launch_linear_motor: true

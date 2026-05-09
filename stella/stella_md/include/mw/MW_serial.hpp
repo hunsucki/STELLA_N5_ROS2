@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <iostream>
 
 int MW_Serial_Connect(char *portname_, uint32_t baudrate_);

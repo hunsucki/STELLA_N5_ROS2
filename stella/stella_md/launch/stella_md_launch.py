@@ -11,6 +11,9 @@ def generate_launch_description():
                                 name='stella_md_node',
                                 output='screen',
                                 emulate_tty=True,
+                                parameters=[{
+                                    'monitoring_rate_hz': 10,
+                                }],
                                 namespace='/',
                                 )
 
