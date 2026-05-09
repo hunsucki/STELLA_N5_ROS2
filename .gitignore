@@ -1,0 +1,29 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging/test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# ROS 2 / colcon artifacts
+build/
+install/
+log/
+.colcon/
+
+# Local editor/OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime logs and temporary files
+*.log
+*.tmp
