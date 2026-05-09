@@ -1,5 +1,6 @@
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from rclpy.duration import Duration
 from rclpy.node import Node
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -14,11 +15,14 @@ class AprilTagToPoseBridge(Node):
         self.declare_parameter('source_frame', 'base_link')
         self.declare_parameter('pose_topic', 'detected_dock_pose')
         self.declare_parameter('publish_rate_hz', 10.0)
+        self.declare_parameter('pose_stamp_delay_sec', 0.1)
 
         self.target_frame = self.get_parameter('target_frame').value
         self.source_frame = self.get_parameter('source_frame').value
         pose_topic = self.get_parameter('pose_topic').value
         publish_rate_hz = float(self.get_parameter('publish_rate_hz').value)
+        self.pose_stamp_delay_sec = max(
+            float(self.get_parameter('pose_stamp_delay_sec').value), 0.0)
 
         self.publisher_ = self.create_publisher(PoseStamped, pose_topic, 10)
         self.tf_buffer = Buffer()
@@ -37,7 +41,9 @@ class AprilTagToPoseBridge(Node):
             return
 
         msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = (
+            self.get_clock().now()
+            - Duration(seconds=self.pose_stamp_delay_sec)).to_msg()
         msg.header.frame_id = self.source_frame
         msg.pose.position.x = trans.transform.translation.x
         msg.pose.position.y = trans.transform.translation.y
