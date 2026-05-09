@@ -149,6 +149,9 @@ namespace ntrex
         tf_orientation = Euler2Quaternion(roll, pitch, yaw);
 
         imu_yaw_msg.data = deg_value[2];
+          roll = deg_value[0] * convertor_d2r;
+          pitch = deg_value[1] * convertor_d2r;
+          yaw = deg_value[2] * convertor_d2r;
 
         imu_data_msg.orientation.x = tf_orientation.x();
         imu_data_msg.orientation.y = tf_orientation.y();
