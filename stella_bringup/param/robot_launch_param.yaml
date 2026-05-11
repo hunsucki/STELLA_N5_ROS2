@@ -5,3 +5,4 @@ launch_pointcloud: false
 launch_pointcloud_laserscan_filter: false
 launch_hailo: false
 launch_linear_motor: true
+launch_battery: true

@@ -16,10 +16,10 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='NTREX',
-    maintainer_email='lab@ntrex.co.kr',
+    maintainer='user',
+    maintainer_email='test@example.com',
     description='AprilTag docking helper package.',
-    license='Apache-2.0',
+    license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

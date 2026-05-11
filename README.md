@@ -51,6 +51,83 @@ RealSense color image가 밀리거나 AprilTag에서 아래와 같은 동기화 
 - `/odom`은 기본 10Hz로 발행
 - `/camera/camera/color/image_raw`의 QoS가 `BEST_EFFORT`
 
+## Battery 모니터링 및 무선 충전
+
+`battery` 패키지는 STELLA N5의 배터리 상태 모니터링과 XY-SK120 무선 충전 제어를 담당함
+
+- INA219(I2C, 기본 주소 `0x40`)로 배터리 전압, 전류, SoC를 측정
+- XY-SK120 충전 모듈을 Modbus RTU로 제어
+- `/battery_state`에 ROS 표준 `sensor_msgs/BatteryState` 발행
+- `/sk120/available`로 SK120 연결 가능 여부, 즉 도킹/충전 가능 상태 발행
+- `/sk120/cmd_output` 명령으로 충전 출력 ON/OFF 제어
+
+`robot.launch.py`에 기본 포함되어 있어 일반 bringup 실행 시 자동으로 함께 시작됨
+
+```bash
+source ~/colcon_ws/install/setup.bash
+ros2 launch stella_bringup robot.launch.py
+```
+
+자동 실행 여부는 `stella_bringup/param/robot_launch_param.yaml`에서 제어함
+
+```yaml
+launch_battery: true
+```
+
+배터리 노드만 단독으로 실행하려면:
+
+```bash
+source ~/colcon_ws/install/setup.bash
+ros2 launch battery battery.launch.py
+```
+
+주요 launch 파라미터:
+
+```bash
+ros2 launch battery battery.launch.py \
+  port:=/dev/ttyUSB4 \
+  baudrate:=115200 \
+  slave_id:=1 \
+  voltage_set:=25.2 \
+  start_current:=0.7 \
+  target_current:=1.8 \
+  current_offset:=0.0
+```
+
+주요 토픽:
+
+- `/battery_state`: 전체 배터리 상태. 충전 중 전류는 양수, 방전 중 전류는 음수로 발행
+- `/sk120/available`: SK120 응답 가능 여부. 도킹 감지/충전 가능 상태 확인용
+- `/sk120/cmd_output`: `std_msgs/Bool`, `true`면 충전 시작, `false`면 충전 중지
+- `/sk120/output_on`: SK120 출력 ON/OFF 상태
+- `/sk120/current_set`: 현재 설정 전류
+- `/sk120/current_out`: SK120 실측 출력 전류
+- `/sk120/voltage_out`: SK120 실측 출력 전압
+
+충전 시작/중지 예시:
+
+```bash
+ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool "data: true"
+ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool "data: false"
+```
+
+상태 확인:
+
+```bash
+ros2 topic echo /battery_state
+ros2 topic echo /sk120/available
+ros2 topic echo /sk120/current_out
+```
+
+필요 패키지:
+
+```bash
+sudo apt install python3-serial python3-smbus2
+```
+
+참고: SK120 USB-TTL 기본 포트는 `/dev/ttyUSB4`로 설정되어 있음. 장비에서 포트가 달라지면
+`port:=...` launch 파라미터 또는 `battery/launch/battery.launch.py` 기본값을 현장 설정에 맞게 변경
+
 ## 통합 도킹 실행
 
 기존 도킹 절차는 아래 명령들을 순서대로 실행해야 한다
@@ -100,11 +177,16 @@ ros2 run docking dock_turn_backup --ros-args \
 ### LiDAR 평면 기반 회전 보정
 
 `dock_turn_backup`은 AprilTag 도킹 접근 후 odom 기반 180도 회전을 먼저 수행하고,
-후진하기 전에 `/scan`의 전방 영역에서 평면을 찾아 yaw를 미세 보정함
+후진하기 전에 `/scan`에서 벽/태그 평면을 찾아 yaw를 미세 보정함
+
+현재 도킹 시나리오에서는 180도 회전이 끝난 뒤 로봇이 후진으로 벽/태그 쪽에 접근하므로,
+보정에 사용할 평면은 로봇 기준 후방에 위치함. 따라서 실제 운용에서는
+`lidar_align_sector_center:=3.14159`를 사용해 후방 60도 영역을 보는 설정을 권장함.
 
 기본 동작:
 
-- 전방 60도 영역의 LaserScan 점만 사용
+- `lidar_align_sector_center`를 중심으로 `lidar_align_sector_width`만큼의 LaserScan 점만 사용
+- 현재 후진 도킹 시나리오 권장값은 후방 60도 영역
 - RANSAC으로 가장 그럴듯한 직선 평면을 찾음
 - 평면의 normal 방향이 로봇 뒤쪽(`pi`)을 향하도록 `/cmd_vel.angular.z`로 저속 보정
 - 오차가 약 2도 이내로 안정되면 후진 단계로 넘어감
@@ -114,7 +196,7 @@ ros2 run docking dock_turn_backup --ros-args \
 ```bash
 ros2 run docking dock_turn_backup --ros-args \
   -p use_lidar_alignment:=true \
-  -p lidar_align_sector_center:=0.0 \
+  -p lidar_align_sector_center:=3.14159 \
   -p lidar_align_sector_width:=1.0472 \
   -p lidar_align_tolerance:=0.0349 \
   -p lidar_align_angular_speed:=0.08 \
@@ -124,7 +206,10 @@ ros2 run docking dock_turn_backup --ros-args \
 정렬 방향이 반대로 보이면 `-p lidar_align_kp:=-0.8`로 부호를 바꿔 테스트할 수 있음
 LiDAR 평면이 잘 안 잡히면 `lidar_align_sector_width`, `lidar_align_max_range`,
 `lidar_align_ransac_threshold`를 현장 구조에 맞춰 조정
-도킹 자세에서 평면이 뒤쪽에 잡히는 다른 장착 구조라면 `-p lidar_align_sector_center:=3.14159`로 바꿔 테스트
+LiDAR `/scan` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
+
+참고: 코드의 기본값은 `lidar_align_sector_center:=0.0`이므로 파라미터를 따로 주지 않으면 전방 60도 영역을 사용함.
+현재 후진 도킹 시나리오에서는 위 예시처럼 `3.14159`를 명시하는 것이 안전함
 
 ### 도킹 실행 전 TF 확인
 

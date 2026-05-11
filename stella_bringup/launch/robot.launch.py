@@ -21,7 +21,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, ThisLaunchFileDir, PythonExpression
+from launch.substitutions import LaunchConfiguration, ThisLaunchFileDir
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
@@ -41,6 +41,7 @@ def generate_launch_description():
     launch_pointcloud_laserscan_filter = param.get('launch_pointcloud_laserscan_filter', False)
     launch_hailo = param.get('launch_hailo', False)
     launch_linear_motor = param.get('launch_linear_motor', True)
+    launch_battery = param.get('launch_battery', True)
 
     md_pkg_dir = LaunchConfiguration(
         'md_pkg_dir',
@@ -61,6 +62,10 @@ def generate_launch_description():
     depth_pkg_dir = LaunchConfiguration(
         'depth_pkg_dir',
         default=os.path.join(get_package_share_directory('realsense2_camera'), 'launch'))
+
+    battery_pkg_dir = LaunchConfiguration(
+        'battery_pkg_dir',
+        default=os.path.join(get_package_share_directory('battery'), 'launch'))
 
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
 
@@ -203,6 +208,12 @@ def generate_launch_description():
             name='linear_motor_node',
             output='screen',
             condition=IfCondition('true' if launch_linear_motor else 'false')
+        ),
+
+        # Battery monitor and SK120 wireless charger control
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([battery_pkg_dir, '/battery.launch.py']),
+            condition=IfCondition('true' if launch_battery else 'false')
         ),
 
     ])
