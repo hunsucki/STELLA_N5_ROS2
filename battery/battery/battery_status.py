@@ -17,7 +17,7 @@
   방전 중 : current < 0  (INA219 값 반전 – INA219는 방전=양수로 측정)
 
 [ 램프업 중단 로직 ]
-  중단 시점의 전류를 _ramp_limit에 저장 → 재충전 시 그 전류까지만 올림
+  실제 충전 전류가 확인된 전류만 _ramp_limit에 저장 → 재충전 시 그 전류까지만 올림
   실제 도킹 해제(SK120 전원 꺼짐)가 감지될 때만 _ramp_limit 초기화
 
 [ 토픽 ]
@@ -72,13 +72,14 @@ class BatteryNode(Node):
 
     FAIL_THRESHOLD = 3        # 연속 통신 실패 허용 횟수
     LOW_CURRENT_THRESHOLD = 0.05   # A – 이하면 "충전 전류 없음"으로 판단
-    LOW_CURRENT_MAX_COUNT = 3      # 연속 N회 → 경고
+    LOW_CURRENT_MAX_COUNT = 3      # 연속 N회 → 직전 정상 전류로 백오프
+    GOOD_CURRENT_MIN_COUNT = 2     # 같은 설정 전류에서 연속 N회 정상 → 안전 전류로 확정
 
     def __init__(self):
         super().__init__('battery_node')
 
         # ── 파라미터 ────────────────────────────────────────────────────
-        self.declare_parameter('port',            '/dev/ttyUSB4')
+        self.declare_parameter('port',            '/dev/SK120')
         self.declare_parameter('baudrate',        115200)
         self.declare_parameter('slave_id',        1)
         self.declare_parameter('voltage_set',     25.2)
@@ -124,6 +125,10 @@ class BatteryNode(Node):
         self._ramp_limit: float | None = None
         # 이번 충전에서 실제 적용할 목표 전류
         self._i_target_eff = self._i_target_raw
+        # 실측 전류가 흐른 마지막 설정 전류
+        self._last_good_current_set: float | None = None
+        self._good_current_candidate: float | None = None
+        self._good_current_count = 0
 
         # 충전 전류 감지 카운터
         self._low_current_count = 0
@@ -164,13 +169,13 @@ class BatteryNode(Node):
                 self._sk120_ready = True
                 self._publish_sk120_available()
                 self.get_logger().info(
-                    '[SK120 감지] 도킹 확인 → /sk120/cmd_output: true 로 충전 시작 가능'
+                    '[충전 모듈 감지] 도킹 확인 -> /sk120/cmd_output: true 로 충전 시작 가능'
                 )
         else:
             self._fail_count += 1
             if self._sk120_ready and self._fail_count >= self.FAIL_THRESHOLD:
                 self.get_logger().warn(
-                    f'[SK120 응답 없음] {self.FAIL_THRESHOLD}회 연속 실패 → 도킹 해제'
+                    f'[충전 모듈 응답 없음] {self.FAIL_THRESHOLD}회 연속 실패 → 도킹 해제'
                 )
                 self._on_undocked()
 
@@ -187,7 +192,7 @@ class BatteryNode(Node):
             return False
 
     def _on_undocked(self):
-        """실제 도킹 해제 – _ramp_limit 초기화 포함."""
+        """실제 도킹 해제 _ramp_limit 초기화 포함."""
         self._stop_charging(reset_ramp_limit=True)
         if self._sk120 is not None:
             try:
@@ -257,8 +262,11 @@ class BatteryNode(Node):
         self._ramp_active = True
         self._fail_count = 0
         self._low_current_count = 0
+        self._last_good_current_set = None
+        self._good_current_candidate = None
+        self._good_current_count = 0
         self.get_logger().info(
-            f'[충전 시작] 초기 {self._i_start}A → 목표 '
+            f'[충전 시작] 초기 {self._i_start}A -> 목표 '
             f'{round(self._i_target_eff - self._i_offset, 3)}A'
         )
 
@@ -273,6 +281,9 @@ class BatteryNode(Node):
         self._sk120_current = 0.0
         self._sk120_voltage = 0.0
         self._low_current_count = 0
+        self._last_good_current_set = None
+        self._good_current_candidate = None
+        self._good_current_count = 0
         if reset_ramp_limit:
             self._ramp_limit = None
         self.get_logger().info(
@@ -291,7 +302,6 @@ class BatteryNode(Node):
             next_i = min(self._current_set + self._ramp_step, self._i_target_eff)
             if self._sk120.set_current(next_i):
                 self._current_set = next_i
-                self._ramp_limit = next_i   # 성공한 전류를 중단 상한으로 저장
                 real_i = round(self._current_set - self._i_offset, 3)
                 self.get_logger().info(
                     f'[램프업] {real_i}A (SK120: {self._current_set}A)'
@@ -304,7 +314,7 @@ class BatteryNode(Node):
             else:
                 self._fail_count += 1
                 if self._fail_count >= self.FAIL_THRESHOLD:
-                    self.get_logger().error('[램프업] 통신 실패 반복 → 충전 중지')
+                    self.get_logger().error('[램프업] 통신 실패 반복 -> 충전 중지')
                     self._on_undocked()
 
     # ──────────────────────────────────────────────────────────────────
@@ -337,12 +347,10 @@ class BatteryNode(Node):
                 if sk_status.current_out < self.LOW_CURRENT_THRESHOLD:
                     self._low_current_count += 1
                     if self._low_current_count >= self.LOW_CURRENT_MAX_COUNT:
-                        self.get_logger().warn(
-                            f'[충전 전류 없음] SK120 출력 ON이나 전류 감지 안됨 '
-                            f'({sk_status.current_out:.3f}A) – 무선 코일 정렬 확인'
-                        )
+                        self._handle_low_charge_current(sk_status.current_out)
                 else:
                     self._low_current_count = 0
+                    self._remember_good_current(sk_status.current_set)
 
             else:
                 self._fail_count += 1
@@ -354,7 +362,7 @@ class BatteryNode(Node):
                     self._on_undocked()
                     return
 
-            self._pub_on.publish(Bool(data=True))
+            self._pub_on.publish(Bool(data=self._charging))
         else:
             self._pub_on.publish(Bool(data=False))
 
@@ -382,16 +390,75 @@ class BatteryNode(Node):
         else:
             # 전압: INA219 직접 측정값
             msg.voltage = float(ina_voltage)
-            # 전류: INA219 반전 (방전=음수, ROS 관례)
-            # INA219 shunt는 방전 방향이 양수로 측정되므로 부호 반전
+            # 전류: INA219 반전 (배터리에 직결하지 않아 방전전류가 양수로 측정됨)
             msg.current = -float(ina_current)
             msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
 
         self._pub_battery.publish(msg)
-        self.get_logger().info(
+        self.get_logger().debug(
             f'[배터리] {msg.voltage:.2f}V  {msg.current:+.3f}A  SoC={soc:.1f}%  '
             f'{"[충전중]" if self._charging else "[방전중]"}'
         )
+
+    def _remember_good_current(self, current_set: float):
+        """실제 전류가 흐른 설정값만 다음 램프업 상한으로 설정."""
+        good_current = min(round(current_set, 3), round(self._current_set, 3))
+        if good_current <= 0.0:
+            return
+
+        if (
+            self._good_current_candidate is None
+            or abs(good_current - self._good_current_candidate) > 0.001
+        ):
+            self._good_current_candidate = good_current
+            self._good_current_count = 1
+        else:
+            self._good_current_count += 1
+
+        if self._good_current_count >= self.GOOD_CURRENT_MIN_COUNT:
+            self._last_good_current_set = good_current
+            self._ramp_limit = good_current
+
+    def _handle_low_charge_current(self, measured_current: float):
+        """무선 커플링이 깨진 경우 직전 정상 전류까지만 충전하도록 백오프."""
+        fallback = self._last_good_current_set
+        if fallback is None:
+            fallback = max(self._i_start_raw, self._current_set - self._ramp_step)
+        fallback = round(min(fallback, self._current_set), 3)
+
+        if fallback >= self._current_set - 0.001:
+            self.get_logger().warn(
+                f'[충전 전류 없음] {measured_current:.3f}A – 직전 정상 전류에서도 '
+                '전류가 없어 충전 중지'
+            )
+            self._stop_charging(reset_ramp_limit=False)
+            return
+
+        self._ramp_limit = fallback
+        self._i_target_eff = fallback
+        self._ramp_active = True
+        self._low_current_count = 0
+        self._good_current_candidate = None
+        self._good_current_count = 0
+
+        real_fallback = round(fallback - self._i_offset, 3)
+        real_current = round(self._current_set - self._i_offset, 3)
+        real_restart = round(self._i_start_raw - self._i_offset, 3)
+        self.get_logger().warn(
+            f'[충전 전류 없음] {measured_current:.3f}A – {real_current}A에서 '
+            f'커플링 불량 감지, {real_restart}A부터 재시작해 '
+            f'{real_fallback}A까지만 램프업'
+        )
+
+        try:
+            self._sk120.set_output(False)
+            self._sk120.set_voltage(self._v_set)
+            if self._sk120.set_current(self._i_start_raw):
+                self._current_set = self._i_start_raw
+            self._sk120.set_output(True)
+        except Exception as e:
+            self.get_logger().error(f'[충전 복구 실패] SK120 제어 오류: {e}')
+            self._stop_charging(reset_ramp_limit=False)
 
     # ──────────────────────────────────────────────────────────────────
     def destroy_node(self):
@@ -413,7 +480,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

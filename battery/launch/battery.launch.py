@@ -6,7 +6,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('port',            default_value='/dev/ttyUSB4'),
+        DeclareLaunchArgument('port',            default_value='/dev/SK120'),
         DeclareLaunchArgument('baudrate',        default_value='115200'),
         DeclareLaunchArgument('slave_id',        default_value='1'),
         DeclareLaunchArgument('voltage_set',     default_value='25.2'),

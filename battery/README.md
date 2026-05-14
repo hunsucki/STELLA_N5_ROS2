@@ -18,7 +18,7 @@ INA219(I2C) 센서로 배터리 상태를 항상 발행하면서, 로봇이 무�
 
 [무선 충전 TX 코일]
         │
-        └─── XY-SK120 충전 모듈 ─── USB-TTL (pl2303) ─── /dev/ttyUSB4
+        └─── XY-SK120 충전 모듈 ─── USB-TTL (pl2303) ─── /dev/SK120
               Modbus RTU, 115200bps
 
 [무선 충전 RX 코일] ─── [배터리]
@@ -166,7 +166,7 @@ Nav2 docking에서 충전 상태로 인식할 수 있도록 `sensor_msgs/Battery
 
 | 파라미터 | 기본값 | 설명 |
 |---------|--------|------|
-| `port` | `/dev/ttyUSB4` | SK120 시리얼 포트 |
+| `port` | `/dev/SK120` | SK120 시리얼 포트 |
 | `baudrate` | `115200` | 통신 속도 |
 | `slave_id` | `1` | Modbus 슬레이브 ID |
 | `voltage_set` | `25.2` V | SK120 출력 전압 설정 |

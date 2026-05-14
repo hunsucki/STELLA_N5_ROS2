@@ -1,29 +1,28 @@
-# set the udev rule , make the rplidar's device_port be fixed by RPLIDAR
+# STELLA serial device names.
+#
+# Current USB layout:
+# - Upper RPLIDAR: CP2102N serial 4a237fb90464ef11947fe2a9c169b110
+# - Lower RPLIDAR: CP2102N serial ccaf2ee0ed63ef11b4dddaa9c169b110
+# - SK120 USB-TTL: PL2303 on hub port 4-1.2
+# - AHRS: FT230X
+# - Motor driver: FT232R
 
-# 3-1.4 : USB Hub Hat USB 1 port
-# 3-1.1 : USB Hub Hat USB 2 port
+KERNEL=="ttyUSB*", ENV{ID_SERIAL_SHORT}=="4a237fb90464ef11947fe2a9c169b110", MODE:="0777", SYMLINK+="RPLIDAR"
+KERNEL=="ttyUSB*", ENV{ID_SERIAL_SHORT}=="ccaf2ee0ed63ef11b4dddaa9c169b110", MODE:="0777", SYMLINK+="RPLIDAR2"
 
-KERNEL=="ttyUSB*", KERNELS=="3-1.4", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0777", SYMLINK+="RPLIDAR"
-KERNEL=="ttyUSB*", KERNELS=="3-1.1", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0777", SYMLINK+="RPLIDAR2"
+KERNEL=="ttyUSB*", KERNELS=="4-1.2", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="2303", MODE:="0777", SYMLINK+="SK120"
+KERNEL=="ttyUSB*", KERNELS=="3-1.2", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="2303", MODE:="0777", SYMLINK+="SK120"
 
-# set the udev rule , make the AHRS's device_port be fixed by AHRS
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE:="0777", SYMLINK+="AHRS"
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE:="0777", SYMLINK+="MW"
 
-# 3-2 : Bottom USB 2.0 port
-
-KERNEL=="ttyUSB*", KERNELS=="3-2", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE:="0777", SYMLINK+="AHRS"
-
-# set the udev rule , make the MotorDriver's device_port be fixed by MW
-
-# 1-2 : Top USB 2.0 port
-
-KERNEL=="ttyUSB*", KERNELS=="1-2", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE:="0777", SYMLINK+="MW"
-
-# set the udev rule , make the Bluetooth's device_port be fixed by BT
+# set the udev rule, make the Bluetooth's device_port be fixed by BT
 
 KERNEL=="ttyS*", MODE:="0777", SYMLINK+="BT"
 
-# set the udev rule , make the realsense's device_port
+# set the udev rule, make the realsense's device_port
 
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b07", MODE:="0777"
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", MODE:="0777"
 KERNEL=="iio*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", MODE:="0777", RUN+="/bin/sh -c 'chmod -R 0777 /sys/%p'"
 DRIVER=="hid_sensor*", ATTRS{idVendor}=="8086", ATTRS{idProduct}=="0b3a", RUN+="/bin/sh -c ' chmod -R 0777 /sys/%p && chmod 0777 /dev/%k'"

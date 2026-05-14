@@ -17,10 +17,10 @@ docking_server:
       use_battery_status: false
       use_stall_detection: false
 
-      staging_x_offset: -0.918
+      staging_x_offset: -0.60
       staging_yaw_offset: 0.0
 
-      external_detection_translation_x: -0.918
+      external_detection_translation_x: -0.60
       external_detection_translation_y: 0.0
       external_detection_rotation_yaw: 0.0
       external_detection_rotation_pitch: 1.57

@@ -85,7 +85,7 @@ ros2 launch battery battery.launch.py
 
 ```bash
 ros2 launch battery battery.launch.py \
-  port:=/dev/ttyUSB4 \
+  port:=/dev/SK120 \
   baudrate:=115200 \
   slave_id:=1 \
   voltage_set:=25.2 \
@@ -125,8 +125,8 @@ ros2 topic echo /sk120/current_out
 sudo apt install python3-serial python3-smbus2
 ```
 
-참고: SK120 USB-TTL 기본 포트는 `/dev/ttyUSB4`로 설정되어 있음. 장비에서 포트가 달라지면
-`port:=...` launch 파라미터 또는 `battery/launch/battery.launch.py` 기본값을 현장 설정에 맞게 변경
+참고: SK120 USB-TTL 기본 포트는 udev 고정 장치명 `/dev/SK120`로 설정되어 있음. 장비에서 포트가 달라지면
+`stella_bringup/stella.rules`의 SK120 규칙 또는 `port:=...` launch 파라미터를 현장 설정에 맞게 변경
 
 ## 통합 도킹 실행
 
@@ -181,12 +181,12 @@ ros2 run docking dock_turn_backup --ros-args \
 
 현재 도킹 시나리오에서는 180도 회전이 끝난 뒤 로봇이 후진으로 벽/태그 쪽에 접근하므로,
 보정에 사용할 평면은 로봇 기준 후방에 위치함. 따라서 실제 운용에서는
-`lidar_align_sector_center:=3.14159`를 사용해 후방 60도 영역을 보는 설정을 권장함.
+상단 라이다 `/scan`의 후방 방향인 `lidar_align_sector_center:=0.0`을 사용함.
 
 기본 동작:
 
 - `lidar_align_sector_center`를 중심으로 `lidar_align_sector_width`만큼의 LaserScan 점만 사용
-- 현재 후진 도킹 시나리오 권장값은 후방 60도 영역
+- 현재 후진 도킹 시나리오 권장값은 상단 라이다 `/scan` 기준 0도 방향의 60도 영역
 - RANSAC으로 가장 그럴듯한 직선 평면을 찾음
 - 평면의 normal 방향이 로봇 뒤쪽(`pi`)을 향하도록 `/cmd_vel.angular.z`로 저속 보정
 - 오차가 약 2도 이내로 안정되면 후진 단계로 넘어감
@@ -196,7 +196,7 @@ ros2 run docking dock_turn_backup --ros-args \
 ```bash
 ros2 run docking dock_turn_backup --ros-args \
   -p use_lidar_alignment:=true \
-  -p lidar_align_sector_center:=3.14159 \
+  -p lidar_align_sector_center:=0.0 \
   -p lidar_align_sector_width:=1.0472 \
   -p lidar_align_tolerance:=0.0349 \
   -p lidar_align_angular_speed:=0.08 \
@@ -208,8 +208,21 @@ LiDAR 평면이 잘 안 잡히면 `lidar_align_sector_width`, `lidar_align_max_r
 `lidar_align_ransac_threshold`를 현장 구조에 맞춰 조정
 LiDAR `/scan` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
 
-참고: 코드의 기본값은 `lidar_align_sector_center:=0.0`이므로 파라미터를 따로 주지 않으면 전방 60도 영역을 사용함.
-현재 후진 도킹 시나리오에서는 위 예시처럼 `3.14159`를 명시하는 것이 안전함
+참고: STELLA N5 URDF에서 `base_scan`은 `base_link` 대비 yaw가 `pi`라서 `/scan`의 0도 방향이 로봇 후방을 향함.
+
+후진 단계는 기본적으로 odom 누적 이동거리 대신 LiDAR 후방 거리로 종료함.
+상단 라이다에서 뒤 범퍼까지의 거리 `0.4315m`를 빼서 뒤 범퍼 기준 clearance를 계산하고,
+기본값은 뒤 범퍼가 벽/태그에서 약 `0.01m` 남았을 때 정지함.
+
+```bash
+ros2 run docking dock_turn_backup --ros-args \
+  -p use_lidar_backup:=true \
+  -p backup_scan_topic:=/scan \
+  -p backup_lidar_sector_center:=0.0 \
+  -p backup_lidar_sector_width:=0.3491 \
+  -p backup_lidar_to_rear_bumper_offset:=0.4315 \
+  -p backup_target_rear_clearance:=0.01
+```
 
 ### 도킹 실행 전 TF 확인
 
