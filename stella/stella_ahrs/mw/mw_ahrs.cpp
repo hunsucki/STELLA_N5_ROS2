@@ -91,12 +91,19 @@ namespace ntrex
 
   void MwAhrsRosDriver::MwAhrsRead()
 {
-  int read_rate_hz = 200;
+  int read_rate_hz = 900;
+  int read_idle_sleep_us = 1000;
   this->get_parameter("read_rate_hz", read_rate_hz);
+  this->get_parameter("read_idle_sleep_us", read_idle_sleep_us);
 
   if (read_rate_hz <= 0)
   {
-    read_rate_hz = 200;
+    read_rate_hz = 900;
+  }
+
+  if (read_idle_sleep_us < 0)
+  {
+    read_idle_sleep_us = 1000;
   }
 
   rclcpp::WallRate read_rate(read_rate_hz);
@@ -105,13 +112,27 @@ namespace ntrex
   {
     unsigned char data[8];
 
-    if (MW_AHRS_Read(data))
+    bool got_packet = false;
+    try
     {
+      got_packet = MW_AHRS_Read(data);
+    }
+    catch (const std::exception & e)
+    {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "AHRS serial read failed: %s", e.what());
+    }
+
+    if (got_packet)
+    {
+      const rclcpp::Time packet_time = this->get_clock()->now();
       std::lock_guard<std::mutex> lock(imu_msg_mutex);
 
       switch ((int)(unsigned char)data[1])
       {
       case ACC:
+        imu_data_raw_msg.header.stamp = packet_time;
         acc_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 1000.0;
         acc_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 1000.0;
         acc_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 1000.0;
@@ -125,6 +146,7 @@ namespace ntrex
         break;
 
       case GYO:
+        imu_data_raw_msg.header.stamp = packet_time;
         gyr_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
         gyr_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
         gyr_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
@@ -138,6 +160,7 @@ namespace ntrex
         break;
 
       case DEG:
+        imu_data_msg.header.stamp = packet_time;
         deg_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 100.0;
         deg_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 100.0;
         deg_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 100.0;
@@ -160,6 +183,7 @@ namespace ntrex
         break;
 
       case MAG:
+        imu_magnetic_msg.header.stamp = packet_time;
         mag_value[0] = (int16_t)(((int)(unsigned char)data[2] | (int)(unsigned char)data[3] << 8)) / 10.0;
         mag_value[1] = (int16_t)(((int)(unsigned char)data[4] | (int)(unsigned char)data[5] << 8)) / 10.0;
         mag_value[2] = (int16_t)(((int)(unsigned char)data[6] | (int)(unsigned char)data[7] << 8)) / 10.0;
@@ -171,7 +195,14 @@ namespace ntrex
       }
     }
 
-    read_rate.sleep();
+    if (got_packet)
+    {
+      read_rate.sleep();
+    }
+    else if (read_idle_sleep_us > 0)
+    {
+      std::this_thread::sleep_for(std::chrono::microseconds(read_idle_sleep_us));
+    }
   }
 }
 
@@ -199,10 +230,6 @@ namespace ntrex
 
       {
         std::lock_guard<std::mutex> lock(imu_msg_mutex);
-
-        imu_data_raw_msg.header.stamp =
-            imu_data_msg.header.stamp =
-                imu_magnetic_msg.header.stamp = now;
 
         imu_data_raw_msg.header.frame_id =
             imu_data_msg.header.frame_id =
@@ -303,14 +330,20 @@ namespace ntrex
       this->declare_parameter("magnetic_field_stddev", 0.0);
       this->declare_parameter("orientation_stddev", 0.0);
 
-      this->declare_parameter("read_rate_hz", 200);
+      this->declare_parameter("read_rate_hz", 900);
       this->declare_parameter("publish_rate_hz", 50);
       this->declare_parameter("read_idle_sleep_us", 1000);
+      this->declare_parameter("publish_tf", false);
+      this->declare_parameter("parent_frame_id", "base_link");
+      this->declare_parameter("frame_id", "imu_link");
 
       this->get_parameter("linear_acceleration_stddev", linear_acceleration_stddev_);
       this->get_parameter("angular_velocity_stddev", angular_velocity_stddev_);
       this->get_parameter("magnetic_field_stddev", magnetic_field_stddev_);
       this->get_parameter("orientation_stddev", orientation_stddev_);
+      this->get_parameter("publish_tf", publish_tf_);
+      this->get_parameter("parent_frame_id", parent_frame_id_);
+      this->get_parameter("frame_id", frame_id_);
 
       MW_AHRS_Covariance();
 

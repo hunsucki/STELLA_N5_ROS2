@@ -13,6 +13,12 @@ def generate_launch_description():
                                 emulate_tty=True,
                                 parameters=[{
                                     'monitoring_rate_hz': 10,
+                                    'use_imu_data_orientation': False,
+                                    'imu_timeout_sec': 0.0,
+                                    'use_imu_yaw_filter': False,
+                                    'imu_yaw_max_rate': 2.0,
+                                    'imu_yaw_filter_tau_sec': 0.0,
+                                    'imu_yaw_jump_warn_threshold': 0.25,
                                 }],
                                 namespace='/',
                                 )

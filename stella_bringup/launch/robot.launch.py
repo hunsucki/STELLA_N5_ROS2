@@ -35,6 +35,7 @@ def generate_launch_description():
         param = yaml.safe_load(f)
 
     launch_lidar2 = param.get('launch_lidar2', True)
+    launch_lidar2_filter = param.get('launch_lidar2_filter', False)
     launch_usb_cam = param.get('launch_usb_cam', False)
     launch_realsense = param.get('launch_realsense', False)
     launch_pointcloud = param.get('launch_pointcloud', False)
@@ -123,7 +124,7 @@ def generate_launch_description():
         # Bottom lidar filter launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([lidar2_pkg_dir, '/laser_filter_launch.py']),
-            condition=IfCondition('true' if launch_lidar2 else 'false')
+            condition=IfCondition('true' if (launch_lidar2 and launch_lidar2_filter) else 'false')
         ),
 
         # Default realsense launch

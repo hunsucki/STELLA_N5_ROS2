@@ -25,15 +25,15 @@ RealSense color image가 밀리거나 AprilTag에서 아래와 같은 동기화 
 
 - `stella_md_node`
   - 모터 모니터링 주기를 `monitoring_rate_hz` 파라미터로 조절하도록 변경
-  - 기본값은 `10Hz`로 설정함
+  - 현재 기본값은 원래 동작과 같은 `10Hz`로 유지함
   - 관련 파일:
     - `stella/stella_md/src/main.cpp`
     - `stella/stella_md/launch/stella_md_launch.py`
 
 - `stella_ahrs_node`
-  - AHRS read/publish 주기를 낮춰 CPU 부하를 줄임
+  - AHRS read/publish 주기를 분리해 외부 publish 주기만 낮게 유지함
   - 기본값:
-    - `read_rate_hz: 200`
+    - `read_rate_hz: 900`
     - `publish_rate_hz: 50`
   - 관련 파일:
     - `stella/stella_ahrs/mw/mw_ahrs.cpp`
@@ -50,6 +50,196 @@ RealSense color image가 밀리거나 AprilTag에서 아래와 같은 동기화 
 - `/camera/camera/color/image_raw`가 약 25Hz 이상으로 유지
 - `/odom`은 기본 10Hz로 발행
 - `/camera/camera/color/image_raw`의 QoS가 `BEST_EFFORT`
+
+## Nav2 odom/IMU yaw 안정화
+
+Nav2 실행 중 제자리 회전하거나 방향을 크게 바꿀 때 RViz에서 LiDAR scan이 순간적으로 확 돌아가 보이는 문제가 있었음.
+정지 상태에서는 `/imu/yaw`와 `/odom` yaw가 잘 맞았지만, 회전 중에는 odom yaw가 늦거나 튀는 증상이 의심됨.
+
+### 기존 구조
+
+```text
+stella_ahrs_node
+  publishes:
+    /imu/data
+    /imu/data_raw
+    /imu/yaw
+
+stella_md_node
+  subscribes:
+    /imu/yaw
+    /cmd_vel
+
+  publishes:
+    /odom
+    /tf
+```
+
+기존 `stella_md_node`는 timestamp가 없는 `std_msgs/Float64` 타입의 `/imu/yaw`를 받아 odom yaw로 사용했다.
+따라서 이 yaw가 방금 측정된 값인지, serial buffer에 밀린 오래된 값인지 판단할 수 없었다.
+
+또한 이전 설정은 아래처럼 동작했다.
+
+```text
+stella_ahrs_node read_rate_hz      = 200
+stella_ahrs_node publish_rate_hz   = 50
+stella_md_node monitoring_rate_hz  = 10
+```
+
+AHRS 센서가 더 빠르게 데이터를 내보내는 상황에서 read loop가 낮으면 serial backlog가 생길 수 있고,
+그 경우 publish는 50Hz로 정상처럼 보여도 내용은 과거 yaw일 수 있다.
+정지 상태에서는 문제가 잘 드러나지 않지만 회전 중에는 `odom -> base_footprint` yaw가 늦게 따라와 Nav2와 scan 표시가 흔들릴 수 있다.
+
+### 현재 적용한 구조
+
+기본 odom yaw 경로는 원래 구조와 같이 `/imu/yaw`를 사용한다.
+`/imu/data` 기반 odom yaw와 yaw rate-limit 필터는 실험용 파라미터로 남겨두었지만 기본값은 꺼져 있다.
+즉, 현재 기본 동작은 원래 잘 동작하던 구조를 최대한 유지하고,
+주기 변경으로 생긴 serial backlog 가능성과 serial 예외로 노드가 죽는 문제만 보수적으로 줄이는 방향이다.
+
+```text
+stella_ahrs_node
+  publishes:
+    /imu/data        sensor_msgs/Imu, debug/optional용
+    /imu/data_raw
+    /imu/yaw         std_msgs/Float64, odom yaw 기본 소스
+
+stella_md_node
+  subscribes:
+    /imu/yaw         odom yaw 기본 소스
+    /imu/data        옵션이 켜진 경우에만 사용
+    /cmd_vel
+
+  publishes:
+    /odom
+    /tf
+```
+
+주요 변경점:
+
+- AHRS read 기본값을 `200Hz -> 900Hz`로 올림
+- AHRS publish 기본값은 `50Hz`로 유지
+- `/imu/data.header.stamp`를 publish 시각이 아니라 실제 AHRS 패킷을 읽은 시각으로 기록
+- `/imu/data.header.frame_id` 기본값을 `imu_link`로 설정
+- `stella_md_node`의 기본 odom yaw 경로는 `/imu/yaw`로 유지
+- serial read/write 예외가 발생해도 `stella_ahrs_node`, `stella_md_node`가 abort되지 않도록 방어
+- `/imu/data` 기반 yaw, stale guard, yaw rate-limit 필터는 파라미터로 켤 수 있지만 기본값은 비활성
+- `robot_launch_param.yaml`에 `launch_lidar2_filter`를 추가해 `/scan_filtered` 실행 여부를 별도로 제어 가능
+
+현재 기본 파라미터:
+
+```text
+stella_bringup/param/robot_launch_param.yaml:
+  launch_lidar2: true
+  launch_lidar2_filter: true
+
+stella_ahrs_node:
+  read_rate_hz: 900
+  publish_rate_hz: 50
+  read_idle_sleep_us: 1000
+  frame_id: imu_link
+  parent_frame_id: base_link
+  publish_tf: false
+
+stella_md_node:
+  monitoring_rate_hz: 10
+  use_imu_data_orientation: false
+  imu_timeout_sec: 0.0
+  use_imu_yaw_filter: false
+```
+
+관련 파일:
+
+- `stella/stella_ahrs/mw/mw_ahrs.cpp`
+- `stella/stella_ahrs/include/mw/mw_ahrs.hpp`
+- `stella/stella_ahrs/launch/stella_ahrs_launch.py`
+- `stella/stella_md/src/main.cpp`
+- `stella/stella_md/src/main.hpp`
+- `stella/stella_md/launch/stella_md_launch.py`
+- `stella/stella_md/CMakeLists.txt`
+- `stella/stella_md/package.xml`
+- `stella_bringup/launch/robot.launch.py`
+- `stella_bringup/param/robot_launch_param.yaml`
+
+### 실험 옵션
+
+아래 옵션들은 문제 분리나 테스트용이다. 기본 운용에서는 꺼둔다.
+
+`/imu/data` orientation을 odom yaw에 사용하려면:
+
+```bash
+ros2 param set /stella_md_node use_imu_data_orientation true
+ros2 param set /stella_md_node imu_timeout_sec 0.25
+```
+
+AHRS yaw가 순간적으로 크게 튀는지 확인하고 rate-limit를 걸려면:
+
+```bash
+ros2 param set /stella_md_node use_imu_yaw_filter true
+ros2 param set /stella_md_node imu_yaw_max_rate 2.0
+ros2 param set /stella_md_node imu_yaw_filter_tau_sec 0.0
+```
+
+두 번째 라이다 필터가 scan 표시나 costmap에 영향을 주는지 분리하려면
+`stella_bringup/param/robot_launch_param.yaml`에서 아래처럼 바꾼 뒤 bringup을 재시작한다.
+
+```yaml
+launch_lidar2_filter: false
+```
+
+이 경우 `/scan_filtered`는 발행되지 않고 `/scan`, `/scan_2`만 남는다.
+
+### 기대 상태
+
+```bash
+ros2 param get /stella_ahrs_node read_rate_hz
+ros2 param get /stella_ahrs_node publish_rate_hz
+ros2 param get /stella_md_node monitoring_rate_hz
+ros2 param get /stella_md_node use_imu_data_orientation
+ros2 param get /stella_md_node use_imu_yaw_filter
+```
+
+기대값:
+
+```text
+read_rate_hz: 900
+publish_rate_hz: 50
+monitoring_rate_hz: 10
+use_imu_data_orientation: false
+use_imu_yaw_filter: false
+```
+
+토픽 주기 확인:
+
+```bash
+ros2 topic hz /imu/data
+ros2 topic hz /odom
+```
+
+기대 상태:
+
+```text
+/imu/data  약 50Hz
+/odom      약 10Hz
+```
+
+정지 상태에서 `/imu/yaw`와 `/odom` orientation yaw가 거의 같아야 한다.
+회전 중에도 두 yaw가 같은 방향으로 부드럽게 변해야 하며, 갑자기 180도 또는 360도 튀면 yaw wrap 처리나 IMU 데이터 지연을 다시 확인해야 한다.
+
+회전 테스트 전후에는 반드시 정지 명령을 보내 모터 명령이 남지 않게 한다.
+
+```bash
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
+```
+
+짧은 제자리 회전 테스트 예시:
+
+```bash
+ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist \
+  "{angular: {z: 0.2}}"
+```
+
+테스트가 끝나면 `Ctrl-C` 후 다시 정지 명령을 보낸다.
 
 ## Battery 모니터링 및 무선 충전
 

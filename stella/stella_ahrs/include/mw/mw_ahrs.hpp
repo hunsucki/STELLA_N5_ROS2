@@ -60,9 +60,9 @@ namespace ntrex
         double roll, pitch, yaw;
 
     private:
-        bool publish_tf_;
-        std::string parent_frame_id_;
-        std::string frame_id_;
+        bool publish_tf_ = false;
+        std::string parent_frame_id_ = "base_link";
+        std::string frame_id_ = "imu_link";
         std::mutex _lockAHRS;
 
     public:

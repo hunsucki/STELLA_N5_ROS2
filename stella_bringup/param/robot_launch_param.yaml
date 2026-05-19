@@ -1,4 +1,5 @@
 launch_lidar2: true
+launch_lidar2_filter: true
 launch_usb_cam: false
 launch_realsense: true
 launch_pointcloud: false

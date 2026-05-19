@@ -42,8 +42,12 @@ def generate_launch_description():
                                 output='screen',
                                 emulate_tty=True,
                                 parameters=[{
-                                    'read_rate_hz': 200,
+                                    'read_rate_hz': 900,
                                     'publish_rate_hz': 50,
+                                    'read_idle_sleep_us': 1000,
+                                    'frame_id': 'imu_link',
+                                    'parent_frame_id': 'base_link',
+                                    'publish_tf': False,
                                 }],
                                 namespace='/',
                                 )
@@ -51,4 +55,3 @@ def generate_launch_description():
     return LaunchDescription([
       driver_node,
     ])
-
