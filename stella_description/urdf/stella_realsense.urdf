@@ -94,7 +94,7 @@
   <joint name="scan2_joint" type="fixed">
     <parent link="base_link"/>
     <child link="base_scan2"/>
-    <origin xyz="0.202 0.0 0.032" rpy="0.0 0.0 -1.57"/>
+    <origin xyz="-0.166 0.0 0.223" rpy="0.0 0.0 3.1415"/>
   </joint>
 
   <link name="base_scan2"/>

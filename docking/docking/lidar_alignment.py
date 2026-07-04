@@ -14,7 +14,7 @@ class LidarPlaneAligner:
     @staticmethod
     def declare_parameters(node: Node) -> None:
         node.declare_parameter('use_lidar_alignment', True)
-        node.declare_parameter('scan_topic', '/scan')
+        node.declare_parameter('scan_topic', '/scan_2')
         node.declare_parameter('lidar_align_timeout_sec', 8.0)
         node.declare_parameter('lidar_align_sector_center', 0.0)
         node.declare_parameter('lidar_align_sector_width', math.radians(60.0))

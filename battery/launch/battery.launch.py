@@ -10,7 +10,7 @@ def generate_launch_description():
         DeclareLaunchArgument('baudrate',        default_value='115200'),
         DeclareLaunchArgument('slave_id',        default_value='1'),
         DeclareLaunchArgument('voltage_set',     default_value='25.2'),
-        DeclareLaunchArgument('start_current',   default_value='0.7'),
+        DeclareLaunchArgument('start_current',   default_value='0.1'),
         DeclareLaunchArgument('target_current',  default_value='1.8'),
         DeclareLaunchArgument('ramp_step',       default_value='0.1'),
         DeclareLaunchArgument('ramp_interval',   default_value='5.0'),

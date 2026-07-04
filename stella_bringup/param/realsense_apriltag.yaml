@@ -1,2 +1,6 @@
 color_qos: SENSOR_DATA
 color_info_qos: SENSOR_DATA
+enable_depth: false
+camera.color.image_raw.enable_pub_plugins:
+  - image_transport/raw
+  - image_transport/compressed

@@ -396,21 +396,21 @@ ros2 run docking dock_turn_backup --ros-args \
 정렬 방향이 반대로 보이면 `-p lidar_align_kp:=-0.8`로 부호를 바꿔 테스트할 수 있음
 LiDAR 평면이 잘 안 잡히면 `lidar_align_sector_width`, `lidar_align_max_range`,
 `lidar_align_ransac_threshold`를 현장 구조에 맞춰 조정
-LiDAR `/scan` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
+LiDAR `/scan_2` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
 
-참고: STELLA N5 URDF에서 `base_scan`은 `base_link` 대비 yaw가 `pi`라서 `/scan`의 0도 방향이 로봇 후방을 향함.
+참고: STELLA N5 URDF에서 `base_scan2`는 `base_link` 대비 yaw가 `pi`라서 `/scan_2`의 0도 방향이 로봇 후방을 향함.
 
 후진 단계는 기본적으로 odom 누적 이동거리 대신 LiDAR 후방 거리로 종료함.
-상단 라이다에서 뒤 범퍼까지의 거리 `0.4315m`를 빼서 뒤 범퍼 기준 clearance를 계산하고,
+2번 라이다에서 뒤 범퍼까지의 거리 `0.0635m`를 빼서 뒤 범퍼 기준 clearance를 계산하고,
 기본값은 뒤 범퍼가 벽/태그에서 약 `0.01m` 남았을 때 정지함.
 
 ```bash
 ros2 run docking dock_turn_backup --ros-args \
   -p use_lidar_backup:=true \
-  -p backup_scan_topic:=/scan \
+  -p backup_scan_topic:=/scan_2 \
   -p backup_lidar_sector_center:=0.0 \
   -p backup_lidar_sector_width:=0.3491 \
-  -p backup_lidar_to_rear_bumper_offset:=0.4315 \
+  -p backup_lidar_to_rear_bumper_offset:=0.0635 \
   -p backup_target_rear_clearance:=0.01
 ```
 
