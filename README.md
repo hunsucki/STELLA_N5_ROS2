@@ -348,9 +348,126 @@ ros2 run docking dock_turn_backup
 - `docking/docking/stack_manager.py`: AprilTag, bridge, docking server 실행/종료
 - `docking/docking/lifecycle.py`: docking server lifecycle configure/activate
 - `docking/docking/motion.py`: odom 기반 180도 회전, 후진, 정지 명령
-- `docking/docking/lidar_alignment.py`: `/scan` 평면 검출 및 yaw 미세 보정
+- `docking/docking/lidar_alignment.py`: `/scan_2` 평면 검출 및 yaw 미세 보정
+- `docking/docking/charging.py`: 충전기 접촉, 충전 시작, 안정 전류 확인
+- `docking/docking/safety.py`: 종료 코드와 단일 인스턴스 lock
 - `docking/config/docking.yaml`: OpenNav docking server 파라미터
 - `docking/config/tags_36h11.yaml`: AprilTag 인식 파라미터
+
+### 현재 개발 테스트 모드
+
+현재 소스의 `development_test_mode` 기본값은 개발 편의를 위해 **`true`로 고정**되어 있다.
+따라서 별도 파라미터 없이 실행하면 AprilTag 접근, 180도 회전, LiDAR 평면 정렬,
+LiDAR 거리 기반 후진이 정상 완료된 시점에 충전 상태를 확인하지 않고 종료 코드 `0`을 반환한다.
+
+```bash
+ros2 run docking dock_turn_backup
+```
+
+이 모드는 실제 체결이나 충전을 보장하지 않으므로 운영 투입 전 반드시 기본값을 `false`로
+변경하거나 원격 명령에서 아래처럼 명시해야 한다.
+
+```bash
+ros2 run docking dock_turn_backup --ros-args \
+  -p development_test_mode:=false
+```
+
+운영 모드에서는 후진 완료 후 다음 순서까지 성공해야 종료 코드 `0`을 반환한다.
+
+1. `/sk120/available`에서 SK120 접촉 상태 확인
+2. `/sk120/cmd_output`에 `true`를 발행해 충전 시작
+3. `/battery_state`가 `CHARGING`이고 전류가 기본 `0.05A` 이상인지 확인
+4. 위 상태가 기본 `3초` 동안 안정적으로 유지되는지 확인
+
+충전 접촉 또는 전류 확인이 기본 `18초` 안에 완료되지 않으면 로봇을 정지하고 종료 코드 `6`으로 끝난다.
+이미 실제 충전 전류가 흐르는 상태에서 명령을 다시 실행하면 로봇을 움직이지 않고 성공 처리한다.
+
+### drive_manager SSH 실행 계약
+
+Jetson의 `drive_manager`는 stdout이나 ROS 토픽을 성공 신호로 해석하지 않고,
+SSH로 실행한 `dock_turn_backup` 프로세스의 종료 코드만 사용한다. 이 패키지는 다음 계약을 적용한다.
+
+- 프로세스는 전체 도킹이 끝날 때까지 포그라운드에서 실행됨
+- 전체 내부 제한 시간은 기본 `100초`로 Jetson의 `120초` 제한보다 짧음
+- 정상, 실패, 예외, timeout, 신호 종료에서 `/cmd_vel` 0을 여러 번 발행함
+- 충전 시작 명령을 보낸 뒤 성공을 확인하지 못한 종료 경로에서는 `/sk120/cmd_output: false`도 반복 발행함
+- SIGINT, SIGTERM, SIGHUP을 중단 요청으로 처리하고 진행 중인 action을 취소함
+- Linux parent-death signal을 설정해 SSH 명령의 직접 부모 프로세스가 종료되면 SIGTERM 정리 경로로 진입함
+- 실행 중 시작한 AprilTag, bridge, docking server의 프로세스 그룹을 SIGINT, SIGTERM, SIGKILL 순서로 정리함
+- `/tmp/stella_dock_turn_backup.lock`의 advisory lock으로 중복 실행을 거부함
+- lock은 프로세스 종료 시 커널이 자동 해제하므로 stale lock 파일이 남아도 재실행 가능함
+- `DOCKING_LOCK_FILE` 환경 변수로 lock 경로를 변경할 수 있음
+
+종료 코드:
+
+| 코드 | 의미 |
+| ---: | --- |
+| `0` | 성공. 현재 개발 모드에서는 거리 기반 후진 완료, 운영 모드에서는 안정 충전 확인 완료 |
+| `1` | 처리되지 않은 내부 오류 또는 cleanup 오류 |
+| `2` | 잘못된 파라미터 또는 중복 실행 거부 |
+| `3` | 필수 센서, TF, odom, AprilTag pose, docking server 사용 불가 |
+| `4` | 도킹 접근, 회전, LiDAR 정렬 또는 후진 실패 |
+| `5` | 전체 `100초` timeout |
+| `6` | 접촉 또는 충전 전류 확인 실패 |
+| `129` | SIGHUP 중단 |
+| `130` | SIGINT 중단 |
+| `143` | SIGTERM 중단 |
+
+주요 안전/운영 파라미터:
+
+| 파라미터 | 현재 기본값 | 설명 |
+| --- | ---: | --- |
+| `development_test_mode` | `true` | `true`이면 후진 완료 후 충전 확인 없이 성공 |
+| `total_timeout_sec` | `100.0` | 전체 도킹 내부 제한 시간 |
+| `charger_wait_timeout_sec` | `18.0` | 접촉 및 충전 확인 제한 시간 |
+| `charging_stable_sec` | `3.0` | 충전 상태 최소 유지 시간 |
+| `charging_min_current` | `0.05` | 성공 판정 최소 충전 전류(A) |
+| `existing_charging_wait_sec` | `2.5` | 시작 시 이미 충전 중인지 확인하는 시간 |
+| `motion_timeout_sec` | `45.0` | 개별 회전/후진 제한 시간 |
+| `max_staging_time` | `40.0` | DockRobot staging 제한 시간 |
+| `dock_pose_wait_timeout_sec` | `10.0` | `detected_dock_pose` 입력 대기 시간 |
+
+베이스 드라이버 `stella_md_node`에도 독립적인 `/cmd_vel` watchdog을 추가했다.
+`cmd_vel_timeout_sec`의 현재 기본값은 `0.5초`이며, 마지막 속도 명령 이후 이 시간이 지나면
+모터 드라이버에 직접 0속도를 보낸다. `0.0`으로 설정하면 watchdog이 비활성화되므로 운영에서는 권장하지 않는다.
+parent-death signal은 직접 부모 종료를 감지하는 Linux 보호 장치이며 네트워크 자체의 heartbeat는 아니다.
+SSH 서버와 원격 부모가 비정상적으로 계속 살아 있는 특수 장애까지 포함하려면 향후
+`drive_manager`와 로봇 측 supervisor 사이에 별도 heartbeat 또는 stop service를 추가해야 한다.
+
+AprilTag 입력은 RealSense의 `BEST_EFFORT` 영상 QoS와 맞도록
+`docking/config/tags_36h11.yaml`의 `qos_profile`을 `sensor_data`로 사용한다.
+`dock_turn_backup`은 `detected_dock_pose`를 먼저 확인한 뒤 DockRobot action을 요청하므로,
+태그 ID `0`이 보이지 않거나 QoS/TF가 끊긴 상태에서는 움직임 단계로 진입하지 않는다.
+
+`dock_turn_backup`은 `/cmd_vel`을 직접 발행하므로 `drive_manager`가 Nav2 navigation을
+PAUSE한 뒤에만 실행해야 한다. 도킹 중에는 teleop이나 별도 `/cmd_vel` publisher를 실행하지 않는다.
+현재 원격 명령에는 Nav2 PAUSE를 로봇 측에서 독립 확인할 인터페이스가 없으므로 이 선행 조건은
+Jetson의 `drive_manager`가 계속 보장해야 한다. 현장 점검에는 다음 명령을 사용한다.
+
+```bash
+ros2 topic info /cmd_vel --verbose
+```
+
+변경 후 빌드와 테스트:
+
+```bash
+cd ~/colcon_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select docking stella_md
+source install/setup.bash
+colcon test --packages-select docking stella_md
+colcon test-result --verbose
+```
+
+실행 전 `robot.launch.py`에서 RealSense, `/scan_2`, odom/TF, battery, motor driver가 먼저 올라와 있어야 한다.
+
+```bash
+# 터미널 1
+ros2 launch stella_bringup robot.launch.py
+
+# 터미널 2: 현재 기본 개발 테스트 모드
+ros2 run docking dock_turn_backup
+```
 
 이미 AprilTag나 docking server를 따로 실행해 둔 상태에서 테스트하려면 필요한 자동 실행만 끌 수 있는 기능 포함
 
@@ -367,16 +484,16 @@ ros2 run docking dock_turn_backup --ros-args \
 ### LiDAR 평면 기반 회전 보정
 
 `dock_turn_backup`은 AprilTag 도킹 접근 후 odom 기반 180도 회전을 먼저 수행하고,
-후진하기 전에 `/scan`에서 벽/태그 평면을 찾아 yaw를 미세 보정함
+후진하기 전에 `/scan_2`에서 벽/태그 평면을 찾아 yaw를 미세 보정함
 
 현재 도킹 시나리오에서는 180도 회전이 끝난 뒤 로봇이 후진으로 벽/태그 쪽에 접근하므로,
 보정에 사용할 평면은 로봇 기준 후방에 위치함. 따라서 실제 운용에서는
-상단 라이다 `/scan`의 후방 방향인 `lidar_align_sector_center:=0.0`을 사용함.
+2번 라이다 `/scan_2`의 후방 방향인 `lidar_align_sector_center:=0.0`을 사용함.
 
 기본 동작:
 
 - `lidar_align_sector_center`를 중심으로 `lidar_align_sector_width`만큼의 LaserScan 점만 사용
-- 현재 후진 도킹 시나리오 권장값은 상단 라이다 `/scan` 기준 0도 방향의 60도 영역
+- 현재 후진 도킹 시나리오 권장값은 2번 라이다 `/scan_2` 기준 0도 방향의 60도 영역
 - RANSAC으로 가장 그럴듯한 직선 평면을 찾음
 - 평면의 normal 방향이 로봇 뒤쪽(`pi`)을 향하도록 `/cmd_vel.angular.z`로 저속 보정
 - 오차가 약 2도 이내로 안정되면 후진 단계로 넘어감
@@ -399,6 +516,8 @@ LiDAR 평면이 잘 안 잡히면 `lidar_align_sector_width`, `lidar_align_max_r
 LiDAR `/scan_2` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
 
 참고: STELLA N5 URDF에서 `base_scan2`는 `base_link` 대비 yaw가 `pi`라서 `/scan_2`의 0도 방향이 로봇 후방을 향함.
+현재 RealSense 포함 URDF의 장착 위치는 `xyz="-0.166 0.0 0.223"`,
+`rpy="0.0 0.0 3.1415"`이며 도킹 기본값은 이 2번 LiDAR를 사용함.
 
 후진 단계는 기본적으로 odom 누적 이동거리 대신 LiDAR 후방 거리로 종료함.
 2번 라이다에서 뒤 범퍼까지의 거리 `0.0635m`를 빼서 뒤 범퍼 기준 clearance를 계산하고,

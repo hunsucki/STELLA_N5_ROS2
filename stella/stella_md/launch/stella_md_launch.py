@@ -19,6 +19,7 @@ def generate_launch_description():
                                     'imu_yaw_max_rate': 2.0,
                                     'imu_yaw_filter_tau_sec': 0.0,
                                     'imu_yaw_jump_warn_threshold': 0.25,
+                                    'cmd_vel_timeout_sec': 0.5,
                                 }],
                                 namespace='/',
                                 )

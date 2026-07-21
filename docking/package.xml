@@ -18,6 +18,7 @@
   <depend>opennav_docking</depend>
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>tf2_ros</depend>
 
   <test_depend>ament_copyright</test_depend>

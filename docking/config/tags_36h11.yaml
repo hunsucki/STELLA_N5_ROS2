@@ -4,7 +4,7 @@
     family: 36h11
     size: 0.154
     max_hamming: 1
-    qos_profile: default
+    qos_profile: sensor_data
 
     detector:
       threads: 1

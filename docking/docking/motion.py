@@ -1,5 +1,5 @@
 import math
-from typing import Any
+from typing import Any, Callable
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -34,8 +34,11 @@ class MotionController:
         node.declare_parameter('motion_timeout_sec', 45.0)
         node.declare_parameter('server_wait_timeout_sec', 10.0)
 
-    def __init__(self, node: Node) -> None:
+    def __init__(
+            self, node: Node,
+            should_stop: Callable[[], bool] | None = None) -> None:
         self.node = node
+        self.should_stop = should_stop or (lambda: False)
         self.cmd_vel_pub = node.create_publisher(
             Twist, node.get_parameter('cmd_vel_topic').value, 10)
         self.odom_sub = node.create_subscription(
@@ -53,13 +56,16 @@ class MotionController:
         start = self.node.get_clock().now()
         self.node.get_logger().info('Waiting for odom...')
 
-        while rclpy.ok() and self.last_odom is None:
+        while (
+                rclpy.ok()
+                and not self.should_stop()
+                and self.last_odom is None):
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if (self.node.get_clock().now() - start).nanoseconds / 1e9 > timeout:
                 self.node.get_logger().error('odom is not available')
                 return False
 
-        return True
+        return self.last_odom is not None
 
     def spin_180(self) -> bool:
         target_yaw = float(self.node.get_parameter('spin_yaw').value)
@@ -129,7 +135,7 @@ class MotionController:
             'Backing up using LiDAR rear clearance: '
             f'target={target_clearance:.3f}m, speed={speed:.3f}m/s')
 
-        while rclpy.ok():
+        while rclpy.ok() and not self.should_stop():
             rclpy.spin_once(self.node, timeout_sec=0.0)
 
             elapsed = (self.node.get_clock().now() - start).nanoseconds / 1e9
@@ -171,9 +177,12 @@ class MotionController:
 
             rclpy.spin_once(self.node, timeout_sec=sleep_time)
 
+        self.stop_robot()
         return False
 
     def stop_robot(self) -> None:
+        if not rclpy.ok():
+            return
         stop = Twist()
         for _ in range(5):
             self.cmd_vel_pub.publish(stop)
@@ -184,7 +193,7 @@ class MotionController:
         sleep_time = 1.0 / max(rate_hz, 1.0)
         start = self.node.get_clock().now()
 
-        while rclpy.ok():
+        while rclpy.ok() and not self.should_stop():
             rclpy.spin_once(self.node, timeout_sec=0.0)
             if done_cb():
                 return True

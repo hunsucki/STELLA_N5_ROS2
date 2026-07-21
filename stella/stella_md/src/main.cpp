@@ -49,6 +49,7 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
   imu_yaw_max_rate_ = this->declare_parameter<double>("imu_yaw_max_rate", 2.0);
   imu_yaw_filter_tau_sec_ = this->declare_parameter<double>("imu_yaw_filter_tau_sec", 0.0);
   imu_yaw_jump_warn_threshold_ = this->declare_parameter<double>("imu_yaw_jump_warn_threshold", 0.25);
+  cmd_vel_timeout_sec_ = this->declare_parameter<double>("cmd_vel_timeout_sec", 0.5);
   if (imu_timeout_sec_ <= 0.0)
   {
     imu_timeout_sec_ = 0.0;
@@ -64,6 +65,10 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
   if (imu_yaw_jump_warn_threshold_ <= 0.0)
   {
     imu_yaw_jump_warn_threshold_ = 0.25;
+  }
+  if (cmd_vel_timeout_sec_ < 0.0)
+  {
+    cmd_vel_timeout_sec_ = 0.0;
   }
 
   if (use_imu_data_orientation_)
@@ -88,6 +93,17 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
 
 stellaN5_node::~stellaN5_node()
 {
+  if (RUN)
+  {
+    try
+    {
+      dual_m_command(dual_m_command_select::m_lav, 0.0, 0.0);
+    }
+    catch (const std::exception & e)
+    {
+      RCLCPP_WARN(this->get_logger(), "Final motor stop failed: %s", e.what());
+    }
+  }
   MW_Serial_DisConnect();
 }
 
@@ -180,6 +196,9 @@ void stellaN5_node::command_velocity_callback(const geometry_msgs::msg::Twist::S
   {
     goal_linear_velocity_ = cmd_vel_msg->linear.x;
     goal_angular_velocity_ = cmd_vel_msg->angular.z ;
+    last_cmd_vel_time_ = std::chrono::steady_clock::now();
+    cmd_vel_received_ = true;
+    cmd_vel_watchdog_stopped_ = false;
 
     try
     {
@@ -198,6 +217,32 @@ void stellaN5_node::serial_callback()
 {
   if(RUN)
   {
+    if (cmd_vel_timeout_sec_ > 0.0 && cmd_vel_received_ && !cmd_vel_watchdog_stopped_)
+    {
+      const double command_age = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - last_cmd_vel_time_).count();
+      if (command_age > cmd_vel_timeout_sec_)
+      {
+        goal_linear_velocity_ = 0.0;
+        goal_angular_velocity_ = 0.0;
+        try
+        {
+          dual_m_command(dual_m_command_select::m_lav, 0.0, 0.0);
+          cmd_vel_watchdog_stopped_ = true;
+          RCLCPP_WARN(
+              this->get_logger(),
+              "/cmd_vel timeout after %.3f s; motors stopped",
+              command_age);
+        }
+        catch (const std::exception & e)
+        {
+          RCLCPP_ERROR_THROTTLE(
+              this->get_logger(), *this->get_clock(), 1000,
+              "Motor watchdog stop failed: %s", e.what());
+        }
+      }
+    }
+
     try
     {
       Motor_MonitoringCommand(channel_1, _position);

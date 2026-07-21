@@ -1,6 +1,8 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include <chrono>
+
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -41,11 +43,15 @@ private:
     double imu_yaw_max_rate_ = 2.0;
     double imu_yaw_filter_tau_sec_ = 0.0;
     double imu_yaw_jump_warn_threshold_ = 0.25;
+    double cmd_vel_timeout_sec_ = 0.5;
     bool use_imu_data_orientation_ = false;
     bool use_imu_yaw_filter_ = false;
     bool imu_data_received_ = false;
     bool yaw_received_ = false;
     bool filtered_yaw_initialized_ = false;
+    bool cmd_vel_received_ = false;
+    bool cmd_vel_watchdog_stopped_ = false;
+    std::chrono::steady_clock::time_point last_cmd_vel_time_;
     rclcpp::Time latest_imu_stamp_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_yaw_receive_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_filtered_yaw_stamp_{0, 0, RCL_ROS_TIME};

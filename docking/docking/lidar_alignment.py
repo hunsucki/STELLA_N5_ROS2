@@ -1,13 +1,12 @@
 import math
 import random
 
+from docking.motion import MotionController
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
-
-from docking.motion import MotionController
 
 
 class LidarPlaneAligner:
@@ -59,7 +58,7 @@ class LidarPlaneAligner:
 
         self.node.get_logger().info('Fine-aligning yaw using LiDAR plane...')
 
-        while rclpy.ok():
+        while rclpy.ok() and not self.motion.should_stop():
             rclpy.spin_once(self.node, timeout_sec=0.0)
             elapsed = (self.node.get_clock().now() - start).nanoseconds / 1e9
             if elapsed > timeout_sec:
@@ -115,6 +114,7 @@ class LidarPlaneAligner:
 
             rclpy.spin_once(self.node, timeout_sec=sleep_time)
 
+        self.motion.stop_robot()
         return False
 
     def _estimate_error(
