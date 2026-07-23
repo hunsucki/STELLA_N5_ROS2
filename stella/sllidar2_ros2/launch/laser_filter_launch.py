@@ -14,6 +14,6 @@ def generate_launch_description():
                 PathJoinSubstitution([
                     get_package_share_directory("sllidar2_ros2"),
                     "filter_params", "laser_filter_param.yaml",
-                ])],# 5~175 deg filter
+                ])],  # Legacy lower-mount bounds; disabled in robot.launch.py.
         )
     ])

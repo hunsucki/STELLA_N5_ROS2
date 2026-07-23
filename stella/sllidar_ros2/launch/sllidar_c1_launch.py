@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.actions import LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -18,15 +14,7 @@ def generate_launch_description():
     inverted = LaunchConfiguration('inverted', default='false')
     angle_compensate = LaunchConfiguration('angle_compensate', default='true')
     scan_mode = LaunchConfiguration('scan_mode', default='Standard')
-    
-    tf2_node = Node(package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='static_tf_pub_laser',
-                    arguments=['0.18', '0', '0.28','0', '0', '1', '0','base_link','base_scan'],
-                    )
-
     return LaunchDescription([
-        # tf2_node,
         DeclareLaunchArgument(
             'channel_type',
             default_value=channel_type,
@@ -77,4 +65,3 @@ def generate_launch_description():
 
             
     ])
-

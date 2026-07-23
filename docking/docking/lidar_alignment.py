@@ -1,23 +1,28 @@
 import math
 import random
+import time
 
+from docking.docking_lidar import DockingLidar, ScanSnapshot
+from docking.lidar_geometry import (
+    line_orientation_error,
+    normalize_angle,
+    UniqueScanStability,
+)
 from docking.motion import MotionController
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import LaserScan
 
 
 class LidarPlaneAligner:
     @staticmethod
     def declare_parameters(node: Node) -> None:
         node.declare_parameter('use_lidar_alignment', True)
-        node.declare_parameter('scan_topic', '/scan_2')
         node.declare_parameter('lidar_align_timeout_sec', 8.0)
-        node.declare_parameter('lidar_align_sector_center', 0.0)
+        node.declare_parameter('lidar_align_sector_center', math.nan)
+        node.declare_parameter('lidar_align_sector_center_base', math.pi)
         node.declare_parameter('lidar_align_sector_width', math.radians(60.0))
-        node.declare_parameter('lidar_align_target_normal_angle', math.pi)
+        node.declare_parameter('lidar_align_target_line_angle', math.pi / 2.0)
         node.declare_parameter('lidar_align_min_range', 0.15)
         node.declare_parameter('lidar_align_max_range', 2.0)
         node.declare_parameter('lidar_align_min_points', 20)
@@ -30,18 +35,20 @@ class LidarPlaneAligner:
         node.declare_parameter('lidar_align_angular_speed', 0.08)
         node.declare_parameter('lidar_align_min_angular_speed', 0.02)
         node.declare_parameter('lidar_align_stable_cycles', 4)
+        node.declare_parameter(
+            'lidar_align_max_rotation', math.radians(15.0))
 
-    def __init__(self, node: Node, motion: MotionController) -> None:
+    def __init__(
+            self, node: Node, motion: MotionController,
+            lidar: DockingLidar) -> None:
         self.node = node
         self.motion = motion
-        self.scan_sub = node.create_subscription(
-            LaserScan,
-            node.get_parameter('scan_topic').value,
-            self._scan_callback,
-            qos_profile_sensor_data)
-        self.last_scan: LaserScan | None = None
+        self.lidar = lidar
 
     def align(self) -> bool:
+        if not self.validate_parameters():
+            return False
+
         timeout_sec = float(self.node.get_parameter('lidar_align_timeout_sec').value)
         tolerance = abs(float(self.node.get_parameter('lidar_align_tolerance').value))
         max_speed = abs(float(self.node.get_parameter('lidar_align_angular_speed').value))
@@ -53,7 +60,13 @@ class LidarPlaneAligner:
         rate_hz = float(self.node.get_parameter('control_rate_hz').value)
         sleep_time = 1.0 / max(rate_hz, 1.0)
         start = self.node.get_clock().now()
-        stable_cycles = 0
+        start_yaw = self.motion.current_yaw()
+        max_rotation = float(
+            self.node.get_parameter('lidar_align_max_rotation').value)
+        stage_start_sequence = self.lidar.sequence
+        stability = UniqueScanStability(
+            stable_cycles_required, stage_start_sequence)
+        current_command = Twist()
         last_log_time = 0.0
 
         self.node.get_logger().info('Fine-aligning yaw using LiDAR plane...')
@@ -66,41 +79,78 @@ class LidarPlaneAligner:
                 self.node.get_logger().error('LiDAR plane alignment timed out')
                 return False
 
-            if self.last_scan is None:
-                self.motion.cmd_vel_pub.publish(Twist())
+            if not self.motion.odom_is_fresh():
+                self.motion.stop_robot()
+                self.node.get_logger().error(
+                    'Odometry became stale during LiDAR alignment')
+                return False
+
+            rotation = abs(MotionController.normalize_angle(
+                self.motion.current_yaw() - start_yaw))
+            if rotation >= max_rotation:
+                self.motion.stop_robot()
+                self.node.get_logger().error(
+                    'LiDAR alignment exceeded the rotation safety limit: '
+                    f'{math.degrees(rotation):.2f}deg >= '
+                    f'{math.degrees(max_rotation):.2f}deg')
+                return False
+
+            snapshot = self.lidar.snapshot()
+            if snapshot is None:
+                stability.reset()
+                current_command = Twist()
+                self.motion.cmd_vel_pub.publish(current_command)
+                if (
+                        time.monotonic() - self.lidar.last_valid_received_at
+                        > self.lidar.max_scan_age):
+                    self.motion.stop_robot()
+                    self.node.get_logger().error(
+                        'Docking LiDAR failed during alignment: '
+                        f'{self.lidar.last_error}')
+                    return False
                 rclpy.spin_once(self.node, timeout_sec=sleep_time)
                 continue
 
-            estimate = self._estimate_error(self.last_scan)
+            if snapshot.sequence == stability.last_sequence:
+                self.motion.cmd_vel_pub.publish(current_command)
+                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                continue
+
+            estimate = self._estimate_error(snapshot)
             if estimate is None:
-                stable_cycles = 0
+                stability.observe(snapshot.sequence, False)
+                current_command = Twist()
                 now = self.node.get_clock().now().nanoseconds / 1e9
                 if now - last_log_time >= 1.0:
                     self.node.get_logger().info('Waiting for a valid LiDAR plane...')
                     last_log_time = now
-                self.motion.cmd_vel_pub.publish(Twist())
+                self.motion.cmd_vel_pub.publish(current_command)
                 rclpy.spin_once(self.node, timeout_sec=sleep_time)
                 continue
 
-            error, normal_angle, inliers, total_points, line_length = estimate
-            if abs(error) <= tolerance:
-                stable_cycles += 1
-                self.motion.stop_robot()
-                if stable_cycles >= stable_cycles_required:
-                    self.node.get_logger().info(
-                        'LiDAR plane alignment complete: '
-                        f'error={math.degrees(error):.2f}deg, '
-                        f'normal={math.degrees(normal_angle):.2f}deg, '
-                        f'inliers={inliers}/{total_points}, '
-                        f'line_length={line_length:.2f}m')
-                    return True
+            error, line_angle, inliers, total_points, line_length = estimate
+            aligned = abs(error) <= tolerance
+            complete = stability.observe(snapshot.sequence, aligned)
+            if aligned:
+                current_command = Twist()
             else:
-                stable_cycles = 0
                 angular_z = self._clamp(kp * error, -max_speed, max_speed)
                 if abs(angular_z) < min_speed:
                     angular_z = math.copysign(min_speed, angular_z)
-                self.motion.cmd_vel_pub.publish(
-                    MotionController.twist(angular_z=angular_z))
+                angular_z = self._clamp(angular_z, -max_speed, max_speed)
+                current_command = MotionController.twist(angular_z=angular_z)
+
+            self.motion.cmd_vel_pub.publish(current_command)
+            if complete:
+                self.motion.stop_robot()
+                self.node.get_logger().info(
+                    'LiDAR plane alignment complete: '
+                    f'error={math.degrees(error):.2f}deg, '
+                    f'line={math.degrees(line_angle):.2f}deg, '
+                    f'inliers={inliers}/{total_points}, '
+                    f'line_length={line_length:.2f}m, '
+                    f'unique_scans={stability.count}')
+                return True
 
             now = self.node.get_clock().now().nanoseconds / 1e9
             if now - last_log_time >= 1.0:
@@ -118,8 +168,9 @@ class LidarPlaneAligner:
         return False
 
     def _estimate_error(
-            self, scan: LaserScan) -> tuple[float, float, int, int, float] | None:
-        points = self._scan_points_in_sector(scan)
+            self, snapshot: ScanSnapshot
+            ) -> tuple[float, float, int, int, float] | None:
+        points = self._scan_points_in_sector(snapshot)
         min_points = int(self.node.get_parameter('lidar_align_min_points').value)
         if len(points) < min_points:
             return None
@@ -140,36 +191,111 @@ class LidarPlaneAligner:
             return None
 
         target_angle = float(
-            self.node.get_parameter('lidar_align_target_normal_angle').value)
-        normal_a = MotionController.normalize_angle(line_angle + math.pi / 2.0)
-        normal_b = MotionController.normalize_angle(line_angle - math.pi / 2.0)
-        if abs(MotionController.normalize_angle(normal_a - target_angle)) <= abs(
-                MotionController.normalize_angle(normal_b - target_angle)):
-            normal_angle = normal_a
-        else:
-            normal_angle = normal_b
+            self.node.get_parameter('lidar_align_target_line_angle').value)
+        error = line_orientation_error(line_angle, target_angle)
+        return error, line_angle, len(inliers), len(points), line_length
 
-        error = MotionController.normalize_angle(normal_angle - target_angle)
-        return error, normal_angle, len(inliers), len(points), line_length
-
-    def _scan_points_in_sector(self, scan: LaserScan) -> list[tuple[float, float]]:
-        center = float(self.node.get_parameter('lidar_align_sector_center').value)
-        half_width = abs(float(
-            self.node.get_parameter('lidar_align_sector_width').value)) / 2.0
+    def _scan_points_in_sector(
+            self, snapshot: ScanSnapshot) -> list[tuple[float, float]]:
+        center = float(self.node.get_parameter(
+            'lidar_align_sector_center_base').value)
+        width = abs(float(
+            self.node.get_parameter('lidar_align_sector_width').value))
         min_range = float(self.node.get_parameter('lidar_align_min_range').value)
         max_range = float(self.node.get_parameter('lidar_align_max_range').value)
-        points: list[tuple[float, float]] = []
+        projected = self.lidar.project(
+            snapshot, center, width, min_range, max_range)
+        if projected is None:
+            return []
+        return [(point.x, point.y) for point in projected]
 
-        angle = scan.angle_min
-        for distance in scan.ranges:
-            if (
-                    math.isfinite(distance)
-                    and min_range <= distance <= max_range
-                    and abs(MotionController.normalize_angle(angle - center)) <= half_width):
-                points.append((distance * math.cos(angle), distance * math.sin(angle)))
-            angle += scan.angle_increment
+    def validate_parameters(self) -> bool:
+        legacy_center = float(
+            self.node.get_parameter('lidar_align_sector_center').value)
+        if math.isfinite(legacy_center):
+            self.node.get_logger().error(
+                'lidar_align_sector_center used the old scan-frame convention. '
+                'Use lidar_align_sector_center_base with base_link angles.')
+            return False
 
-        return points
+        values = {
+            'timeout': float(self.node.get_parameter(
+                'lidar_align_timeout_sec').value),
+            'center': float(self.node.get_parameter(
+                'lidar_align_sector_center_base').value),
+            'width': float(self.node.get_parameter(
+                'lidar_align_sector_width').value),
+            'target_line': float(self.node.get_parameter(
+                'lidar_align_target_line_angle').value),
+            'min_range': float(self.node.get_parameter(
+                'lidar_align_min_range').value),
+            'max_range': float(self.node.get_parameter(
+                'lidar_align_max_range').value),
+            'tolerance': float(self.node.get_parameter(
+                'lidar_align_tolerance').value),
+            'kp': float(self.node.get_parameter('lidar_align_kp').value),
+            'max_speed': float(self.node.get_parameter(
+                'lidar_align_angular_speed').value),
+            'min_speed': float(self.node.get_parameter(
+                'lidar_align_min_angular_speed').value),
+            'max_rotation': float(self.node.get_parameter(
+                'lidar_align_max_rotation').value),
+            'control_rate': float(self.node.get_parameter(
+                'control_rate_hz').value),
+            'odom_max_age': float(self.node.get_parameter(
+                'odom_max_age_sec').value),
+        }
+        if not all(math.isfinite(value) for value in values.values()):
+            self.node.get_logger().error(
+                'LiDAR alignment parameters must all be finite')
+            return False
+
+        min_points = int(self.node.get_parameter(
+            'lidar_align_min_points').value)
+        min_inliers = int(self.node.get_parameter(
+            'lidar_align_min_inliers').value)
+        iterations = int(self.node.get_parameter(
+            'lidar_align_ransac_iterations').value)
+        stable_cycles = int(self.node.get_parameter(
+            'lidar_align_stable_cycles').value)
+        threshold = float(self.node.get_parameter(
+            'lidar_align_ransac_threshold').value)
+        min_line_length = float(self.node.get_parameter(
+            'lidar_align_min_line_length').value)
+        if not math.isfinite(threshold) or not math.isfinite(min_line_length):
+            self.node.get_logger().error(
+                'LiDAR alignment fit parameters must be finite')
+            return False
+
+        if (
+                values['timeout'] <= 0.0
+                or not 0.0 < values['width'] <= 2.0 * math.pi
+                or values['min_range'] < 0.0
+                or values['max_range'] <= values['min_range']
+                or values['tolerance'] < 0.0
+                or values['kp'] == 0.0
+                or values['max_speed'] <= 0.0
+                or not 0.0 < values['min_speed'] <= values['max_speed']
+                or values['max_rotation'] <= 0.0
+                or values['control_rate'] <= 0.0
+                or values['odom_max_age'] <= 0.0
+                or min_points < 2
+                or min_inliers < 2
+                or min_inliers > min_points
+                or iterations < 1
+                or stable_cycles < 1
+                or threshold <= 0.0
+                or min_line_length <= 0.0):
+            self.node.get_logger().error(
+                'LiDAR alignment parameters are outside safe bounds')
+            return False
+
+        if abs(normalize_angle(
+                math.pi - values['center'])) > values['width'] / 2.0:
+            self.node.get_logger().error(
+                'LiDAR alignment sector does not include robot rear (pi)')
+            return False
+        return True
 
     def _ransac_line_inliers(
             self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -226,9 +352,6 @@ class LidarPlaneAligner:
         ]
         line_length = max(projections) - min(projections)
         return line_angle, line_length
-
-    def _scan_callback(self, msg: LaserScan) -> None:
-        self.last_scan = msg
 
     @staticmethod
     def _clamp(value: float, lower: float, upper: float) -> float:

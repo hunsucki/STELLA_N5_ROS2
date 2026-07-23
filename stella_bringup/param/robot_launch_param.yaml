@@ -1,5 +1,6 @@
 launch_lidar2: true
-launch_lidar2_filter: true
+# Disabled until the angular filter is recalibrated for the rear upper mount.
+launch_lidar2_filter: false
 launch_usb_cam: false
 launch_realsense: true
 launch_pointcloud: false

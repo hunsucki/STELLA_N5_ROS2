@@ -110,18 +110,18 @@ def generate_launch_description():
             PythonLaunchDescriptionSource([ahrs_pkg_dir, '/stella_ahrs_launch.py'])
         ),
 
-        # Upper lidar launch
+        # Front upper lidar launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([lidar_pkg_dir, '/sllidar_c1_launch.py'])
         ),
 
-        # Bottom lidar launch
+        # Rear upper docking lidar launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([lidar2_pkg_dir, '/sllidar_c1_launch.py']),
             condition=IfCondition('true' if launch_lidar2 else 'false')
         ),
 
-        # Bottom lidar filter launch
+        # Optional rear-lidar filter launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([lidar2_pkg_dir, '/laser_filter_launch.py']),
             condition=IfCondition('true' if (launch_lidar2 and launch_lidar2_filter) else 'false')

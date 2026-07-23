@@ -1,5 +1,7 @@
 scan_to_scan_filter_chain:
   ros__parameters:
+    # Legacy bounds from the former lower mount. robot.launch.py keeps this
+    # filter disabled until the rear-upper mounting blind sectors are measured.
     filter1:
       name: angle
       type: laser_filters/LaserScanAngularBoundsFilter

@@ -1,8 +1,8 @@
 # STELLA serial device names.
 #
 # Current USB layout:
-# - Upper RPLIDAR: CP2102N serial 4a237fb90464ef11947fe2a9c169b110
-# - Lower RPLIDAR: CP2102N serial ccaf2ee0ed63ef11b4dddaa9c169b110
+# - Front upper RPLIDAR: CP2102N serial 4a237fb90464ef11947fe2a9c169b110
+# - Rear upper docking RPLIDAR: CP2102N serial ccaf2ee0ed63ef11b4dddaa9c169b110
 # - SK120 USB-TTL: PL2303 on hub port 4-1.2
 # - AHRS: FT230X
 # - Motor driver: FT232R

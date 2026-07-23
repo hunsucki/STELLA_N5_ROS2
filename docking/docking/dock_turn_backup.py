@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run AprilTag docking, LiDAR yaw alignment, backup, and cleanup."""
 
+import math
 import os
 import signal
 import sys
@@ -10,6 +11,7 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from docking.charging import ChargingVerifier
+from docking.docking_lidar import DockingLidar
 from docking.lidar_alignment import LidarPlaneAligner
 from docking.lifecycle import DockingLifecycleManager
 from docking.motion import MotionController
@@ -41,6 +43,7 @@ class DockTurnBackup(Node):
         DockingLifecycleManager.declare_parameters(self)
         MotionController.declare_parameters(self)
         LidarPlaneAligner.declare_parameters(self)
+        DockingLidar.declare_parameters(self)
         ChargingVerifier.declare_parameters(self)
         self._declare_docking_parameters()
         self._declare_tf_parameters()
@@ -51,11 +54,15 @@ class DockTurnBackup(Node):
         self.total_timed_out = False
         self._timeout_logged = False
 
-        self.motion = MotionController(self, self.should_stop)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.lidar = DockingLidar(self, self.tf_buffer)
+        self.motion = MotionController(self, self.lidar, self.should_stop)
         self.stack = ManagedStack(
             self, self.motion.stop_robot, self.should_stop)
         self.lifecycle = DockingLifecycleManager(self)
-        self.lidar_aligner = LidarPlaneAligner(self, self.motion)
+        self.lidar_aligner = LidarPlaneAligner(
+            self, self.motion, self.lidar)
         self.charging = ChargingVerifier(self, self.should_stop)
         self.last_dock_pose: PoseStamped | None = None
         self.dock_pose_sub = self.create_subscription(
@@ -66,8 +73,6 @@ class DockTurnBackup(Node):
 
         self.dock_client = ActionClient(
             self, DockRobot, self.get_parameter('dock_action').value)
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
     def run(self) -> DockingExitCode:
         total_timeout = float(self.get_parameter('total_timeout_sec').value)
@@ -109,6 +114,13 @@ class DockTurnBackup(Node):
         if not self._wait_for_base_transform():
             return self._failure_code(
                 DockingExitCode.SENSOR_OR_BASE_UNAVAILABLE)
+
+        if (
+                bool(self.get_parameter('use_lidar_alignment').value)
+                or bool(self.get_parameter('use_lidar_backup').value)):
+            if not self._wait_for_docking_lidar():
+                return self._failure_code(
+                    DockingExitCode.SENSOR_OR_BASE_UNAVAILABLE)
 
         self._warmup_docking_server_tf_buffer()
 
@@ -238,6 +250,50 @@ class DockTurnBackup(Node):
                 and not self.should_stop()
                 and time.monotonic() < deadline):
             rclpy.spin_once(self, timeout_sec=0.1)
+
+    def _wait_for_docking_lidar(self) -> bool:
+        if not self.lidar.validate_parameters():
+            self.get_logger().error(self.lidar.last_error)
+            return False
+
+        timeout = max(float(self.get_parameter(
+            'docking_lidar_wait_timeout_sec').value), 0.0)
+        topic = str(self.get_parameter('docking_lidar_topic').value)
+        frame = self.lidar.expected_frame()
+        deadline = time.monotonic() + timeout
+        last_log_time = 0.0
+
+        self.get_logger().info(
+            f'Waiting for docking LiDAR {topic} in frame {frame}...')
+
+        while rclpy.ok() and not self.should_stop():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            snapshot = self.lidar.snapshot()
+            transform = self.lidar.transform
+            if snapshot is not None and transform is not None:
+                self.get_logger().info(
+                    'Docking LiDAR ready: '
+                    f'{self.get_parameter("base_frame").value} <- {frame}, '
+                    f'xyz=({transform.x:.4f}, {transform.y:.4f}, '
+                    f'{self.lidar.transform_z:.4f})m, '
+                    f'yaw={math.degrees(transform.yaw):.2f}deg')
+                if (
+                        bool(self.get_parameter('use_lidar_backup').value)
+                        and not self.motion.validate_lidar_configuration()):
+                    return False
+                return True
+
+            now = time.monotonic()
+            if now - last_log_time >= 1.0:
+                self.get_logger().info(
+                    f'Still waiting for docking LiDAR: {self.lidar.last_error}')
+                last_log_time = now
+            if now >= deadline:
+                self.get_logger().error(
+                    f'Docking LiDAR is not ready: {self.lidar.last_error}')
+                return False
+
+        return False
 
     def _wait_for_detected_dock_pose(self) -> bool:
         timeout = float(self.get_parameter('dock_pose_wait_timeout_sec').value)

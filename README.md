@@ -131,7 +131,7 @@ stella_md_node
 ```text
 stella_bringup/param/robot_launch_param.yaml:
   launch_lidar2: true
-  launch_lidar2_filter: true
+  launch_lidar2_filter: false
 
 stella_ahrs_node:
   read_rate_hz: 900
@@ -180,8 +180,8 @@ ros2 param set /stella_md_node imu_yaw_max_rate 2.0
 ros2 param set /stella_md_node imu_yaw_filter_tau_sec 0.0
 ```
 
-두 번째 라이다 필터가 scan 표시나 costmap에 영향을 주는지 분리하려면
-`stella_bringup/param/robot_launch_param.yaml`에서 아래처럼 바꾼 뒤 bringup을 재시작한다.
+두 번째 라이다의 기존 각도 필터는 예전 하단 장착 방향 기준이므로, 후방 상단으로
+이동한 현재 구성에서는 기본적으로 비활성화한다.
 
 ```yaml
 launch_lidar2_filter: false
@@ -348,31 +348,26 @@ ros2 run docking dock_turn_backup
 - `docking/docking/stack_manager.py`: AprilTag, bridge, docking server 실행/종료
 - `docking/docking/lifecycle.py`: docking server lifecycle configure/activate
 - `docking/docking/motion.py`: odom 기반 180도 회전, 후진, 정지 명령
+- `docking/docking/docking_lidar.py`: `/scan_2` freshness, frame, TF를 공통 검증
+- `docking/docking/lidar_geometry.py`: LaserScan을 `base_link` 좌표로 투영하고 뒤 간격 계산
 - `docking/docking/lidar_alignment.py`: `/scan_2` 평면 검출 및 yaw 미세 보정
 - `docking/docking/charging.py`: 충전기 접촉, 충전 시작, 안정 전류 확인
 - `docking/docking/safety.py`: 종료 코드와 단일 인스턴스 lock
 - `docking/config/docking.yaml`: OpenNav docking server 파라미터
 - `docking/config/tags_36h11.yaml`: AprilTag 인식 파라미터
 
-### 현재 개발 테스트 모드
+### 개발 테스트 모드와 운영 모드
 
-현재 소스의 `development_test_mode` 기본값은 개발 편의를 위해 **`true`로 고정**되어 있다.
-따라서 별도 파라미터 없이 실행하면 AprilTag 접근, 180도 회전, LiDAR 평면 정렬,
-LiDAR 거리 기반 후진이 정상 완료된 시점에 충전 상태를 확인하지 않고 종료 코드 `0`을 반환한다.
+현재 소스의 `development_test_mode` 기본값은 **`true`**이다.
+따라서 별도 파라미터 없이 실행하면 AprilTag 접근, 회전, LiDAR 정렬과 후진을 완료한 뒤
+충전 접촉 및 전류를 확인하지 않고 종료 코드 `0`을 반환한다.
 
 ```bash
 ros2 run docking dock_turn_backup
 ```
 
-이 모드는 실제 체결이나 충전을 보장하지 않으므로 운영 투입 전 반드시 기본값을 `false`로
-변경하거나 원격 명령에서 아래처럼 명시해야 한다.
-
-```bash
-ros2 run docking dock_turn_backup --ros-args \
-  -p development_test_mode:=false
-```
-
-운영 모드에서는 후진 완료 후 다음 순서까지 성공해야 종료 코드 `0`을 반환한다.
+테스트 모드를 끄고 운영 모드로 실행하면 후진 완료 후 다음 순서까지 성공해야
+종료 코드 `0`을 반환한다. 테스트 모드를 끄는 명령은 README 맨 아래에 정리되어 있다.
 
 1. `/sk120/available`에서 SK120 접촉 상태 확인
 2. `/sk120/cmd_output`에 `true`를 발행해 충전 시작
@@ -402,7 +397,7 @@ SSH로 실행한 `dock_turn_backup` 프로세스의 종료 코드만 사용한�
 
 | 코드 | 의미 |
 | ---: | --- |
-| `0` | 성공. 현재 개발 모드에서는 거리 기반 후진 완료, 운영 모드에서는 안정 충전 확인 완료 |
+| `0` | 성공. 개발 모드로 실행한 경우 거리 기반 후진 완료, 운영 모드에서는 안정 충전 확인 완료 |
 | `1` | 처리되지 않은 내부 오류 또는 cleanup 오류 |
 | `2` | 잘못된 파라미터 또는 중복 실행 거부 |
 | `3` | 필수 센서, TF, odom, AprilTag pose, docking server 사용 불가 |
@@ -417,13 +412,15 @@ SSH로 실행한 `dock_turn_backup` 프로세스의 종료 코드만 사용한�
 
 | 파라미터 | 현재 기본값 | 설명 |
 | --- | ---: | --- |
-| `development_test_mode` | `true` | `true`이면 후진 완료 후 충전 확인 없이 성공 |
+| `development_test_mode` | `true` | `true`이면 후진 완료 후 충전 확인 없이 성공(벤치 전용) |
 | `total_timeout_sec` | `100.0` | 전체 도킹 내부 제한 시간 |
 | `charger_wait_timeout_sec` | `18.0` | 접촉 및 충전 확인 제한 시간 |
 | `charging_stable_sec` | `3.0` | 충전 상태 최소 유지 시간 |
 | `charging_min_current` | `0.05` | 성공 판정 최소 충전 전류(A) |
 | `existing_charging_wait_sec` | `2.5` | 시작 시 이미 충전 중인지 확인하는 시간 |
 | `motion_timeout_sec` | `45.0` | 개별 회전/후진 제한 시간 |
+| `docking_lidar_scan_max_age_sec` | `0.30` | 이 시간보다 오래된 scan이면 즉시 정지/실패 |
+| `backup_max_travel` | `0.60` | LiDAR 후진의 독립적인 odom 이동 한계(m) |
 | `max_staging_time` | `40.0` | DockRobot staging 제한 시간 |
 | `dock_pose_wait_timeout_sec` | `10.0` | `detected_dock_pose` 입력 대기 시간 |
 
@@ -453,7 +450,8 @@ ros2 topic info /cmd_vel --verbose
 ```bash
 cd ~/colcon_ws
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select docking stella_md
+colcon build --symlink-install --packages-select \
+  docking stella_md stella_description stella_bringup sllidar_ros2 sllidar2_ros2
 source install/setup.bash
 colcon test --packages-select docking stella_md
 colcon test-result --verbose
@@ -465,7 +463,7 @@ colcon test-result --verbose
 # 터미널 1
 ros2 launch stella_bringup robot.launch.py
 
-# 터미널 2: 현재 기본 개발 테스트 모드
+# 터미널 2: 기본 개발 테스트 모드(충전 확인 생략)
 ros2 run docking dock_turn_backup
 ```
 
@@ -488,22 +486,25 @@ ros2 run docking dock_turn_backup --ros-args \
 
 현재 도킹 시나리오에서는 180도 회전이 끝난 뒤 로봇이 후진으로 벽/태그 쪽에 접근하므로,
 보정에 사용할 평면은 로봇 기준 후방에 위치함. 따라서 실제 운용에서는
-2번 라이다 `/scan_2`의 후방 방향인 `lidar_align_sector_center:=0.0`을 사용함.
+`base_link` 기준 후방인 `lidar_align_sector_center_base:=3.14159`를 사용함.
 
 기본 동작:
 
-- `lidar_align_sector_center`를 중심으로 `lidar_align_sector_width`만큼의 LaserScan 점만 사용
-- 현재 후진 도킹 시나리오 권장값은 2번 라이다 `/scan_2` 기준 0도 방향의 60도 영역
+- `/scan_2`의 `frame_id`가 `base_scan2`인지 확인하고 URDF의 `base_scan2 -> base_link` TF를 조회
+- LaserScan 점을 `base_link` 좌표로 변환한 뒤 `lidar_align_sector_center_base` 중심 영역만 사용
+- 현재 권장값은 `base_link` 기준 후방 `pi` 방향의 60도 영역
 - RANSAC으로 가장 그럴듯한 직선 평면을 찾음
-- 평면의 normal 방향이 로봇 뒤쪽(`pi`)을 향하도록 `/cmd_vel.angular.z`로 저속 보정
-- 오차가 약 2도 이내로 안정되면 후진 단계로 넘어감
+- 평면 접선이 로봇의 좌우축(`pi/2`)과 평행해지도록 `/cmd_vel.angular.z`로 저속 보정
+- 서로 다른 최신 scan 4개에서 오차가 약 2도 이내이면 후진 단계로 넘어감
 
 주요 튜닝 파라미터:
 
 ```bash
 ros2 run docking dock_turn_backup --ros-args \
   -p use_lidar_alignment:=true \
-  -p lidar_align_sector_center:=0.0 \
+  -p docking_lidar_topic:=/scan_2 \
+  -p docking_lidar_frame:=base_scan2 \
+  -p lidar_align_sector_center_base:=3.14159 \
   -p lidar_align_sector_width:=1.0472 \
   -p lidar_align_tolerance:=0.0349 \
   -p lidar_align_angular_speed:=0.08 \
@@ -513,23 +514,34 @@ ros2 run docking dock_turn_backup --ros-args \
 정렬 방향이 반대로 보이면 `-p lidar_align_kp:=-0.8`로 부호를 바꿔 테스트할 수 있음
 LiDAR 평면이 잘 안 잡히면 `lidar_align_sector_width`, `lidar_align_max_range`,
 `lidar_align_ransac_threshold`를 현장 구조에 맞춰 조정
-LiDAR `/scan_2` 프레임에서 0도가 전방이 아닌 장착 구조라면 `lidar_align_sector_center`를 실제 평면이 보이는 방향으로 조정
+`lidar_align_sector_center_base`는 센서 로컬 각도가 아니라 `base_link` 기준 각도임.
 
 참고: STELLA N5 URDF에서 `base_scan2`는 `base_link` 대비 yaw가 `pi`라서 `/scan_2`의 0도 방향이 로봇 후방을 향함.
 현재 RealSense 포함 URDF의 장착 위치는 `xyz="-0.166 0.0 0.223"`,
 `rpy="0.0 0.0 3.1415"`이며 도킹 기본값은 이 2번 LiDAR를 사용함.
 
 후진 단계는 기본적으로 odom 누적 이동거리 대신 LiDAR 후방 거리로 종료함.
-2번 라이다에서 뒤 범퍼까지의 거리 `0.0635m`를 빼서 뒤 범퍼 기준 clearance를 계산하고,
-기본값은 뒤 범퍼가 벽/태그에서 약 `0.01m` 남았을 때 정지함.
+LaserScan 끝점을 TF로 `base_link`에 투영한 뒤 차체 collision box의 뒤 끝
+`backup_rear_reference_x:=-0.2295`와 비교한다. 따라서 센서 x 위치나 yaw를 코드에
+offset으로 중복 저장하지 않는다. 기본값은 뒤 기준면이 벽/태그에서 약 `0.01m`
+남았을 때 정지한다.
+
+새 위치에서 목표 시 센서 정면 거리는 약 `0.0735m`이므로 드라이버의 `range_min=0.05m`와
+코드의 `backup_lidar_min_range=0.05m`를 함께 사용한다. 시작할 때 목표 거리가 실제
+LaserScan 유효 범위 안인지 검사하며, 최소 3도에 걸친 인접 beam 5개와 서로 다른 최신 scan 3개가
+동시에 조건을 만족해야 완료로 인정한다. 단일 짧은 노이즈는 정지는 시키지만 성공으로
+처리하지 않는다. 넓은 150도 후방 fan으로 차체 폭의 장애물을 별도 감시하며, scan이
+`0.30초` 이상 끊기거나 odom 후진량이 `0.60m`, yaw 편차가 5도에 도달하면 실패한다.
 
 ```bash
 ros2 run docking dock_turn_backup --ros-args \
   -p use_lidar_backup:=true \
-  -p backup_scan_topic:=/scan_2 \
-  -p backup_lidar_sector_center:=0.0 \
+  -p docking_lidar_topic:=/scan_2 \
+  -p docking_lidar_frame:=base_scan2 \
+  -p backup_lidar_sector_center_base:=3.14159 \
   -p backup_lidar_sector_width:=0.3491 \
-  -p backup_lidar_to_rear_bumper_offset:=0.0635 \
+  -p backup_rear_reference_x:=-0.2295 \
+  -p backup_lidar_min_range:=0.05 \
   -p backup_target_rear_clearance:=0.01
 ```
 
@@ -537,6 +549,9 @@ ros2 run docking dock_turn_backup --ros-args \
 
 OpenNav docking server는 `/odom` 토픽뿐 아니라 `odom -> base_link` TF transform이 필요함
 `dock_turn_backup`은 도킹 goal을 보내기 전에 `/odom` 메시지와 `odom -> base_link` TF가 준비될 때까지 대기
+또한 `/scan_2`, `frame_id=base_scan2`, `base_link <- base_scan2` TF와 근거리 측정 가능성을
+확인한 뒤에만 이동을 시작함. 동일하거나 오래된 `header.stamp`를 반복 발행한 scan도
+새 측정으로 인정하지 않음.
 또한 `docking_server` activate 직후 내부 TF buffer가 `/tf`를 받을 수 있도록 기본 2초 대기(파라미터 설정가능)
 
 아래와 같은 에러가 보이면 `/odom` 토픽은 있어도 docking server가 아직 `odom` frame을 받기 전에 goal이 들어간 경우임
@@ -559,8 +574,20 @@ Lookup would require extrapolation into the future
 ```bash
 ros2 topic hz /odom
 ros2 run tf2_ros tf2_echo odom base_link
+ros2 run tf2_ros tf2_echo base_link base_scan2
+ros2 topic echo /scan_2 --once --field header.frame_id
 ```
 
 `tf2_echo`가 처음 1초 정도 대기 메시지를 출력한 뒤 transform을 계속 출력하면 정상
 계속 대기 상태라면 bringup의 `stella_md_node`, `robot_state_publisher`, `/tf`, `/tf_static` 상태 확인
 필요하면 `-p docking_server_tf_warmup_sec:=3.0`처럼 대기 시간을 늘려 테스트
+
+### 테스트 모드 끄기
+
+실제 충전 접촉과 충전 전류까지 확인하는 운영 모드로 실행하려면
+`development_test_mode`를 `false`로 지정한다.
+
+```bash
+ros2 run docking dock_turn_backup --ros-args \
+  -p development_test_mode:=false
+```
