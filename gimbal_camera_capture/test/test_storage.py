@@ -1,55 +1,59 @@
-# Copyright 2026 NTRex Co., Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Tests for hourly capture directory allocation."""
+"""Tests for date/camera capture path allocation."""
 
 from datetime import datetime, timezone
 
-from gimbal_camera_capture.storage import HourlyRunDirectory
+from gimbal_camera_capture.storage import DatedCapturePaths
 
 
-def test_same_hour_uses_same_directory(tmp_path):
-    """Two captures in one hour share a run directory."""
-    allocator = HourlyRunDirectory(tmp_path)
+def test_allocates_matching_left_and_right_paths(tmp_path):
+    """Both cameras get the requested date, time, and sequence."""
+    allocator = DatedCapturePaths(tmp_path)
 
-    first = allocator.for_time(datetime(2026, 7, 21, 10, 1, tzinfo=timezone.utc))
-    second = allocator.for_time(
-        datetime(2026, 7, 21, 10, 59, tzinfo=timezone.utc)
+    directory, paths = allocator.allocate(
+        datetime(2026, 7, 26, 15, 36, 33, tzinfo=timezone.utc)
     )
 
-    assert first == second
-    assert first.name == 'run_20260721_1'
+    assert directory == tmp_path / '20260726'
+    assert paths['left'] == directory / 'left' / '153633_1.jpg'
+    assert paths['right'] == directory / 'right' / '153633_1.jpg'
+    assert paths['left'].parent.is_dir()
+    assert paths['right'].parent.is_dir()
 
 
-def test_new_hour_increments_run_number(tmp_path):
-    """A later capture hour gets the next run number."""
-    allocator = HourlyRunDirectory(tmp_path)
+def test_same_second_increments_sequence(tmp_path):
+    """Repeated requests in one second never overwrite the first pair."""
+    allocator = DatedCapturePaths(tmp_path)
+    timestamp = datetime(2026, 7, 26, 15, 36, 33, tzinfo=timezone.utc)
 
-    first = allocator.for_time(datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc))
-    second = allocator.for_time(datetime(2026, 7, 21, 11, 0, tzinfo=timezone.utc))
+    allocator.allocate(timestamp)
+    _, second_paths = allocator.allocate(timestamp)
 
-    assert first.name == 'run_20260721_1'
-    assert second.name == 'run_20260721_2'
+    assert second_paths['left'].name == '153633_2.jpg'
+    assert second_paths['right'].name == '153633_2.jpg'
 
 
-def test_new_date_restarts_run_number(tmp_path):
-    """Run numbering starts from one again on a new date."""
-    allocator = HourlyRunDirectory(tmp_path)
+def test_existing_file_in_either_camera_directory_skips_pair(tmp_path):
+    """An existing image on either side advances both sequence numbers."""
+    allocator = DatedCapturePaths(tmp_path)
+    timestamp = datetime(2026, 7, 26, 15, 36, 33, tzinfo=timezone.utc)
+    existing = tmp_path / '20260726' / 'left' / '153633_1.jpg'
+    existing.parent.mkdir(parents=True)
+    existing.touch()
 
-    allocator.for_time(datetime(2026, 7, 21, 23, 0, tzinfo=timezone.utc))
-    next_day = allocator.for_time(
-        datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    _, paths = allocator.allocate(timestamp)
+
+    assert paths['left'].name == '153633_2.jpg'
+    assert paths['right'].name == '153633_2.jpg'
+
+
+def test_new_date_uses_a_new_date_directory(tmp_path):
+    """A new calendar date gets independent left/right directories."""
+    allocator = DatedCapturePaths(tmp_path)
+
+    directory, paths = allocator.allocate(
+        datetime(2026, 7, 27, 0, 0, 1, tzinfo=timezone.utc)
     )
 
-    assert next_day.name == 'run_20260722_1'
+    assert directory.name == '20260727'
+    assert paths['left'].name == '000001_1.jpg'
+    assert paths['right'].name == '000001_1.jpg'

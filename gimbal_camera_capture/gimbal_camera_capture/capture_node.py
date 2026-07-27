@@ -13,7 +13,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
-from .storage import HourlyRunDirectory
+from .storage import DatedCapturePaths
 
 
 class GimbalCameraCaptureNode(Node):
@@ -47,8 +47,8 @@ class GimbalCameraCaptureNode(Node):
             str(self.get_parameter('output_directory').value)
         )
         self._camera_urls = {
-            'camera1': str(self.get_parameter('camera_1_url').value),
-            'camera2': str(self.get_parameter('camera_2_url').value),
+            'left': str(self.get_parameter('camera_1_url').value),
+            'right': str(self.get_parameter('camera_2_url').value),
         }
         self._open_timeout_ms = int(
             self.get_parameter('open_timeout_ms').value
@@ -65,7 +65,7 @@ class GimbalCameraCaptureNode(Node):
             max(0, int(self.get_parameter('jpeg_quality').value)),
         )
 
-        self._directories = HourlyRunDirectory(output_directory)
+        self._paths = DatedCapturePaths(output_directory)
         self._state_lock = threading.Lock()
         self._worker = None
         self._shutting_down = threading.Event()
@@ -80,7 +80,7 @@ class GimbalCameraCaptureNode(Node):
 
         self.get_logger().info(
             f'Waiting for Bool(true) on {self._trigger_topic}; '
-            f'output={self._directories.base_directory}'
+            f'output={self._paths.base_directory}'
         )
 
     def _on_trigger(self, message: Bool) -> None:
@@ -114,16 +114,14 @@ class GimbalCameraCaptureNode(Node):
         directory = ''
 
         try:
-            run_directory = self._directories.for_time(timestamp)
-            directory = str(run_directory)
+            date_directory, output_paths = self._paths.allocate(timestamp)
+            directory = str(date_directory)
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {
                     camera_name: executor.submit(
                         self._capture_camera,
-                        camera_name,
                         camera_url,
-                        run_directory,
-                        timestamp,
+                        output_paths[camera_name],
                     )
                     for camera_name, camera_url in self._camera_urls.items()
                 }
@@ -148,10 +146,8 @@ class GimbalCameraCaptureNode(Node):
 
     def _capture_camera(
         self,
-        camera_name: str,
         camera_url: str,
-        run_directory: Path,
-        timestamp: datetime,
+        output_path: Path,
     ) -> Path:
         capture = self._open_camera(camera_url)
         try:
@@ -167,8 +163,6 @@ class GimbalCameraCaptureNode(Node):
             if frame is None:
                 raise RuntimeError(f'no frame received from {camera_url}')
 
-            stamp = timestamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            output_path = run_directory / f'{camera_name}_{stamp}.jpg'
             temporary_path = output_path.with_suffix('.tmp.jpg')
             saved = cv2.imwrite(
                 str(temporary_path),

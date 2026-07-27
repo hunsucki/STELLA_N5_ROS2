@@ -3,17 +3,17 @@
 <package format="3">
   <name>gimbal_camera_capture</name>
   <version>0.1.0</version>
-  <description>Capture synchronized still images from two SIYI RTSP cameras on a ROS 2 topic trigger.</description>
+  <description>Capture images and control two SIYI gimbal cameras through ROS 2 topics.</description>
   <maintainer email="lab@ntrex.co.kr">user</maintainer>
   <license>Apache License 2.0</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
 
-  <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>

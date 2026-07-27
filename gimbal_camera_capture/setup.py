@@ -27,13 +27,14 @@ setup(
     maintainer='user',
     maintainer_email='lab@ntrex.co.kr',
     description=(
-        'Capture still images from two SIYI RTSP cameras on a ROS 2 trigger.'
+        'Capture images and control two SIYI gimbals through ROS 2 topics.'
     ),
     license='Apache License 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'capture_node = gimbal_camera_capture.capture_node:main',
+            'control_node = gimbal_camera_capture.control_node:main',
         ],
     },
 )
