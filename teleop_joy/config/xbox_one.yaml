@@ -1,0 +1,24 @@
+# SDL GameController uses a stable Xbox-style mapping even when connected over
+# Bluetooth. Axes: left X=0, LT=4, RT=5. Triggers are 0 when released and -1
+# when fully pressed in sensor_msgs/Joy.
+game_controller_node:
+  ros__parameters:
+    device_id: 0
+    device_name: ""
+    # The connected controller rests near 0.126 on LEFTX; 0.15 prevents drift.
+    deadzone: 0.15
+    autorepeat_rate: 20.0
+    sticky_buttons: false
+    coalesce_interval_ms: 1
+
+teleop_joy_node:
+  ros__parameters:
+    forward_axis: 5
+    reverse_axis: 4
+    steering_axis: 0
+    # Xbox standard button index 1 is B. Hold B to enable every command.
+    enable_button: 1
+    max_linear_speed: 0.70
+    max_angular_speed: 1.8
+    publish_rate_hz: 20.0
+    joy_timeout_sec: 0.5
