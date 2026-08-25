@@ -591,3 +591,315 @@ ros2 topic echo /scan_2 --once --field header.frame_id
 ros2 run docking dock_turn_backup --ros-args \
   -p development_test_mode:=false
 ```
+
+## Update 0825 - wheel odometry 분리 및 IMU/엔코더 주기 개선
+
+> 이 섹션은 2026-08-25 기준의 현재 구현과 실측 결과를 기록한다. README 위쪽에 남아 있는
+> `stella_md` 10 Hz, AHRS 50 Hz 및 `/imu/yaw` 기반 odom 설명은 이전 작업 이력이며,
+> 현재 기본 설정은 아래 내용과 `stella_bringup/param/robot_launch_param.yaml`을 기준으로 한다.
+
+### 변경 목적과 현재 기본 구조
+
+기존에는 `stella_md_node`가 모터 제어, 엔코더 읽기, IMU yaw 구독 및 `/odom` 계산을
+모두 담당했다. 기존 계산 코드는 삭제하지 않고 `enable_legacy_odom` 파라미터로
+비활성화했으며, 새로운 `wheel_odometry` 패키지로 odom 계산을 분리했다.
+
+```text
+MW-MDC24D100D-v2
+  -> stella_md_node
+  -> /wheel/encoders (sensor_msgs/JointState, timestamp 포함)
+                                      \
+                                       -> wheel_odometry -> /odom
+                                      /                  -> odom -> base_footprint TF
+MW-AHRS X1 -> stella_ahrs_node -> /imu/data (timestamp 포함)
+                                  /imu/data_raw
+                                  /imu/mag
+                                  /imu/yaw (기존 호환용, Float64라 header 없음)
+```
+
+현재 `robot.launch.py`의 기본값은 다음과 같다.
+
+- `launch_wheel_odometry: true`
+- `enable_legacy_odom: false`
+- 엔코더 polling 목표: `30 Hz`
+- AHRS sensor sync 요청: `5 ms` (`200 Hz` 주기 요청)
+- ROS IMU topic 발행 상한: `100 Hz`
+- AHRS serial read: `0` (인위적인 rate 제한 없이 수신 버퍼를 계속 비움)
+- motor driver CPU affinity: core `2`
+- AHRS driver CPU affinity: core `3`
+
+`stella_md_node`의 모터 제어 및 `/cmd_vel` 구독 기능은 그대로 유지된다. 분리된 것은
+odom 계산과 발행 책임이며, `stella_md_node`는 항상 timestamp가 있는
+`/wheel/encoders`를 발행한다.
+
+### 적용한 하드웨어 값과 이론 해상도
+
+확인한 하드웨어와 현재 계산값은 다음과 같다.
+
+- 모터: `MD36NP51-24V`, 감속비 `51:1`
+- 엔코더: 광전식 `500 PPR`, 4체배 시 모터축 `2,000 count/rev`
+- 감속기 출력축 한 바퀴: `2,000 x 51 = 102,000 count/rev`
+- 모터 드라이버: `MW-MDC24D100D-v2`, serial `115200 bps`
+- 드라이버에서 확인한 양 채널 encoder PPR: 각각 `2,000`
+- 현재 wheel radius: `0.0875 m`
+- 현재 wheel separation: `0.36 m`
+- 현재 반지름 기준 바퀴 둘레: 약 `0.549779 m`
+- 엔코더 1 count당 이론 이동거리: 약 `0.000005390 m` (`5.39 um`)
+
+바퀴가 명목상 직경 `180 mm`여도 하중, 타이어 눌림, 바닥 재질 때문에 유효 반지름은
+정확히 `0.09 m`가 아닐 수 있다. 요청에 따라 기존 값 `0.0875 m`를 그대로 유지했다.
+만약 실제 유효 반지름이 정확히 `0.09 m`라면 현재 odom 직선거리는 약 `2.78%` 작게
+계산될 수 있으나, 이는 실제 주행 거리 측정 전의 단순 기하학적 비교일 뿐이다.
+
+### `stella_md` 변경 사항
+
+- 기존 `/odom` 계산 코드는 삭제하지 않고 `enable_legacy_odom` 기본값을 `false`로 변경
+- `encoder_poll_rate_hz` 파라미터 추가, 기본값 `30`
+- 예전 `monitoring_rate_hz`는 호환성을 위해 남겨 두었으며 `0`보다 크면
+  `encoder_poll_rate_hz`를 대신하는 deprecated 파라미터로 동작
+- 좌/우 절대 엔코더 위치와 계산된 속도를 `/wheel/encoders`로 발행
+- 두 모터 채널을 순차 질의하므로, timestamp는 첫 질의 시작 시각과 두 번째 질의 종료
+  시각의 중간값으로 기록하여 좌/우 측정 시간 편차를 줄임
+- legacy odom을 실행 중 켜거나 끌 수 있으며, 켤 때 현재 encoder 위치를 새 baseline으로
+  잡아 갑작스러운 pose 점프를 방지
+- legacy odom을 끄면 `/odom` publisher와 TF broadcaster 자체를 해제
+
+주의: legacy odom의 twist에는 원래 코드의 commanded velocity 사용 방식이 남아 있다.
+새 `wheel_odometry`는 실제 encoder 변화량과 timestamp 차이로 twist를 계산한다.
+
+### 새 `wheel_odometry` 패키지
+
+`wheel_odometry`는 `/wheel/encoders`와 timestamp가 있는 `/imu/data` orientation을 받아
+`/odom`과 `odom -> base_footprint` TF를 발행한다.
+
+계산 순서는 다음과 같다.
+
+1. 좌/우 바퀴 회전 변화량에 반지름을 곱해 양쪽 이동거리를 계산한다.
+2. 양쪽 이동거리의 평균으로 중심 이동거리를 구한다.
+3. `(right_distance - left_distance) / wheel_separation`으로 wheel yaw 변화를 예측한다.
+4. IMU yaw가 새롭고 유효하면 complementary correction으로 누적 yaw drift를 보정한다.
+5. 이전 yaw와 새 yaw의 중간 방향으로 `x`, `y`를 적분한다.
+6. 실제 거리 및 yaw 변화량을 encoder timestamp 간격으로 나누어 twist를 계산한다.
+
+기본 yaw 설정은 다음과 같다.
+
+- `use_imu_orientation: true`
+- `relative_imu_yaw: false` - 기존 동작처럼 IMU의 절대 orientation으로 시작
+- `imu_timeout_sec: 0.25`
+- `imu_correction_time_constant_sec: 0.5`
+- `max_imu_correction_rate_rad_s: 1.0`
+
+IMU가 잠시 늦거나 stale이면 odom을 중단하지 않고 wheel yaw만으로 계속 적분한다.
+`imu_correction_time_constant_sec: 0.0`이면 매 encoder sample에서 IMU yaw를 즉시
+적용하는 동작이 된다.
+
+비교용 `/wheel_odometry/yaw_diagnostics`는
+`geometry_msgs/Vector3Stamped`이며 다음 값을 담는다.
+
+- `vector.x`: wheel encoder만 적분한 yaw
+- `vector.y`: 같은 시점에 사용할 수 있는 최신 IMU yaw, 없으면 `NaN`
+- `vector.z`: 최종 융합 yaw
+
+기본 기구/융합/covariance 파라미터는
+`wheel_odometry/config/wheel_odometry.yaml`에서 관리한다. 현재 covariance는 실측으로
+추정한 값이 아니라 초기 운용을 위한 값이므로 향후 rosbag 기반 보정이 필요하다.
+
+### IMU timestamp와 serial 처리 개선
+
+공식 기본 드라이버의 `/imu/data`에도 `header.stamp`는 있었지만, 센서 packet을 받은
+시각이 아니라 ROS publish loop가 실행된 시각을 넣었다. 또한 센서 sync보다 publish
+loop가 훨씬 빠르면 같은 측정값이 새 timestamp로 반복 발행될 수 있었다.
+
+현재 구현은 다음처럼 변경했다.
+
+- ACC/GYRO/orientation/MAG packet을 실제로 읽은 시점에 해당 메시지 timestamp 갱신
+- `publish_only_on_new_data: true`일 때 이전과 같은 timestamp의 측정값은 재발행하지 않음
+- 새 orientation이 발행될 때 `/imu/data`와 호환용 `/imu/yaw`를 함께 발행
+- `wheel_odometry`는 header가 없는 `/imu/yaw` 대신 timestamp가 있는 `/imu/data` 사용
+- `sync_period_ms`를 파라미터화하고 설정 후 장치에서 값을 다시 읽어 로그로 확인
+- `read_rate_hz: 0`이면 packet read를 제한하지 않고, 수신 packet이 없을 때만
+  `read_idle_sleep_us`만큼 sleep
+- 종료/재시작 때 streaming 중지 명령을 응답 대기 없이 보낸 후 serial input을 flush하여
+  남아 있던 sync packet이 다음 연결의 설정 응답으로 오인되는 문제 완화
+- AHRS YAML이 실제 노드명 `stella_ahrs_node`에 적용되도록 수정하고 config 설치 추가
+
+`/imu/yaw`는 `std_msgs/Float64`이므로 메시지 형식상 timestamp를 넣을 수 없다.
+새 odom이나 sensor fusion에는 `/imu/data`를 사용해야 한다.
+
+### 센서 주기 실측 결과
+
+측정은 로봇에 실제 연결된 모터 드라이버와 AHRS로 수행했으며, 안전을 위해
+`/cmd_vel`은 한 번도 발행하지 않고 정지 상태에서 확인했다.
+
+모터 드라이버는 좌/우 encoder를 각각 요청/응답하는 blocking serial 방식이다.
+공식 초기 코드의 1 ms timer는 1,000 Hz 목표일 뿐 실제 1,000회의 좌/우 측정을
+완료할 수 없다. 이 로봇에서 paired encoder query의 실측 포화점은 약 `31.25 Hz`였다.
+
+| encoder 목표 | 실측 | `stella_md_node` CPU 참고값 |
+|---:|---:|---:|
+| 10 Hz | 약 10.05 Hz | 약 30% |
+| 20 Hz | 약 20.07 Hz | 약 39.5% |
+| 30 Hz | 약 30 Hz | 약 68.6% |
+| 50 Hz | 약 31.25 Hz로 포화 | 약 85.9% |
+
+따라서 현재 `30 Hz`는 이 드라이버/라이브러리 조합에서 정보를 거의 최대로 받으면서
+불필요한 busy-wait를 더 늘리지 않는 현실적인 상한이다. 이는 encoder 자체의 내부
+카운팅 속도가 아니라 SBC가 양쪽 누적 count를 읽어 오는 주기이다.
+
+AHRS는 `5 ms` sync를 요청하고 ROS publish 상한을 `100 Hz`로 설정했다. `200 Hz`
+publish 실험에서는 topic rate가 약 200 Hz로 보이더라도 새 sensor timestamp 기준
+유효 데이터가 그보다 낮거나 반복되는 경우가 있었다. 현재 중복 억제를 적용한
+`100 Hz` 설정에서는 5초 동안 475개 수신/475개 고유 timestamp, 약 `94.8 Hz`를
+확인했다. 전체 `robot.launch.py` 실행 중의 대표 측정값은 다음과 같다.
+
+| 항목 | 전체 bringup 실측 |
+|---|---:|
+| `/wheel/encoders` | 약 30.18 Hz |
+| `/imu/data` | 약 97.05 Hz |
+| `/odom` | 약 30.05 Hz |
+
+최종 odom 갱신은 encoder가 기준이므로 약 30 Hz이다. IMU 100 Hz이면 encoder 한 주기
+사이에 대략 3개의 새 orientation을 받을 수 있어 현재 구조에는 충분하다. 더 높은
+IMU 주기가 필요한 경우 baud rate, sync data 종류 및 고유 timestamp 비율을 함께
+측정해야 하며 topic 표시 주기만 보고 센서가 실제로 새 값을 냈다고 판단하면 안 된다.
+
+### Raspberry Pi CPU affinity와 전체 bringup 확인
+
+`stella_md_node`와 `stella_ahrs_node` launch에 `taskset` prefix를 추가했다.
+
+- `motor_cpu_affinity: 2`: 모터 드라이버 process와 그 thread를 CPU 2에서만 실행
+- `imu_cpu_affinity: 3`: AHRS process와 그 thread를 CPU 3에서만 실행
+- 제한하지 않으려면 각 값을 `0-3`으로 설정
+
+이 설정은 두 process가 사용할 수 있는 CPU를 제한하는 것이며 CPU core를 독점 예약하는
+것은 아니다. 다른 process도 scheduler 설정에 따라 같은 core에서 실행될 수 있다.
+
+RealSense, 양쪽 LiDAR, battery 및 linear motor를 포함한 전체 bringup 측정에서
+`stella_md_node`는 약 `74.7%` of one core, `stella_ahrs_node`는 약 `19.9%` of one core를
+사용했다. 같은 측정 구간의 전체 CPU idle은 약 `30.4%`, 메모리는 8 GB 중 약 2.8 GB
+사용/약 5.0 GB available, CPU 온도는 약 `65.6 C`였다. 다만 당시 VS Code C++ indexer가
+별도로 큰 CPU를 사용하고 있었으므로 전체 CPU 수치는 깨끗한 단독 benchmark가 아니다.
+두 serial driver의 affinity가 각각 CPU 2와 3으로 적용된 것은 PID affinity로 확인했다.
+
+### 설정 위치와 실행 방법
+
+통합 설정 파일:
+
+```text
+stella_bringup/param/robot_launch_param.yaml
+```
+
+현재 주요 값:
+
+```yaml
+encoder_poll_rate_hz: 30
+imu_sync_period_ms: 5
+imu_publish_rate_hz: 100
+imu_read_rate_hz: 0
+motor_cpu_affinity: 2
+imu_cpu_affinity: 3
+launch_wheel_odometry: true
+enable_legacy_odom: false
+```
+
+빌드 및 실행:
+
+```bash
+cd ~/colcon_ws
+colcon build --packages-select wheel_odometry stella_md stella_ahrs stella_bringup --symlink-install
+source install/setup.bash
+ros2 launch stella_bringup robot.launch.py
+```
+
+동작 확인:
+
+```bash
+ros2 topic hz /wheel/encoders
+ros2 topic hz /imu/data
+ros2 topic hz /odom
+ros2 topic info /odom -v
+ros2 topic echo /wheel_odometry/yaw_diagnostics
+ros2 run tf2_ros tf2_echo odom base_footprint
+```
+
+전체 변경 후 네 패키지의 `colcon build`를 완료했고, 전체 bringup에서 새
+`wheel_odometry`만 `/odom`을 발행하는 것을 확인했다. 종료 시 기존
+`linear_motor_node`가 `rclpy.shutdown()`을 두 번 호출하여 exit code 1이 되는 문제는
+이번 odometry 변경과 무관한 기존 문제라 수정하지 않았다.
+
+### 새 odom과 legacy odom 전환
+
+두 구현이 동시에 `/odom` 및 같은 TF를 발행하면 안 된다. `robot.launch.py`는 설정
+파일에서 `launch_wheel_odometry`와 `enable_legacy_odom`이 동시에 `true`이면 실행을
+중단하도록 검사한다.
+
+실행 중 새 odom에서 legacy odom으로 전환:
+
+```bash
+ros2 param set /wheel_odometry enabled false
+ros2 param set /stella_md_node enable_legacy_odom true
+```
+
+legacy에서 새 odom으로 복귀:
+
+```bash
+ros2 param set /stella_md_node enable_legacy_odom false
+ros2 param set /wheel_odometry enabled true
+```
+
+반드시 현재 publisher를 먼저 끈 다음 다른 쪽을 켠다. 실제 runtime 전환 시험에서
+각 상태의 `/odom` publisher가 하나만 존재하는 것을 확인했다.
+
+### 정밀도 한계와 향후 보정
+
+encoder 분해능 자체는 충분히 높지만 실제 odom 오차는 주로 다음 항목의 영향을 받는다.
+
+- 좌/우 바퀴의 실제 유효 반지름 차이와 명목 반지름 오차
+- 실제 wheel separation 오차
+- 가감속/회전 시 미끄러짐과 바닥 상태
+- 기어 backlash 및 차체 하중 분포
+- 모터, 철제 차체 및 주변 자기장에 의한 9축 IMU magnetometer yaw 왜곡
+- 현재 covariance와 complementary filter 값이 실주행 데이터로 추정되지 않았다는 점
+
+직선 실측 보정의 시작값은 다음 식으로 계산할 수 있다.
+
+```text
+new_wheel_radius = current_wheel_radius * actual_distance / odom_distance
+```
+
+제자리 회전 실측으로 wheel separation을 보정할 때의 시작값은 다음과 같다.
+
+```text
+new_wheel_separation = current_wheel_separation * odom_rotation / actual_rotation
+```
+
+이 값은 여러 번 왕복/양방향 회전한 평균으로 정하고, 보정 전후 rosbag에서
+wheel yaw, IMU yaw 및 fused yaw를 비교해야 한다. 이번 시험은 `/cmd_vel`을 발행하지
+않은 정지 시험이므로 실제 직선 거리, 회전각, slip 및 장시간 drift 오차는 아직
+정량 검증되지 않았다.
+
+### 향후 `robot_localization` 전환 방침
+
+현재 구현은 별도 EKF 없이 바로 쓸 수 있도록 `wheel_odometry` 안에서 wheel yaw와
+IMU yaw를 complementary fusion한다. 향후 Nav2 운용에서 `robot_localization` EKF를
+도입할 때는 같은 IMU를 두 번 융합하지 않도록 구조를 바꿔야 한다.
+
+권장 전환값과 데이터 흐름:
+
+```yaml
+# wheel_odometry/config/wheel_odometry.yaml
+use_imu_orientation: false
+odom_topic: /wheel/odom
+publish_tf: false
+```
+
+```text
+/wheel/odom (wheel encoder만 사용) ----\
+                                       -> robot_localization EKF
+/imu/data (원본 IMU) ------------------/    -> /odometry/filtered
+                                            -> odom -> base_footprint TF
+```
+
+이때 최종 TF는 EKF 한 곳에서만 발행해야 한다. 현재처럼 IMU가 이미 들어간 `/odom`과
+동일한 `/imu/data`를 EKF 입력으로 동시에 넣으면 서로 독립적이지 않은 같은 측정을
+중복 반영하여 covariance를 실제보다 과도하게 신뢰하게 된다.

@@ -24,6 +24,7 @@
   <exec_depend>stella_ahrs</exec_depend>
   <exec_depend>stella_description</exec_depend>
   <exec_depend>stella_md</exec_depend>
+  <exec_depend>wheel_odometry</exec_depend>
   <export>
     <build_type>ament_cmake</build_type>
   </export>

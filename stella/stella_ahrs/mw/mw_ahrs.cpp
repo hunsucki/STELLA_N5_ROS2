@@ -6,8 +6,38 @@
 #include <mutex>
 #include <thread>
 
+#include "serial.h"
+
 static std::atomic_bool AHRS{false};
 static std::mutex imu_msg_mutex;
+static float acc_value[3] = {0.0F, 0.0F, 0.0F};
+static float gyr_value[3] = {0.0F, 0.0F, 0.0F};
+static float deg_value[3] = {0.0F, 0.0F, 0.0F};
+static float mag_value[3] = {0.0F, 0.0F, 0.0F};
+
+extern serial::Serial _serial;
+extern bool SetVal_NotRx(char type, unsigned short index, unsigned char sub_index, void * value);
+
+namespace
+{
+void stop_stream_and_flush()
+{
+  long stop_data = 0;
+  try
+  {
+    // Send without waiting for a response so queued synchronous packets cannot
+    // be mistaken for the command acknowledgement by the vendor library.
+    SetVal_NotRx(8, CI_SYNC_DATA, 0, &stop_data);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    _serial.flushInput();
+  }
+  catch (const std::exception &)
+  {
+    // Connection/setup code below reports a definitive failure if the port is
+    // no longer usable.
+  }
+}
+}  // namespace
 
 namespace ntrex
 {
@@ -91,14 +121,14 @@ namespace ntrex
 
   void MwAhrsRosDriver::MwAhrsRead()
 {
-  int read_rate_hz = 900;
+  int read_rate_hz = 0;
   int read_idle_sleep_us = 1000;
   this->get_parameter("read_rate_hz", read_rate_hz);
   this->get_parameter("read_idle_sleep_us", read_idle_sleep_us);
 
-  if (read_rate_hz <= 0)
+  if (read_rate_hz < 0)
   {
-    read_rate_hz = 900;
+    read_rate_hz = 0;
   }
 
   if (read_idle_sleep_us < 0)
@@ -106,7 +136,11 @@ namespace ntrex
     read_idle_sleep_us = 1000;
   }
 
-  rclcpp::WallRate read_rate(read_rate_hz);
+  std::unique_ptr<rclcpp::WallRate> read_rate;
+  if (read_rate_hz > 0)
+  {
+    read_rate = std::make_unique<rclcpp::WallRate>(read_rate_hz);
+  }
 
   while (rclcpp::ok() && AHRS.load())
   {
@@ -195,9 +229,20 @@ namespace ntrex
       }
     }
 
-    if (got_packet)
+    if (got_packet && read_rate)
     {
-      read_rate.sleep();
+      if (!rclcpp::ok() || !AHRS.load())
+      {
+        break;
+      }
+      try
+      {
+        read_rate->sleep();
+      }
+      catch (const std::exception &)
+      {
+        break;
+      }
     }
     else if (read_idle_sleep_us > 0)
     {
@@ -209,8 +254,10 @@ namespace ntrex
   void MwAhrsRosDriver::publish_topic()
   {
     int publish_rate_hz = 50;
+    bool publish_only_on_new_data = true;
 
     this->get_parameter("publish_rate_hz", publish_rate_hz);
+    this->get_parameter("publish_only_on_new_data", publish_only_on_new_data);
 
     if (publish_rate_hz <= 0)
     {
@@ -218,11 +265,12 @@ namespace ntrex
     }
 
     rclcpp::Rate rate(publish_rate_hz);
+    int64_t last_raw_stamp = 0;
+    int64_t last_orientation_stamp = 0;
+    int64_t last_magnetic_stamp = 0;
 
     while (rclcpp::ok() && AHRS.load())
     {
-      rclcpp::Time now = this->get_clock()->now();
-
       sensor_msgs::msg::Imu imu_data_raw_copy;
       sensor_msgs::msg::Imu imu_data_copy;
       sensor_msgs::msg::MagneticField imu_magnetic_copy;
@@ -241,15 +289,39 @@ namespace ntrex
         imu_yaw_copy = imu_yaw_msg;
       }
 
-      imu_data_raw_pub_->publish(imu_data_raw_copy);
-      imu_data_pub_->publish(imu_data_copy);
-      imu_mag_pub_->publish(imu_magnetic_copy);
-      imu_yaw_pub_->publish(imu_yaw_copy);
+      const int64_t raw_stamp = rclcpp::Time(imu_data_raw_copy.header.stamp).nanoseconds();
+      const int64_t orientation_stamp = rclcpp::Time(imu_data_copy.header.stamp).nanoseconds();
+      const int64_t magnetic_stamp = rclcpp::Time(imu_magnetic_copy.header.stamp).nanoseconds();
+      const bool publish_raw =
+        !publish_only_on_new_data || (raw_stamp != 0 && raw_stamp != last_raw_stamp);
+      const bool publish_orientation =
+        !publish_only_on_new_data ||
+        (orientation_stamp != 0 && orientation_stamp != last_orientation_stamp);
+      const bool publish_magnetic =
+        !publish_only_on_new_data ||
+        (magnetic_stamp != 0 && magnetic_stamp != last_magnetic_stamp);
 
-      if (publish_tf_)
+      if (publish_raw)
+      {
+        imu_data_raw_pub_->publish(imu_data_raw_copy);
+        last_raw_stamp = raw_stamp;
+      }
+      if (publish_orientation)
+      {
+        imu_data_pub_->publish(imu_data_copy);
+        imu_yaw_pub_->publish(imu_yaw_copy);
+        last_orientation_stamp = orientation_stamp;
+      }
+      if (publish_magnetic)
+      {
+        imu_mag_pub_->publish(imu_magnetic_copy);
+        last_magnetic_stamp = magnetic_stamp;
+      }
+
+      if (publish_tf_ && publish_orientation)
       {
         geometry_msgs::msg::TransformStamped tf;
-        tf.header.stamp = now;
+        tf.header.stamp = imu_data_copy.header.stamp;
         tf.header.frame_id = parent_frame_id_;
         tf.child_frame_id = frame_id_;
         tf.transform.translation.x = 0.0;
@@ -260,7 +332,18 @@ namespace ntrex
         broadcaster_->sendTransform(tf);
       }
 
-      rate.sleep();
+      if (!rclcpp::ok() || !AHRS.load())
+      {
+        break;
+      }
+      try
+      {
+        rate.sleep();
+      }
+      catch (const std::exception &)
+      {
+        break;
+      }
     }
   }
 
@@ -286,10 +369,10 @@ namespace ntrex
     long product_id = 0, software_ver = 0, hardware_ver = 0, function_ver = 0;
 
     long sync_port = CI_USB;
-    long sync_period = 10;
+    long sync_period = sync_period_ms_;
+    long confirmed_sync_period = 0;
     long sync_trmode = CI_Binary;
     long sync_data = 15;
-    long FlashWrite = 1;
 
     res &= MW_AHRS_GetValI(product_id,   CI_PRODUCT_ID);
     res &= MW_AHRS_GetValI(software_ver, CI_SW_VERSION);
@@ -304,6 +387,24 @@ namespace ntrex
     res &= MW_AHRS_SetValI(sync_port,   CI_SYNC_PORT);
     res &= MW_AHRS_SetValI(sync_period, CI_SYNC_PERIOD);
     res &= MW_AHRS_SetValI(sync_trmode, CI_SYNC_TRMODE);
+    if (MW_AHRS_GetValI(confirmed_sync_period, CI_SYNC_PERIOD))
+    {
+      if (confirmed_sync_period >= 1 && confirmed_sync_period <= 60000)
+      {
+        sync_period_ms_ = static_cast<int>(confirmed_sync_period);
+      }
+      RCLCPP_INFO(
+        this->get_logger(),
+        "AHRS sync period requested=%ld ms, device confirmed=%ld ms",
+        sync_period, confirmed_sync_period);
+    }
+    else
+    {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Could not read back AHRS sync period; continuing with requested %ld ms",
+        sync_period);
+    }
     res &= MW_AHRS_SetValI(sync_data,   CI_SYNC_DATA);
     // res &= MW_AHRS_SetValI(FlashWrite,  CI_SYS_COMMAND);
 
@@ -316,10 +417,20 @@ namespace ntrex
   {
     bool res = false;
 
+    this->declare_parameter("sync_period_ms", 5);
+    this->get_parameter("sync_period_ms", sync_period_ms_);
+    if (sync_period_ms_ < 1 || sync_period_ms_ > 60000)
+    {
+      RCLCPP_WARN(
+        this->get_logger(), "sync_period_ms must be in [1, 60000]; using 5 ms");
+      sync_period_ms_ = 5;
+    }
+
     res = MW_AHRS_Connect(port, baud_rate);
 
     if (res)
     {
+      stop_stream_and_flush();
       res = MW_AHRS_Setting();
     }
 
@@ -330,8 +441,9 @@ namespace ntrex
       this->declare_parameter("magnetic_field_stddev", 0.0);
       this->declare_parameter("orientation_stddev", 0.0);
 
-      this->declare_parameter("read_rate_hz", 900);
-      this->declare_parameter("publish_rate_hz", 50);
+      this->declare_parameter("read_rate_hz", 0);
+      this->declare_parameter("publish_rate_hz", 100);
+      this->declare_parameter("publish_only_on_new_data", true);
       this->declare_parameter("read_idle_sleep_us", 1000);
       this->declare_parameter("publish_tf", false);
       this->declare_parameter("parent_frame_id", "base_link");
@@ -357,7 +469,19 @@ namespace ntrex
       StartReading();
       StartPubing();
 
-      RCLCPP_INFO(this->get_logger(), "MW-AHRS ROS Init Success");
+      int publish_rate_hz = 100;
+      int read_rate_hz = 0;
+      this->get_parameter("publish_rate_hz", publish_rate_hz);
+      this->get_parameter("read_rate_hz", read_rate_hz);
+      const std::string read_description = read_rate_hz > 0
+        ? std::to_string(read_rate_hz) + " packets/s cap"
+        : "unlimited drain";
+      RCLCPP_INFO(
+        this->get_logger(),
+        "MW-AHRS ROS Init Success: sensor sync=%d ms (up to %.1f sync cycles/s), serial read=%s, topic publish=%d Hz",
+        sync_period_ms_, 1000.0 / sync_period_ms_,
+        read_description.c_str(),
+        publish_rate_hz);
     }
     else
     {
@@ -367,11 +491,9 @@ namespace ntrex
 
   MwAhrsRosDriver::~MwAhrsRosDriver()
   {
-    long stop_data = 0;
-
-    MW_AHRS_SetValI(stop_data, CI_SYNC_DATA);
     StopReading();
     StopPubing();
+    stop_stream_and_flush();
     MW_AHRS_DisConnect();
   }
 }

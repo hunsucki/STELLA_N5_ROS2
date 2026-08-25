@@ -50,6 +50,9 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
   imu_yaw_filter_tau_sec_ = this->declare_parameter<double>("imu_yaw_filter_tau_sec", 0.0);
   imu_yaw_jump_warn_threshold_ = this->declare_parameter<double>("imu_yaw_jump_warn_threshold", 0.25);
   cmd_vel_timeout_sec_ = this->declare_parameter<double>("cmd_vel_timeout_sec", 0.5);
+  enable_legacy_odom_ = this->declare_parameter<bool>("enable_legacy_odom", false);
+  encoder_poll_rate_hz_ = this->declare_parameter<int>("encoder_poll_rate_hz", 30);
+  const int legacy_monitoring_rate_hz = this->declare_parameter<int>("monitoring_rate_hz", 0);
   if (imu_timeout_sec_ <= 0.0)
   {
     imu_timeout_sec_ = 0.0;
@@ -71,24 +74,39 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
     cmd_vel_timeout_sec_ = 0.0;
   }
 
+  if (legacy_monitoring_rate_hz > 0)
+  {
+    encoder_poll_rate_hz_ = legacy_monitoring_rate_hz;
+    RCLCPP_WARN(
+        this->get_logger(),
+        "Parameter monitoring_rate_hz is deprecated; use encoder_poll_rate_hz instead");
+  }
+  if (encoder_poll_rate_hz_ <= 0)
+  {
+    encoder_poll_rate_hz_ = 30;
+  }
+
   if (use_imu_data_orientation_)
   {
     imu_data_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("imu/data", 10, std::bind(&stellaN5_node::imu_data_callback, this, std::placeholders::_1));
   }
   ahrs_yaw_sub_ = this->create_subscription<std_msgs::msg::Float64>("imu/yaw", 1, std::bind(&stellaN5_node::ahrs_yaw_data_callback, this, std::placeholders::_1));
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>("cmd_vel", 10, std::bind(&stellaN5_node::command_velocity_callback, this, std::placeholders::_1));
-  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", qos);
-  odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-  int monitoring_rate_hz = this->declare_parameter<int>("monitoring_rate_hz", 10);
-  if (monitoring_rate_hz <= 0)
+  wheel_encoder_pub_ = this->create_publisher<sensor_msgs::msg::JointState>("wheel/encoders", qos);
+  if (enable_legacy_odom_)
   {
-    monitoring_rate_hz = 10;
+    odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", qos);
+    odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   }
 
   auto serial_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>(1.0 / monitoring_rate_hz));
+      std::chrono::duration<double>(1.0 / encoder_poll_rate_hz_));
   Serial_timer = this->create_wall_timer(serial_period, std::bind(&stellaN5_node::serial_callback, this));
+
+  RCLCPP_INFO(
+      this->get_logger(),
+      "Encoder polling: %d Hz; wheel topic: /wheel/encoders; legacy odom: %s",
+      encoder_poll_rate_hz_, enable_legacy_odom_ ? "enabled" : "disabled");
 }
 
 stellaN5_node::~stellaN5_node()
@@ -245,8 +263,15 @@ void stellaN5_node::serial_callback()
 
     try
     {
+      const rclcpp::Time encoder_read_start = this->now();
       Motor_MonitoringCommand(channel_1, _position);
       Motor_MonitoringCommand(channel_2, _position);
+      const rclcpp::Time encoder_read_end = this->now();
+      const rclcpp::Time encoder_stamp(
+        encoder_read_start.nanoseconds() +
+        (encoder_read_end.nanoseconds() - encoder_read_start.nanoseconds()) / 2,
+        this->get_clock()->get_clock_type());
+      publish_wheel_encoder_state(encoder_stamp);
     }
     catch (const std::exception & e)
     {
@@ -256,8 +281,84 @@ void stellaN5_node::serial_callback()
       return;
     }
 
-    update_odometry();
+    enable_legacy_odom_ = this->get_parameter("enable_legacy_odom").as_bool();
+    if (enable_legacy_odom_)
+    {
+      if (!previous_legacy_odom_enabled_)
+      {
+        if (!odom_pub_)
+        {
+          odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
+            "odom", rclcpp::QoS(rclcpp::KeepLast(10)));
+        }
+        if (!odom_broadcaster)
+        {
+          odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        }
+        left_encoder_prev = MyMotorCommandReadValue.position[channel_1];
+        right_encoder_prev = MyMotorCommandReadValue.position[channel_2];
+        previous_legacy_odom_enabled_ = true;
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Legacy odom enabled. Disable wheel_odometry to avoid duplicate /odom and TF publishers");
+      }
+      update_odometry();
+    }
+    else
+    {
+      if (previous_legacy_odom_enabled_)
+      {
+        RCLCPP_WARN(this->get_logger(), "Legacy odom disabled");
+      }
+      previous_legacy_odom_enabled_ = false;
+      odom_pub_.reset();
+      odom_broadcaster.reset();
+    }
   }
+}
+
+void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
+{
+  const double counts_per_wheel_revolution =
+      Differential_MobileRobot.gear_ratio * MyMotorConfiguration.encoder_ppr[channel_1];
+  if (counts_per_wheel_revolution <= 0.0)
+  {
+    RCLCPP_ERROR_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Invalid encoder configuration: gear_ratio=%.3f encoder_ppr=%ld",
+        Differential_MobileRobot.gear_ratio,
+        MyMotorConfiguration.encoder_ppr[channel_1]);
+    return;
+  }
+
+  const double radians_per_count = 2.0 * M_PI / counts_per_wheel_revolution;
+  sensor_msgs::msg::JointState wheel_state;
+  wheel_state.header.stamp = stamp;
+  wheel_state.name = {"left_wheel", "right_wheel"};
+  wheel_state.position = {
+      MyMotorCommandReadValue.position[channel_1] * radians_per_count,
+      MyMotorCommandReadValue.position[channel_2] * radians_per_count};
+  wheel_state.velocity = {0.0, 0.0};
+
+  if (wheel_encoder_initialized_)
+  {
+    const double dt = (stamp - last_wheel_encoder_stamp_).seconds();
+    if (dt > 0.0)
+    {
+      wheel_state.velocity[0] =
+          (MyMotorCommandReadValue.position[channel_1] - left_encoder_prev_for_wheel_state_) *
+          radians_per_count / dt;
+      wheel_state.velocity[1] =
+          (MyMotorCommandReadValue.position[channel_2] - right_encoder_prev_for_wheel_state_) *
+          radians_per_count / dt;
+    }
+  }
+
+  left_encoder_prev_for_wheel_state_ = MyMotorCommandReadValue.position[channel_1];
+  right_encoder_prev_for_wheel_state_ = MyMotorCommandReadValue.position[channel_2];
+  last_wheel_encoder_stamp_ = stamp;
+  wheel_encoder_initialized_ = true;
+  wheel_encoder_pub_->publish(wheel_state);
 }
 
 bool stellaN5_node::update_odometry()
@@ -367,7 +468,8 @@ int main(int argc, char *argv[])
 {
   rclcpp::init(argc, argv);
 
-  MW_Serial_Connect("/dev/MW", 115200);
+  char motor_port[] = "/dev/MW";
+  MW_Serial_Connect(motor_port, 115200);
 
   if(Robot_Setting(::N5)) RUN = true;
   Robot_Fault_Checking_RESET();

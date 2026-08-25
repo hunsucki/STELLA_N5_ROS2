@@ -7,6 +7,7 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include <std_msgs/msg/float64.hpp>
@@ -27,6 +28,7 @@ private:
     
     // ROS topic publishers
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr wheel_encoder_pub_;
 
     // ROS topic subscribers
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
@@ -44,6 +46,8 @@ private:
     double imu_yaw_filter_tau_sec_ = 0.0;
     double imu_yaw_jump_warn_threshold_ = 0.25;
     double cmd_vel_timeout_sec_ = 0.5;
+    int encoder_poll_rate_hz_ = 30;
+    bool enable_legacy_odom_ = false;
     bool use_imu_data_orientation_ = false;
     bool use_imu_yaw_filter_ = false;
     bool imu_data_received_ = false;
@@ -51,12 +55,17 @@ private:
     bool filtered_yaw_initialized_ = false;
     bool cmd_vel_received_ = false;
     bool cmd_vel_watchdog_stopped_ = false;
+    bool wheel_encoder_initialized_ = false;
+    bool previous_legacy_odom_enabled_ = false;
     std::chrono::steady_clock::time_point last_cmd_vel_time_;
+    rclcpp::Time last_wheel_encoder_stamp_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_imu_stamp_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_yaw_receive_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_filtered_yaw_stamp_{0, 0, RCL_ROS_TIME};
     
     int left_encoder_prev=0,right_encoder_prev=0;
+    long left_encoder_prev_for_wheel_state_ = 0;
+    long right_encoder_prev_for_wheel_state_ = 0;
     
     double ahrs_yaw=0.0, filtered_yaw_rad_=0.0, delta_th=0.0,delta_s=0.0,delta_x=0.0,delta_y=0.0,x=0.0,y=0.0,th=0.0,delta_left = 0,delta_right = 0;
 
@@ -64,5 +73,6 @@ private:
     void ahrs_yaw_data_callback(const std_msgs::msg::Float64::SharedPtr msg);
     void command_velocity_callback(const geometry_msgs::msg::Twist::SharedPtr cmd_vel_msg);
     void serial_callback();
+    void publish_wheel_encoder_state(const rclcpp::Time & stamp);
     bool update_odometry();
 };

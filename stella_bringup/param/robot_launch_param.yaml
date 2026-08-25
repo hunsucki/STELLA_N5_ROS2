@@ -8,3 +8,18 @@ launch_pointcloud_laserscan_filter: false
 launch_hailo: false
 launch_linear_motor: true
 launch_battery: true
+
+# Odometry sensor rates. The motor driver's paired encoder query saturates near
+# 31 Hz on this robot, so 30 Hz is the practical high-rate setting.
+encoder_poll_rate_hz: 30
+imu_sync_period_ms: 5
+imu_publish_rate_hz: 100
+imu_read_rate_hz: 0
+
+# Raspberry Pi 5 has cores 0-3. Keep the two serial drivers on separate cores.
+motor_cpu_affinity: 2
+imu_cpu_affinity: 3
+
+# Exactly one odometry implementation should publish /odom and odom TF.
+launch_wheel_odometry: true
+enable_legacy_odom: false

@@ -7,6 +7,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.actions import Node
 from launch_ros.actions import LifecycleNode
 
@@ -17,6 +18,10 @@ def generate_launch_description():
 
     rviz_config_file = LaunchConfiguration('rviz_config_file')
     use_rviz = LaunchConfiguration('use_rviz')
+    sync_period_ms = LaunchConfiguration('sync_period_ms')
+    publish_rate_hz = LaunchConfiguration('publish_rate_hz')
+    read_rate_hz = LaunchConfiguration('read_rate_hz')
+    cpu_affinity = LaunchConfiguration('cpu_affinity')
     
     declare_rviz_config_file_cmd = DeclareLaunchArgument(
         'rviz_config_file',
@@ -41,9 +46,15 @@ def generate_launch_description():
                                 name='stella_ahrs_node',
                                 output='screen',
                                 emulate_tty=True,
-                                parameters=[{
-                                    'read_rate_hz': 900,
-                                    'publish_rate_hz': 50,
+                                prefix=['taskset -c ', cpu_affinity],
+                                parameters=[config_file, {
+                                    'sync_period_ms': ParameterValue(
+                                        sync_period_ms, value_type=int),
+                                    'read_rate_hz': ParameterValue(
+                                        read_rate_hz, value_type=int),
+                                    'publish_rate_hz': ParameterValue(
+                                        publish_rate_hz, value_type=int),
+                                    'publish_only_on_new_data': True,
                                     'read_idle_sleep_us': 1000,
                                     'frame_id': 'imu_link',
                                     'parent_frame_id': 'base_link',
@@ -53,5 +64,17 @@ def generate_launch_description():
                                 )
 
     return LaunchDescription([
+      DeclareLaunchArgument(
+          'sync_period_ms', default_value='5',
+          description='MW-AHRS synchronous sensor data period in milliseconds'),
+      DeclareLaunchArgument(
+          'publish_rate_hz', default_value='100',
+          description='Maximum ROS IMU topic publication rate in Hz'),
+      DeclareLaunchArgument(
+          'read_rate_hz', default_value='0',
+          description='Serial packet read cap in Hz; 0 drains all available packets'),
+      DeclareLaunchArgument(
+          'cpu_affinity', default_value='3',
+          description='Linux CPU core list assigned to the AHRS driver'),
       driver_node,
     ])

@@ -43,6 +43,19 @@ def generate_launch_description():
     launch_hailo = param.get('launch_hailo', False)
     launch_linear_motor = param.get('launch_linear_motor', True)
     launch_battery = param.get('launch_battery', True)
+    encoder_poll_rate_hz = int(param.get('encoder_poll_rate_hz', 30))
+    imu_sync_period_ms = int(param.get('imu_sync_period_ms', 5))
+    imu_publish_rate_hz = int(param.get('imu_publish_rate_hz', 100))
+    imu_read_rate_hz = int(param.get('imu_read_rate_hz', 0))
+    motor_cpu_affinity = str(param.get('motor_cpu_affinity', 2))
+    imu_cpu_affinity = str(param.get('imu_cpu_affinity', 3))
+    launch_wheel_odometry = param.get('launch_wheel_odometry', True)
+    enable_legacy_odom = param.get('enable_legacy_odom', False)
+
+    if launch_wheel_odometry and enable_legacy_odom:
+        raise RuntimeError(
+            'launch_wheel_odometry and enable_legacy_odom cannot both be true; '
+            'they would publish duplicate /odom and odom TF')
 
     md_pkg_dir = LaunchConfiguration(
         'md_pkg_dir',
@@ -51,6 +64,10 @@ def generate_launch_description():
     ahrs_pkg_dir = LaunchConfiguration(
         'ahrs_pkg_dir',
         default=os.path.join(get_package_share_directory('stella_ahrs'), 'launch'))
+
+    wheel_odometry_pkg_dir = LaunchConfiguration(
+        'wheel_odometry_pkg_dir',
+        default=os.path.join(get_package_share_directory('wheel_odometry'), 'launch'))
 
     lidar_pkg_dir = LaunchConfiguration(
         'lidar_pkg_dir',
@@ -102,12 +119,30 @@ def generate_launch_description():
 
         # MotorDriver launch
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([md_pkg_dir, '/stella_md_launch.py'])
+            PythonLaunchDescriptionSource([md_pkg_dir, '/stella_md_launch.py']),
+            launch_arguments={
+                'encoder_poll_rate_hz': str(encoder_poll_rate_hz),
+                'enable_legacy_odom': str(enable_legacy_odom).lower(),
+                'cpu_affinity': motor_cpu_affinity,
+            }.items()
         ),
 
         # AHRS launch
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([ahrs_pkg_dir, '/stella_ahrs_launch.py'])
+            PythonLaunchDescriptionSource([ahrs_pkg_dir, '/stella_ahrs_launch.py']),
+            launch_arguments={
+                'sync_period_ms': str(imu_sync_period_ms),
+                'publish_rate_hz': str(imu_publish_rate_hz),
+                'read_rate_hz': str(imu_read_rate_hz),
+                'cpu_affinity': imu_cpu_affinity,
+            }.items()
+        ),
+
+        # Separated wheel encoder + IMU odometry
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                [wheel_odometry_pkg_dir, '/wheel_odometry.launch.py']),
+            condition=IfCondition('true' if launch_wheel_odometry else 'false')
         ),
 
         # Front upper lidar launch

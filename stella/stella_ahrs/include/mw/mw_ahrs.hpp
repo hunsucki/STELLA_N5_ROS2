@@ -28,20 +28,6 @@
 
 using namespace std::chrono_literals;
 
-static float acc_value[3] = {
-    0,
-},
-             gyr_value[3] = {
-                 0,
-},
-             deg_value[3] = {
-                 0,
-},
-             mag_value[3] = {
-                 0,
-};
-
-
 namespace ntrex
 {
     class MwAhrsRosDriver : public rclcpp::Node
@@ -61,6 +47,7 @@ namespace ntrex
 
     private:
         bool publish_tf_ = false;
+        int sync_period_ms_ = 5;
         std::string parent_frame_id_ = "base_link";
         std::string frame_id_ = "imu_link";
         std::mutex _lockAHRS;

@@ -1,0 +1,26 @@
+wheel_odometry:
+  ros__parameters:
+    enabled: true
+    wheel_radius: 0.0875
+    wheel_separation: 0.36
+    wheel_topic: /wheel/encoders
+    imu_topic: /imu/data
+    odom_topic: /odom
+    odom_frame: odom
+    base_frame: base_footprint
+    left_wheel_name: left_wheel
+    right_wheel_name: right_wheel
+    use_imu_orientation: true
+    relative_imu_yaw: false
+    imu_timeout_sec: 0.25
+    # Wheel yaw predicts fast motion; absolute IMU yaw corrects accumulated drift.
+    # 0.0 reproduces the old behavior of replacing yaw directly with IMU yaw.
+    imu_correction_time_constant_sec: 0.5
+    max_imu_correction_rate_rad_s: 1.0
+    max_encoder_interval_sec: 0.5
+    publish_tf: true
+    publish_yaw_diagnostics: true
+    pose_xy_variance: 0.0025
+    pose_yaw_variance: 0.00121847
+    twist_linear_variance: 0.01
+    twist_angular_variance: 0.01

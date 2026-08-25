@@ -1,6 +1,15 @@
-mw_ahrs_ros2_driver:
+stella_ahrs_node:
   ros__parameters:
     linear_acceleration_stddev: 0.02
     angular_velocity_stddev: 0.01
     magnetic_field_stddev: 0.00000327486
     orientation_stddev: 0.00125
+    sync_period_ms: 5
+    # 0 drains every available serial packet. A positive value caps read attempts.
+    read_rate_hz: 0
+    publish_rate_hz: 100
+    publish_only_on_new_data: true
+    read_idle_sleep_us: 1000
+    frame_id: imu_link
+    parent_frame_id: base_link
+    publish_tf: false
