@@ -5,6 +5,7 @@ from docking.lidar_geometry import (
     has_consecutive_clearance_cluster,
     header_stamp_is_acceptable,
     line_orientation_error,
+    plane_normal_alignment_error,
     PlanarTransform,
     project_scan_to_base,
     rear_clearances,
@@ -66,6 +67,25 @@ def test_tf_projection_corrects_off_axis_wall_range():
 
     assert points is not None
     assert rear_clearances(points, REAR_REFERENCE_X)[0][1] == pytest.approx(0.10)
+
+
+def test_rear_60_degree_safety_sector_excludes_old_side_rail_return():
+    # Field scan that stopped backup with the former +/-75-degree safety fan.
+    old_edge_angle = math.radians(74.85)
+    points = project_scan_to_base(
+        [0.2412],
+        old_edge_angle,
+        math.radians(0.5),
+        0.05,
+        12.0,
+        MOUNT,
+        math.pi,
+        math.radians(60.0),
+        0.05,
+        2.0,
+    )
+
+    assert points == []
 
 
 def test_completion_range_is_inside_driver_range():
@@ -182,6 +202,17 @@ def test_alignment_line_error_has_correct_sign():
     assert math.degrees(line_orientation_error(
         target + math.radians(5.0), target)) == pytest.approx(5.0)
     assert line_orientation_error(target + math.pi, target) == pytest.approx(0.0)
+
+
+def test_plane_normal_error_matches_rear_and_side_station_surfaces():
+    yaw_error = math.radians(4.0)
+
+    assert plane_normal_alignment_error(
+        math.pi / 2.0 + yaw_error, 0.0) == pytest.approx(yaw_error)
+    assert plane_normal_alignment_error(
+        yaw_error, math.pi / 2.0) == pytest.approx(yaw_error)
+    assert plane_normal_alignment_error(
+        math.pi + yaw_error, math.pi / 2.0) == pytest.approx(yaw_error)
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,8 @@ encoder_poll_rate_hz: 30
 imu_sync_period_ms: 5
 imu_publish_rate_hz: 100
 imu_read_rate_hz: 0
+# Hardware-tested reader pacing; 1250 us produced a stable 100 Hz /imu/data.
+imu_read_success_sleep_us: 1250
 
 # Raspberry Pi 5 has cores 0-3. Keep the two serial drivers on separate cores.
 motor_cpu_affinity: 2

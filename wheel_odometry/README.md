@@ -8,8 +8,17 @@ yaw는 좌·우 휠 이동거리 차이로 먼저 예측하고, IMU의 절대 ya
 `0.5 s`, IMU에 의한 최대 보정 속도는 `1.0 rad/s`이다. `0.0 s`로 설정하면
 기존처럼 매 샘플마다 IMU yaw를 그대로 적용한다.
 
+IMU yaw는 timestamp 이력을 유지하고 엔코더 측정시각을 앞뒤로 감싸는 샘플이 있으면
+최단 각도 방향으로 보간한다. 앞쪽 샘플만 있으면 timeout 이내의 최신 과거 샘플만
+사용하며 미래 샘플 하나만으로 과거 엔코더를 보정하지 않는다.
+
 `/wheel_odometry/yaw_diagnostics`의 `vector.x/y/z`에는 같은 엔코더 시각의
-휠 적분 yaw, 최신 IMU yaw, 융합 yaw가 각각 발행되어 rosbag으로 비교할 수 있다.
+휠 적분 yaw, 시간 정렬된 IMU yaw, 융합 yaw가 각각 발행되어 rosbag으로 비교할 수 있다.
+
+`/odom.twist.twist.angular.z`는 IMU heading 보정량을 제외한 휠 엔코더 차동 회전속도다.
+따라서 IMU가 복구되거나 자기장 heading이 천천히 보정될 때 이를 실제 차체 회전으로
+Nav2에 전달하지 않는다. `max_wheel_speed_m_s`보다 큰 좌우 휠 변화는 엔코더 reset,
+rollover 또는 통신 오류로 보고 pose에 반영하지 않은 채 baseline을 재설정한다.
 
 기본 기구 파라미터는 기존 `stella_md` 값을 유지한다.
 

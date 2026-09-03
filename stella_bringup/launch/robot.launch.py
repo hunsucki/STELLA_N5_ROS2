@@ -47,6 +47,7 @@ def generate_launch_description():
     imu_sync_period_ms = int(param.get('imu_sync_period_ms', 5))
     imu_publish_rate_hz = int(param.get('imu_publish_rate_hz', 100))
     imu_read_rate_hz = int(param.get('imu_read_rate_hz', 0))
+    imu_read_success_sleep_us = int(param.get('imu_read_success_sleep_us', 1250))
     motor_cpu_affinity = str(param.get('motor_cpu_affinity', 2))
     imu_cpu_affinity = str(param.get('imu_cpu_affinity', 3))
     launch_wheel_odometry = param.get('launch_wheel_odometry', True)
@@ -134,6 +135,7 @@ def generate_launch_description():
                 'sync_period_ms': str(imu_sync_period_ms),
                 'publish_rate_hz': str(imu_publish_rate_hz),
                 'read_rate_hz': str(imu_read_rate_hz),
+                'read_success_sleep_us': str(imu_read_success_sleep_us),
                 'cpu_affinity': imu_cpu_affinity,
             }.items()
         ),

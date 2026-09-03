@@ -24,6 +24,22 @@ class ProjectedPoint:
     distance: float
 
 
+@dataclass(frozen=True)
+class GuideCenterEstimate:
+    """Two-rail dock opening measured in a rear-panel-aligned frame."""
+
+    center_offset: float
+    separation: float
+    left_y: float
+    right_y: float
+    left_inliers: int
+    right_inliers: int
+    left_length: float
+    right_length: float
+    left_line_angle: float
+    right_line_angle: float
+
+
 class UniqueScanStability:
     """Count stable observations only when a new scan sequence is seen."""
 
@@ -55,6 +71,13 @@ def line_orientation_error(line_angle: float, target_angle: float) -> float:
     """Shortest line-orientation error, treating angles pi apart as equal."""
     delta = normalize_angle(line_angle - target_angle)
     return 0.5 * math.atan2(math.sin(2.0 * delta), math.cos(2.0 * delta))
+
+
+def plane_normal_alignment_error(
+        line_angle: float, target_normal_angle: float) -> float:
+    """Plane-normal yaw error, treating opposite normal directions as equal."""
+    normal_angle = line_angle + math.pi / 2.0
+    return line_orientation_error(normal_angle, target_normal_angle)
 
 
 def yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:

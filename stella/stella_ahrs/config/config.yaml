@@ -9,6 +9,8 @@ stella_ahrs_node:
     read_rate_hz: 0
     publish_rate_hz: 100
     publish_only_on_new_data: true
+    # Yield after a decoded packet so the reader cannot starve the publisher.
+    read_success_sleep_us: 1250
     read_idle_sleep_us: 1000
     frame_id: imu_link
     parent_frame_id: base_link

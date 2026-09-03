@@ -32,15 +32,40 @@ agent on
 default-agent
 scan on
 # 출력에서 Xbox Wireless Controller의 주소를 확인합니다.
+scan off
 pair XX:XX:XX:XX:XX:XX
 trust XX:XX:XX:XX:XX:XX
 connect XX:XX:XX:XX:XX:XX
 quit
 ```
 
-현재 컨트롤러(`9C:AA:1B:4C:A7:7A`)와 Raspberry Pi 조합은 검색이 켜진
-상태에서 pair/connect해야 안정적으로 연결되었습니다. 이를 자동화한 스크립트
-두 개가 포함되어 있습니다.
+스크립트는 검색 중 Xbox 광고 패킷을 확인한 뒤 검색을 종료하고 pair/connect를
+실행합니다. 활성 검색을 연결 과정까지 유지하지 마십시오.
+
+이 저장소의 이전 연결 파라미터 실험을 적용했다면 한 번 원본 BlueZ 설정과
+본딩 상태로 초기화합니다. 기존 설정과 본딩은 삭제하지 않고 별도 위치에
+백업되며 Bluetooth 서비스가 한 번 재시작됩니다.
+
+```bash
+cd ~/colcon_ws/src/STELLA_N5_ROS2/teleop_joy/scripts
+./reset_xbox_bluetooth.sh
+```
+
+초기화할 때는 컨트롤러를 완전히 끄고, 열려 있는 `bluetoothctl`과 Bluetooth
+설정 창도 모두 닫아야 합니다. 초기화 후 컨트롤러를 빠른 점멸 상태로 만들어
+`./xbox_pair.sh`를 실행합니다.
+
+Ubuntu에서 `/dev/input/event*`가 `root:input` 전용으로 생성되면 연결은
+성공해도 `/joy`가 발행되지 않습니다. 이 저장소의 udev 규칙에는 Xbox 입력을
+`plugdev` 그룹에 허용하는 설정이 포함되어 있습니다. 최초 한 번 적용합니다.
+
+```bash
+cd ~/colcon_ws/src/STELLA_N5_ROS2/stella_bringup
+./create_udev_rules.sh
+```
+
+적용 후 컨트롤러를 껐다 켜거나 아래 재연결 스크립트를 실행해야 새 권한으로
+입력 장치가 다시 생성됩니다.
 
 컨트롤러가 빠르게 점멸하는 최초 페어링 모드일 때:
 
@@ -48,6 +73,27 @@ quit
 cd ~/colcon_ws/src/STELLA_N5_ROS2/teleop_joy/scripts
 ./xbox_pair.sh
 ```
+
+페어링 한 번이 실패하면 컨트롤러의 빠른 점멸도 종료될 수 있습니다. 재시도할
+때마다 페어링 버튼을 다시 길게 눌러 빠른 점멸을 새로 시작해야 합니다. 이
+스크립트는 Xbox의 숫자 확인 인증 요청을 처리할 수 있도록
+`KeyboardDisplay` 에이전트를 사용합니다.
+에이전트는 페어링 스크립트가 실행되는 동안에만 등록되며, 종료할 때 자동으로
+해제됩니다. 실패 시 상세 로그는 `~/.local/state/teleop_joy/pair.*`에 남습니다.
+
+Xbox One S Bluetooth 전용 커널 드라이버인 `xpadneo`를 설치할 수 있습니다.
+설치 스크립트는 검증된 안정 태그 `v0.10.4`를
+사용하고 현재 실행 중인 Raspberry Pi 커널과 정확히 일치하는 헤더를 설치한
+뒤 DKMS 모듈을 빌드합니다.
+
+```bash
+cd ~/colcon_ws/src/STELLA_N5_ROS2/teleop_joy/scripts
+./install_xpadneo.sh
+```
+
+설치할 때는 컨트롤러를 완전히 끄고, 설치 후 다시 켜서
+`./xbox_connect.sh`를 실행합니다. 내려받은 공식 저장소는 `~/xpadneo`에
+보관되며 `~/xpadneo/uninstall.sh`로 제거할 수 있습니다.
 
 이미 페어링된 컨트롤러가 일반적으로 점멸하며 재연결을 기다릴 때:
 

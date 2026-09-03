@@ -13,11 +13,16 @@ wheel_odometry:
     use_imu_orientation: true
     relative_imu_yaw: false
     imu_timeout_sec: 0.25
+    # Keep timestamped yaw samples so encoder-time interpolation can be used.
+    imu_history_duration_sec: 1.0
     # Wheel yaw predicts fast motion; absolute IMU yaw corrects accumulated drift.
     # 0.0 reproduces the old behavior of replacing yaw directly with IMU yaw.
     imu_correction_time_constant_sec: 0.5
     max_imu_correction_rate_rad_s: 1.0
     max_encoder_interval_sec: 0.5
+    # MD36NP51-24V nominal wheel speed is about 1.12 m/s. Values above this
+    # safety margin indicate a counter reset, rollover or corrupt sample.
+    max_wheel_speed_m_s: 2.0
     publish_tf: true
     publish_yaw_diagnostics: true
     pose_xy_variance: 0.0025

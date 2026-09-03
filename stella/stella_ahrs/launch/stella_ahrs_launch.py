@@ -21,6 +21,7 @@ def generate_launch_description():
     sync_period_ms = LaunchConfiguration('sync_period_ms')
     publish_rate_hz = LaunchConfiguration('publish_rate_hz')
     read_rate_hz = LaunchConfiguration('read_rate_hz')
+    read_success_sleep_us = LaunchConfiguration('read_success_sleep_us')
     cpu_affinity = LaunchConfiguration('cpu_affinity')
     
     declare_rviz_config_file_cmd = DeclareLaunchArgument(
@@ -55,6 +56,8 @@ def generate_launch_description():
                                     'publish_rate_hz': ParameterValue(
                                         publish_rate_hz, value_type=int),
                                     'publish_only_on_new_data': True,
+                                    'read_success_sleep_us': ParameterValue(
+                                        read_success_sleep_us, value_type=int),
                                     'read_idle_sleep_us': 1000,
                                     'frame_id': 'imu_link',
                                     'parent_frame_id': 'base_link',
@@ -73,6 +76,9 @@ def generate_launch_description():
       DeclareLaunchArgument(
           'read_rate_hz', default_value='0',
           description='Serial packet read cap in Hz; 0 drains all available packets'),
+      DeclareLaunchArgument(
+          'read_success_sleep_us', default_value='1250',
+          description='Reader yield after a decoded packet in microseconds'),
       DeclareLaunchArgument(
           'cpu_affinity', default_value='3',
           description='Linux CPU core list assigned to the AHRS driver'),

@@ -16,6 +16,21 @@ KERNEL=="ttyUSB*", KERNELS=="3-1.2", ATTRS{idVendor}=="067b", ATTRS{idProduct}==
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE:="0777", SYMLINK+="AHRS"
 KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE:="0777", SYMLINK+="MW"
 
+# Raspberry Pi 5 on-board devices used by the Python hardware nodes.
+# gpiozero selects gpiochip4 for the 40-pin header and the INA219 is on I2C bus 1.
+# These nodes are launched as the desktop user, so they must not inherit the
+# Ubuntu default root:dialout 0660 permissions on systems where that user is not
+# a member of dialout.
+SUBSYSTEM=="gpio", KERNEL=="gpiochip4", GROUP:="plugdev", MODE:="0660"
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-1", GROUP:="plugdev", MODE:="0660"
+
+# Microsoft Xbox Bluetooth gamepad input. ROS joy uses the evdev event node,
+# which Ubuntu otherwise creates as root:input 0660. STELLA processes run as a
+# desktop user in plugdev, so grant that group access without opening all input
+# devices system-wide.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/vendor}=="045e", ENV{ID_INPUT_JOYSTICK}=="1", GROUP:="plugdev", MODE:="0660"
+SUBSYSTEM=="input", KERNEL=="js*", ATTRS{id/vendor}=="045e", ENV{ID_INPUT_JOYSTICK}=="1", GROUP:="plugdev", MODE:="0660"
+
 # set the udev rule, make the Bluetooth's device_port be fixed by BT
 
 KERNEL=="ttyS*", MODE:="0777", SYMLINK+="BT"

@@ -34,6 +34,7 @@
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
 from smbus2 import SMBus
@@ -66,6 +67,9 @@ class StellaN5Monitor:
     def get_soc(self, voltage):
         soc = (voltage - self.MIN_V) / (self.MAX_V - self.MIN_V) * 100
         return max(0.0, min(100.0, round(soc, 1)))
+
+    def close(self):
+        self.bus.close()
 
 
 class BatteryNode(Node):
@@ -468,18 +472,23 @@ class BatteryNode(Node):
                 self._sk120.close()
             except Exception:
                 pass
-        super().destroy_node()
+        try:
+            self._monitor.close()
+        finally:
+            super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = BatteryNode()
+    node = None
     try:
+        node = BatteryNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

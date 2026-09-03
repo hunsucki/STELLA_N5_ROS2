@@ -20,7 +20,7 @@ docking_server:
       staging_x_offset: -0.80
       staging_yaw_offset: 0.0
 
-      external_detection_translation_x: -0.80
+      external_detection_translation_x: -0.95
       external_detection_translation_y: 0.0
       external_detection_rotation_yaw: 0.0
       external_detection_rotation_pitch: 1.57
@@ -49,3 +49,51 @@ docking_server:
       frame: odom
       pose: [0.0, 0.0, 0.0]
       id: tag36h11:0
+
+# Parameters for `ros2 run docking dock_turn_backup`.  The executable loads
+# this file automatically; command-line `-p` overrides still take precedence.
+dock_turn_backup:
+  ros__parameters:
+    # New bounded precision stage after Nav2 DockRobot.  Set false to restore
+    # the previous successful sequence without any precision motion.
+    use_tag_pose_refinement: true
+    tag_refinement_target_pose_topic: /dock_pose
+    tag_refinement_target_wait_timeout_sec: 1.0
+    tag_refinement_target_max_age_sec: 1.5
+    tag_refinement_timeout_sec: 18.0
+    tag_refinement_longitudinal_tolerance: 0.04
+    tag_refinement_lateral_tolerance: 0.025
+    tag_refinement_yaw_tolerance: 0.034906585  # 2 deg
+    tag_refinement_stable_cycles: 5
+    tag_refinement_linear_kp: 0.50
+    tag_refinement_angular_k_alpha: 1.00
+    tag_refinement_angular_k_beta: -0.30
+    tag_refinement_final_yaw_kp: 1.00
+    tag_refinement_max_linear_speed: 0.025
+    tag_refinement_max_angular_speed: 0.08
+    tag_refinement_max_initial_longitudinal: 0.18
+    tag_refinement_max_initial_lateral: 0.10
+    tag_refinement_max_initial_yaw: 0.436332313  # 25 deg
+    tag_refinement_max_travel: 0.18
+    tag_refinement_max_yaw_excursion: 0.523598776  # 30 deg
+    tag_refinement_control_rate_hz: 20.0
+    tag_refinement_abort_on_failure: true
+
+    # Rear-plane alignment first acquires a stable surface while stopped.
+    # A small one-off RANSAC jump triggers reacquisition instead of aborting.
+    lidar_align_timeout_sec: 12.0
+    lidar_align_max_rotation: 0.314159265  # 18 deg
+    lidar_align_acquisition_stable_cycles: 3
+    lidar_align_acquisition_max_residual: 0.052359878  # 3 deg
+    lidar_align_max_tracking_residual: 0.087266463  # 5 deg
+    lidar_align_hard_tracking_residual: 0.209439510  # 12 deg
+
+    # The former blind one-second forward motion is disabled independently.
+    # Re-enable this flag to reproduce that step without enabling refinement.
+    use_pre_spin_forward: false
+    pre_spin_forward_duration_sec: 1.0
+    pre_spin_forward_speed: 0.03
+    pre_spin_forward_max_distance: 0.05
+
+    backup_target_rear_clearance: 0.020
+    backup_clearance_tolerance: 0.005

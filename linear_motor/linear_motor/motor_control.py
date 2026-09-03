@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Int32
 from gpiozero import Motor
@@ -38,20 +39,28 @@ class LinearMotorNode(Node):
 
     def destroy_node(self):
         # 종료 시 모터 정지 안전장치
-        self.motor.stop()
-        super().destroy_node()
+        try:
+            self.motor.stop()
+        finally:
+            try:
+                self.motor.close()
+            finally:
+                super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LinearMotorNode()
-    
+    node = None
     try:
+        node = LinearMotorNode()
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info('사용자에 의해 노드가 종료됩니다.')
+    except (KeyboardInterrupt, ExternalShutdownException):
+        if node is not None:
+            node.get_logger().info('사용자에 의해 노드가 종료됩니다.')
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

@@ -122,13 +122,20 @@ namespace ntrex
   void MwAhrsRosDriver::MwAhrsRead()
 {
   int read_rate_hz = 0;
+  int read_success_sleep_us = 1250;
   int read_idle_sleep_us = 1000;
   this->get_parameter("read_rate_hz", read_rate_hz);
+  this->get_parameter("read_success_sleep_us", read_success_sleep_us);
   this->get_parameter("read_idle_sleep_us", read_idle_sleep_us);
 
   if (read_rate_hz < 0)
   {
     read_rate_hz = 0;
+  }
+
+  if (read_success_sleep_us < 0)
+  {
+    read_success_sleep_us = 1250;
   }
 
   if (read_idle_sleep_us < 0)
@@ -229,19 +236,30 @@ namespace ntrex
       }
     }
 
-    if (got_packet && read_rate)
+    if (got_packet)
     {
-      if (!rclcpp::ok() || !AHRS.load())
+      if (read_rate)
       {
-        break;
+        if (!rclcpp::ok() || !AHRS.load())
+        {
+          break;
+        }
+        try
+        {
+          read_rate->sleep();
+        }
+        catch (const std::exception &)
+        {
+          break;
+        }
       }
-      try
+      else if (read_success_sleep_us > 0)
       {
-        read_rate->sleep();
-      }
-      catch (const std::exception &)
-      {
-        break;
+        // The vendor read function and the publisher share imu_msg_mutex.
+        // A small, hardware-tested yield prevents the uncapped reader from
+        // starving the ROS publisher.
+        std::this_thread::sleep_for(
+          std::chrono::microseconds(read_success_sleep_us));
       }
     }
     else if (read_idle_sleep_us > 0)
@@ -444,6 +462,7 @@ namespace ntrex
       this->declare_parameter("read_rate_hz", 0);
       this->declare_parameter("publish_rate_hz", 100);
       this->declare_parameter("publish_only_on_new_data", true);
+      this->declare_parameter("read_success_sleep_us", 1250);
       this->declare_parameter("read_idle_sleep_us", 1000);
       this->declare_parameter("publish_tf", false);
       this->declare_parameter("parent_frame_id", "base_link");
@@ -471,11 +490,13 @@ namespace ntrex
 
       int publish_rate_hz = 100;
       int read_rate_hz = 0;
+      int read_success_sleep_us = 1250;
       this->get_parameter("publish_rate_hz", publish_rate_hz);
       this->get_parameter("read_rate_hz", read_rate_hz);
+      this->get_parameter("read_success_sleep_us", read_success_sleep_us);
       const std::string read_description = read_rate_hz > 0
         ? std::to_string(read_rate_hz) + " packets/s cap"
-        : "unlimited drain";
+        : "uncapped with " + std::to_string(read_success_sleep_us) + " us packet yield";
       RCLCPP_INFO(
         this->get_logger(),
         "MW-AHRS ROS Init Success: sensor sync=%d ms (up to %.1f sync cycles/s), serial read=%s, topic publish=%d Hz",

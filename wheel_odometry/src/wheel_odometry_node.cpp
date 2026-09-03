@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -41,6 +42,12 @@ bool quaternion_to_yaw(const geometry_msgs::msg::Quaternion & q, double & yaw)
   yaw = std::atan2(siny_cosp, cosy_cosp);
   return std::isfinite(yaw);
 }
+
+struct ImuYawSample
+{
+  rclcpp::Time stamp;
+  double yaw;
+};
 }  // namespace
 
 class WheelOdometryNode : public rclcpp::Node
@@ -62,12 +69,15 @@ public:
     use_imu_orientation_ = declare_parameter<bool>("use_imu_orientation", true);
     relative_imu_yaw_ = declare_parameter<bool>("relative_imu_yaw", false);
     imu_timeout_sec_ = declare_parameter<double>("imu_timeout_sec", 0.25);
+    imu_history_duration_sec_ =
+      declare_parameter<double>("imu_history_duration_sec", 1.0);
     imu_correction_time_constant_sec_ =
       declare_parameter<double>("imu_correction_time_constant_sec", 0.5);
     max_imu_correction_rate_rad_s_ =
       declare_parameter<double>("max_imu_correction_rate_rad_s", 1.0);
     max_encoder_interval_sec_ =
       declare_parameter<double>("max_encoder_interval_sec", 0.5);
+    max_wheel_speed_m_s_ = declare_parameter<double>("max_wheel_speed_m_s", 2.0);
     publish_tf_ = declare_parameter<bool>("publish_tf", true);
     publish_yaw_diagnostics_ = declare_parameter<bool>("publish_yaw_diagnostics", true);
 
@@ -80,10 +90,13 @@ public:
     {
       throw std::invalid_argument("wheel_radius and wheel_separation must be positive");
     }
-    if (imu_correction_time_constant_sec_ < 0.0 || max_imu_correction_rate_rad_s_ < 0.0)
+    if (
+      imu_timeout_sec_ < 0.0 || imu_history_duration_sec_ <= 0.0 ||
+      imu_correction_time_constant_sec_ < 0.0 || max_imu_correction_rate_rad_s_ < 0.0 ||
+      max_encoder_interval_sec_ < 0.0 || max_wheel_speed_m_s_ < 0.0)
     {
       throw std::invalid_argument(
-              "IMU correction time constant and maximum correction rate cannot be negative");
+              "Timeouts, rate limits and maximum wheel speed must be valid non-negative values");
     }
 
     yaw_diagnostics_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
@@ -125,9 +138,29 @@ private:
       return;
     }
 
-    latest_imu_yaw_ = yaw;
-    latest_imu_stamp_ = rclcpp::Time(msg->header.stamp);
-    imu_received_ = true;
+    const rclcpp::Time stamp(msg->header.stamp);
+    if (!imu_yaw_history_.empty())
+    {
+      if (stamp < imu_yaw_history_.back().stamp)
+      {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000, "Ignoring out-of-order IMU timestamp");
+        return;
+      }
+      if (stamp == imu_yaw_history_.back().stamp)
+      {
+        imu_yaw_history_.back().yaw = yaw;
+        return;
+      }
+    }
+
+    imu_yaw_history_.push_back({stamp, yaw});
+    while (
+      imu_yaw_history_.size() > 2 &&
+      (stamp - imu_yaw_history_[1].stamp).seconds() > imu_history_duration_sec_)
+    {
+      imu_yaw_history_.pop_front();
+    }
   }
 
   bool wheel_positions(
@@ -156,40 +189,77 @@ private:
     return found_left && found_right && std::isfinite(left) && std::isfinite(right);
   }
 
-  bool imu_yaw_at(const rclcpp::Time & stamp, double & yaw)
+  bool imu_yaw_at(
+    const rclcpp::Time & stamp, double & yaw, rclcpp::Time & measurement_stamp)
   {
     if (!use_imu_orientation_)
     {
       return false;
     }
-    if (!imu_received_)
+    if (imu_yaw_history_.empty())
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000, "Waiting for stamped IMU orientation");
       return false;
     }
 
-    const double age = std::abs((stamp - latest_imu_stamp_).seconds());
-    if (imu_timeout_sec_ > 0.0 && age > imu_timeout_sec_)
+    const auto after = std::upper_bound(
+      imu_yaw_history_.begin(), imu_yaw_history_.end(), stamp,
+      [](const rclcpp::Time & target, const ImuYawSample & sample) {
+        return target < sample.stamp;
+      });
+
+    // Never use a future-only sample.  If samples bracket the encoder time,
+    // interpolate across the shortest yaw arc.  Otherwise use the newest
+    // causal sample within the configured timeout.
+    if (after == imu_yaw_history_.begin())
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "IMU orientation is stale relative to encoder sample (%.3f sec)", age);
+        "Waiting for an IMU sample at or before the encoder timestamp");
       return false;
+    }
+
+    const auto before = std::prev(after);
+    const double past_age = (stamp - before->stamp).seconds();
+    if (imu_timeout_sec_ > 0.0 && past_age > imu_timeout_sec_)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "IMU orientation is stale relative to encoder sample (%.3f sec)", past_age);
+      return false;
+    }
+
+    double raw_yaw = before->yaw;
+    measurement_stamp = before->stamp;
+    if (after != imu_yaw_history_.end())
+    {
+      const double future_age = (after->stamp - stamp).seconds();
+      const double sample_interval = (after->stamp - before->stamp).seconds();
+      const bool future_is_fresh = imu_timeout_sec_ <= 0.0 || future_age <= imu_timeout_sec_;
+      if (sample_interval > 0.0 && future_is_fresh)
+      {
+        const double ratio = std::clamp(
+          (stamp - before->stamp).seconds() / sample_interval, 0.0, 1.0);
+        raw_yaw = std::atan2(
+          std::sin(before->yaw + ratio * angle_diff(after->yaw, before->yaw)),
+          std::cos(before->yaw + ratio * angle_diff(after->yaw, before->yaw)));
+        measurement_stamp = stamp;
+      }
     }
 
     if (relative_imu_yaw_)
     {
       if (!imu_reference_initialized_)
       {
-        initial_imu_yaw_ = latest_imu_yaw_;
+        initial_imu_yaw_ = raw_yaw;
         imu_reference_initialized_ = true;
       }
-      yaw = angle_diff(latest_imu_yaw_, initial_imu_yaw_);
+      yaw = angle_diff(raw_yaw, initial_imu_yaw_);
     }
     else
     {
-      yaw = latest_imu_yaw_;
+      yaw = raw_yaw;
     }
     return true;
   }
@@ -202,6 +272,7 @@ private:
       enabled_ = requested_enabled;
       encoder_initialized_ = false;
       imu_reference_initialized_ = false;
+      last_used_imu_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       if (enabled_)
       {
         create_output_publishers();
@@ -238,7 +309,8 @@ private:
 
     const rclcpp::Time stamp(msg->header.stamp);
     double imu_yaw = 0.0;
-    const bool have_imu_yaw = imu_yaw_at(stamp, imu_yaw);
+    rclcpp::Time imu_measurement_stamp(0, 0, stamp.get_clock_type());
+    const bool have_imu_yaw = imu_yaw_at(stamp, imu_yaw, imu_measurement_stamp);
 
     if (!encoder_initialized_)
     {
@@ -252,6 +324,10 @@ private:
       yaw_ = use_imu_orientation_ ? imu_yaw : 0.0;
       wheel_yaw_ = yaw_;
       previous_yaw_ = yaw_;
+      if (have_imu_yaw)
+      {
+        last_used_imu_stamp_ = imu_measurement_stamp;
+      }
       encoder_initialized_ = true;
       publish_odometry(stamp, 0.0, 0.0);
       publish_yaw_diagnostics(
@@ -279,6 +355,24 @@ private:
 
     const double left_distance = (left_position - previous_left_position_) * wheel_radius_;
     const double right_distance = (right_position - previous_right_position_) * wheel_radius_;
+    const double left_speed = left_distance / dt;
+    const double right_speed = right_distance / dt;
+    if (
+      !std::isfinite(left_speed) || !std::isfinite(right_speed) ||
+      (max_wheel_speed_m_s_ > 0.0 &&
+      (std::abs(left_speed) > max_wheel_speed_m_s_ ||
+      std::abs(right_speed) > max_wheel_speed_m_s_)))
+    {
+      RCLCPP_WARN(
+        get_logger(),
+        "Rejecting implausible encoder change: left=%.3f m/s right=%.3f m/s; resetting baseline",
+        left_speed, right_speed);
+      previous_left_position_ = left_position;
+      previous_right_position_ = right_position;
+      previous_encoder_stamp_ = stamp;
+      return;
+    }
+
     const double center_distance = 0.5 * (left_distance + right_distance);
     const double wheel_yaw_change = (right_distance - left_distance) / wheel_separation_;
     wheel_yaw_ = std::atan2(
@@ -288,7 +382,9 @@ private:
       std::sin(yaw_ + wheel_yaw_change),
       std::cos(yaw_ + wheel_yaw_change));
 
-    if (use_imu_orientation_ && have_imu_yaw)
+    const bool new_imu_measurement =
+      have_imu_yaw && imu_measurement_stamp > last_used_imu_stamp_;
+    if (use_imu_orientation_ && new_imu_measurement)
     {
       const double correction_alpha = imu_correction_time_constant_sec_ > 0.0
         ? 1.0 - std::exp(-dt / imu_correction_time_constant_sec_)
@@ -303,6 +399,7 @@ private:
       yaw_ = std::atan2(
         std::sin(predicted_yaw + imu_correction),
         std::cos(predicted_yaw + imu_correction));
+      last_used_imu_stamp_ = imu_measurement_stamp;
     }
     else
     {
@@ -315,7 +412,10 @@ private:
     y_ += center_distance * std::sin(integration_yaw);
 
     const double linear_velocity = center_distance / dt;
-    const double angular_velocity = yaw_change / dt;
+    // Pose yaw includes a slow IMU drift correction.  Report measured wheel
+    // angular velocity instead so a heading correction is not presented to
+    // Nav2 as physical robot rotation.
+    const double angular_velocity = wheel_yaw_change / dt;
     publish_odometry(stamp, linear_velocity, angular_velocity);
     publish_yaw_diagnostics(
       stamp, have_imu_yaw ? imu_yaw : std::numeric_limits<double>::quiet_NaN());
@@ -407,7 +507,6 @@ private:
   bool publish_tf_{true};
   bool use_imu_orientation_{true};
   bool relative_imu_yaw_{false};
-  bool imu_received_{false};
   bool imu_reference_initialized_{false};
   bool encoder_initialized_{false};
   bool publish_yaw_diagnostics_{true};
@@ -415,14 +514,15 @@ private:
   double wheel_radius_{0.0875};
   double wheel_separation_{0.36};
   double imu_timeout_sec_{0.25};
+  double imu_history_duration_sec_{1.0};
   double max_encoder_interval_sec_{0.5};
+  double max_wheel_speed_m_s_{2.0};
   double imu_correction_time_constant_sec_{0.5};
   double max_imu_correction_rate_rad_s_{1.0};
   double pose_xy_variance_{0.0025};
   double pose_yaw_variance_{0.00121847};
   double twist_linear_variance_{0.01};
   double twist_angular_variance_{0.01};
-  double latest_imu_yaw_{0.0};
   double initial_imu_yaw_{0.0};
   double previous_left_position_{0.0};
   double previous_right_position_{0.0};
@@ -440,7 +540,8 @@ private:
   std::string left_wheel_name_;
   std::string right_wheel_name_;
 
-  rclcpp::Time latest_imu_stamp_{0, 0, RCL_ROS_TIME};
+  std::deque<ImuYawSample> imu_yaw_history_;
+  rclcpp::Time last_used_imu_stamp_{0, 0, RCL_ROS_TIME};
   rclcpp::Time previous_encoder_stamp_{0, 0, RCL_ROS_TIME};
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr yaw_diagnostics_pub_;
