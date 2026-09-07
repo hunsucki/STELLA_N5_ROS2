@@ -4,9 +4,11 @@ SIYI A8 mini 짐벌 카메라 두 대에서 ROS 2 토픽 명령을 받을 때마
 프레임을 한 장씩 병렬 캡처하고, 각 카메라의 yaw/pitch 회전, 디지털 줌과
 중앙 복귀를 ROS 2 토픽으로 제어하는 독립 패키지다.
 
-이 패키지는 현재 `stella_bringup`에 등록되어 있지 않다. 따라서 로봇을
-부팅하거나 기존 bringup을 실행해도 자동으로 시작되지 않으며, 필요할 때
-별도로 launch해야 한다.
+촬영 서비스 노드는 `stella_bringup/launch/robot.launch.py`에 등록되어 있다.
+`robot_launch_param.yaml`의 `launch_gimbal_camera_capture: true`가 기본값이므로
+로봇 bringup과 함께 시작해 촬영 요청을 기다린다. 대기 중에는 RTSP 스트림을
+열지 않으며 실제 촬영 요청을 처리할 때만 두 카메라에 접속한다. 수동 짐벌
+제어용 `control_node`는 별도로 실행한다.
 
 ## 1. 현재 구성 요약
 
@@ -71,7 +73,28 @@ Right를 USB-LAN에 직결하여 두 카메라를 서로 다른 L2 구간으로 
 
 ## 3. ROS 2 인터페이스와 동작
 
-### 촬영 명령
+### drive_manager 자동 운용 서비스
+
+자동 순회에서는 다음 `inspection_interfaces` 서비스를 사용한다.
+
+| 서비스 | 역할 |
+|---|---|
+| `/camera/capture_run/start` | mission/map/활성 구역 스냅샷으로 run 시작 |
+| `/camera/capture_pair` | request/구역/AMCL pose와 좌우 사진 한 쌍 저장 |
+| `/camera/capture_run/finish` | metadata 확정 후 `READY` 생성 |
+| `/camera/capture_run/abort` | metadata를 `aborted`로 확정하고 `READY` 없이 종료 |
+
+정상 호출 순서는 `start -> capture 0회 이상 -> finish`다. 모든 서비스 응답은
+필요한 파일과 `metadata.yaml`의 원자적 저장이 끝난 뒤 반환된다. 같은
+`mission_id`, `request_id`, finish 또는 abort 요청이 재전송되면 디스크에 저장된
+기존 결과를 반환하고 새 run이나 사진을 만들지 않는다. 노드 재시작 후 재요청도
+같은 규칙을 적용한다.
+
+상세 필드와 drive_manager 상태 머신 계약은 같은 저장소의
+`../inspection_interfaces/CAMERA_SERVICE_INTEGRATION.md`를 따른다. 메시지와
+서비스 정의는 형제 패키지인 `inspection_interfaces`에 분리되어 있다.
+
+### 수동 시험용 legacy 촬영 명령
 
 - 구독 토픽: `/camera/capture`
 - 메시지 형식: `std_msgs/msg/Bool`
@@ -81,7 +104,22 @@ Right를 USB-LAN에 직결하여 두 카메라를 서로 다른 L2 구간으로 
 한 번의 촬영이 진행 중일 때 새로운 `true` 명령이 들어오면 중복 촬영을
 시작하지 않고 요청을 거절한 결과를 발행한다.
 
-### 촬영 결과
+### 수동 시험용 legacy run 시작과 종료
+
+- 시작 토픽: `/camera/run/start` (`std_msgs/msg/Empty`)
+- 종료 토픽: `/camera/run/finish` (`std_msgs/msg/Empty`)
+- 결과 토픽: `/camera/run/result` (`std_msgs/msg/String`, JSON)
+
+`start`는 해당 날짜의 다음 `run_N` 폴더를 만들고, `finish`는
+`metadata.yaml`을 `completed` 상태로 갱신한 뒤 `READY` 파일을 만든다.
+`/camera/run/result`의 `finish`, `success: true`, `ready: true` 결과에 포함된
+`directory`가 Jetson으로 전송할 단위다.
+
+시작 토픽 없이 legacy 촬영 명령이 먼저 들어오면 새 run을 자동 생성한다.
+drive_manager는 이 토픽들을 사용하지 않고 위 네 서비스를 사용해야 한다.
+서비스가 관리하는 mission run에는 legacy 촬영/종료 토픽을 사용할 수 없다.
+
+### 수동 촬영 결과
 
 - 발행 토픽: `/camera/capture/result`
 - 메시지 형식: `std_msgs/msg/String`
@@ -91,12 +129,14 @@ Right를 USB-LAN에 직결하여 두 카메라를 서로 다른 L2 구간으로 
 
 ```json
 {
-  "directory": "/home/user/capcture/20260726",
+  "directory": "/home/user/capture/20260726/run_1",
   "errors": {},
   "files": {
-    "left": "/home/user/capcture/20260726/left/154408_1.jpg",
-    "right": "/home/user/capcture/20260726/right/154408_1.jpg"
+    "left": "/home/user/capture/20260726/run_1/left/154408_1.jpg",
+    "right": "/home/user/capture/20260726/run_1/right/154408_1.jpg"
   },
+  "metadata_file": "/home/user/capture/20260726/run_1/metadata.yaml",
+  "run_id": "run_1",
   "success": true,
   "timestamp": "2026-07-26T15:44:08.000000+09:00"
 }
@@ -163,27 +203,48 @@ SIYI 회전과 줌 명령은 시작 후 정지 명령을 받아야 멈추는 방
 
 ## 4. 저장 위치와 파일명
 
-기본 저장 위치는 철자가 `capture`가 아닌 **`~/capcture`** 다. 기존 경로와의
-호환성을 위해 현재는 이 이름을 유지하고 있다.
+기본 저장 위치는 **`~/capture`** 다. 과거 오타 경로인 `~/capcture`의 기존
+사진은 자동으로 이동하거나 삭제하지 않으며, 새 촬영만 올바른 경로에 저장한다.
 
 ```text
-~/capcture/
+~/capture/
 └── 20260726/
-    ├── left/
-    │   └── 153633_1.jpg
-    └── right/
-        └── 153633_1.jpg
+    ├── run_1/
+    │   ├── metadata.yaml
+    │   ├── READY
+    │   ├── left/
+    │   │   └── 153633_1.jpg
+    │   └── right/
+    │       └── 153633_1.jpg
+    └── run_2/
+        ├── metadata.yaml
+        ├── left/
+        └── right/
 ```
 
 - 날짜 폴더: 로컬 시간 기준 `YYYYMMDD`
+- 주행 폴더: 날짜별 `run_1`, `run_2`, ...
 - 카메라 폴더: `left`, `right`
 - 파일명: `HHMMSS_번호.jpg`
 - 한 번의 촬영으로 생성된 Left/Right 사진은 같은 파일명을 사용
 - 같은 초에 다시 촬영하거나 한쪽에 같은 이름의 기존 파일이 있으면
   `_2`, `_3` 순서로 증가
 - 다음 초에는 다시 `_1`부터 시작
+- `metadata.yaml`: 시작/종료 시각, run 상태, 촬영별 성공 여부와 상대 파일 경로
+- `READY`: run 종료 처리가 끝났으며 폴더를 전송해도 된다는 표시
 - 기존 `run_YYYYMMDD_N` 구조의 사진은 삭제하거나 이동하지 않음
 - 오래된 사진을 자동 삭제하는 기능은 없으므로 디스크 용량은 별도로 관리해야 함
+
+`metadata.yaml`은 schema version 2로 mission/map/가변 구역 스냅샷과 각 요청의
+`request_id`, `zone_id`, 요청·촬영 시각, 전체 AMCL pose/covariance, 좌우 결과를
+기록한다. 파일 경로는 `left/153633_1.jpg` 같은 상대경로이므로 run 폴더 전체를
+Jetson으로 이동한 후에도 수정할 필요가 없다. 비정상 종료된 run은
+`status: running`이고 `READY`가 없으며, abort된 run은 `status: aborted`이고
+역시 `READY`가 없다. Jetson은 `READY`가 있는 run만 추론 대상으로 사용한다.
+
+구역은 1개 이상이면 되고 최대 개수 제한은 없다. 이름에는 영문, 숫자, `_`,
+`-`만 사용할 수 있으며 start 요청의 이름·좌표만 metadata에 기록한다.
+`CapturePair.zone_id`는 해당 start 요청에 포함됐던 이름 중 하나여야 한다.
 
 파일 날짜와 시간이 중요하므로 다음 명령으로 시스템 시간과 시간대를 확인한다.
 
@@ -203,26 +264,29 @@ timedatectl
 
 | 파일 | 역할 |
 |---|---|
-| `gimbal_camera_capture/capture_node.py` | 토픽 구독, 병렬 RTSP 캡처, 결과 발행 |
+| `gimbal_camera_capture/capture_node.py` | 네 서비스, legacy 토픽, 병렬 RTSP 캡처 |
 | `gimbal_camera_capture/control_node.py` | Left/Right 제어 토픽, 자동 정지 watchdog |
 | `gimbal_camera_capture/siyi_protocol.py` | SIYI 프레임, CRC16, UDP 전송 구현 |
-| `gimbal_camera_capture/storage.py` | 날짜/방향 폴더와 중복 없는 파일명 할당 |
+| `gimbal_camera_capture/storage.py` | 날짜/run/카메라 폴더, 메타데이터와 파일명 관리 |
+| `../inspection_interfaces/msg`, `../inspection_interfaces/srv` | 양쪽이 공유하는 메시지와 네 서비스 타입 |
 | `launch/camera_capture.launch.py` | 캡처 노드 단독 launch |
 | `launch/gimbal_control.launch.py` | 제어 노드 단독 launch |
 | `test/test_storage.py` | 저장 경로와 중복 방지 로직 테스트 |
+| `test/test_service_contract.py` | start/capture/finish/abort 서비스 계약 테스트 |
 | `test/test_siyi_protocol.py` | 공식 패킷 CRC와 UDP 전송 테스트 |
+| `../inspection_interfaces/CAMERA_SERVICE_INTEGRATION.md` | drive_manager 호출 순서와 필드 계약 |
 | `README.md` | 현재 구성과 운용 문서 |
 
 ## 6. 빌드와 테스트
 
 현재 환경은 Ubuntu 24.04와 ROS 2 Jazzy를 사용한다. 주요 런타임 의존성은
-`rclpy`, `std_msgs`, `geometry_msgs`, `python3-opencv`, ROS 2 launch
-패키지다.
+`rclpy`, `std_msgs`, `geometry_msgs`, `inspection_interfaces`,
+`python3-opencv`, `python3-yaml`, ROS 2 launch 패키지다.
 
 ```bash
 cd ~/colcon_ws
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select gimbal_camera_capture --symlink-install
+colcon build --packages-up-to gimbal_camera_capture --symlink-install
 source install/setup.bash
 ```
 
@@ -237,7 +301,7 @@ colcon test-result \
 ```
 
 현재 저장 경로, SIYI 공식 패킷/CRC16, 로컬 UDP 전송과 코드 표준 검사를
-포함한 9개 테스트가 모두 통과했다. 실제 카메라 두 대에서도 같은 파일명의
+포함한 20개 테스트가 모두 통과했다. 실제 카메라 두 대에서도 같은 파일명의
 1280x720 JPEG 저장과 양쪽 UDP `37260` 펌웨어 응답을 확인했다.
 
 ## 7. 실행, 촬영 및 짐벌 제어
@@ -253,11 +317,26 @@ source install/setup.bash
 ros2 launch gimbal_camera_capture camera_capture.launch.py
 ```
 
+서비스와 타입 확인:
+
+```bash
+ros2 service list -t | grep -E 'capture_pair|capture_run'
+ros2 interface show inspection_interfaces/srv/CapturePair
+```
+
 다른 터미널에서 촬영 명령을 한 번 발행한다.
 
 ```bash
 source ~/colcon_ws/install/setup.bash
+
+# 주행 시작: 새 run_N 생성
+ros2 topic pub --once /camera/run/start std_msgs/msg/Empty '{}'
+
+# 주행 중 필요한 횟수만큼 촬영
 ros2 topic pub --once /camera/capture std_msgs/msg/Bool '{data: true}'
+
+# 마지막 capture/result 확인 후 주행 종료
+ros2 topic pub --once /camera/run/finish std_msgs/msg/Empty '{}'
 ```
 
 결과 토픽과 생성 파일 확인:
@@ -265,7 +344,8 @@ ros2 topic pub --once /camera/capture std_msgs/msg/Bool '{data: true}'
 ```bash
 source ~/colcon_ws/install/setup.bash
 ros2 topic echo /camera/capture/result
-find ~/capcture -maxdepth 3 -type f -name '*.jpg' | sort
+ros2 topic echo /camera/run/result
+find ~/capture -maxdepth 4 -type f | sort
 ```
 
 노드가 실행 중인지 확인:
@@ -365,13 +445,37 @@ ros2 topic echo /gimbal/control/result
 |---|---|---|
 | `trigger_topic` | `/camera/capture` | 촬영 명령 토픽 |
 | `result_topic` | `/camera/capture/result` | JSON 결과 토픽 |
-| `output_directory` | `~/capcture` | 사진 저장 최상위 경로 |
+| `run_start_topic` | `/camera/run/start` | 새 주행 시작 토픽 |
+| `run_finish_topic` | `/camera/run/finish` | 현재 주행 종료 토픽 |
+| `run_result_topic` | `/camera/run/result` | 주행 시작/종료 JSON 결과 토픽 |
+| `capture_run_start_service` | `/camera/capture_run/start` | mission run 시작 서비스 |
+| `capture_pair_service` | `/camera/capture_pair` | 동기 좌우 촬영 서비스 |
+| `capture_run_finish_service` | `/camera/capture_run/finish` | run 완료/READY 서비스 |
+| `capture_run_abort_service` | `/camera/capture_run/abort` | run 중단 서비스 |
+| `output_directory` | `~/capture` | 사진 저장 최상위 경로 |
 | `camera_1_url` | `rtsp://192.168.144.25:8554/main.264` | Left RTSP 주소 |
 | `camera_2_url` | `rtsp://192.168.144.26:8554/main.264` | Right RTSP 주소 |
 | `open_timeout_ms` | `5000` | 스트림 열기 제한 시간(ms) |
 | `read_timeout_ms` | `5000` | 프레임 읽기 제한 시간(ms) |
 | `frame_read_attempts` | `5` | 최신 프레임 확보를 위한 읽기 횟수 |
 | `jpeg_quality` | `95` | JPEG 품질(0~100) |
+
+drive_manager의 `capture_service_timeout_sec`는 정상 촬영 시간뿐 아니라 카메라
+장애 시 RTSP 제한 시간도 포함해야 한다. 현재 카메라 노드의 최악 지연은
+`open_timeout_ms + frame_read_attempts * read_timeout_ms`에 근접할 수 있으므로,
+현재 기본값의 이론상 상한은 약 30초다. 최초 연동 시 drive_manager timeout을
+35초 이상으로 두는 것이 안전하다. 5초 설정을 유지하려면 현장 측정으로 응답
+시간을 검증하고 `open_timeout_ms`와 `read_timeout_ms`를 함께 낮춰야 한다.
+
+촬영 실패를 metadata에 기록하되 주행은 계속하려면 `drive_manager`가 설치된
+컴퓨터에서 다음 정책을 사용한다. 이 로봇 워크스페이스에는 `drive_manager`가
+없으므로 해당 값은 카메라 서버가 아니라 drive_manager 설정에서 변경해야 한다.
+
+```yaml
+capture_failure_stops_mission: false
+capture_service_timeout_sec: 35.0
+capture_finish_wait_timeout_sec: 40.0
+```
 
 예를 들어 저장 경로와 토픽을 바꾸려면 다음과 같이 실행한다.
 
@@ -686,7 +790,7 @@ ros2 pkg prefix gimbal_camera_capture
 - `.25` 경로가 `eth0`, `.26` 경로가 `enx00e04c3628a8`로 나가는가
 - `CYCLONEDDS_URI`가 `/etc/cyclonedds.xml`을 가리키는가
 - Cyclone DDS 설정이 `wlan0`만 지정하는가
-- `~/capcture`에 충분한 디스크 공간이 있는가
+- `~/capture`에 충분한 디스크 공간이 있는가
 - 시스템 날짜, 시간과 `Asia/Seoul` 시간대가 올바른가
 - 필요한 독립 launch가 실행 중이고 캡처/제어 구독자가 보이는가
 - 처음 움직이기 전에 짐벌 주변에 충돌할 물체나 케이블이 없는가

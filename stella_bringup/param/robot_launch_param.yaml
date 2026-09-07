@@ -9,6 +9,11 @@ launch_hailo: false
 launch_linear_motor: true
 launch_battery: true
 
+# Start the dual SIYI capture service with robot bringup. The node opens RTSP
+# streams only while handling a capture request.
+launch_gimbal_camera_capture: true
+gimbal_camera_output_directory: ~/capture
+
 # Odometry sensor rates. The motor driver's paired encoder query saturates near
 # 31 Hz on this robot, so 30 Hz is the practical high-rate setting.
 encoder_poll_rate_hz: 30

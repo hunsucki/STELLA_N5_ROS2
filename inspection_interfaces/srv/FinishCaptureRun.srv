@@ -1,0 +1,9 @@
+string run_id
+string mission_id
+---
+bool success
+string message
+bool ready
+string run_id
+string directory
+string metadata_file

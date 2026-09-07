@@ -1,0 +1,9 @@
+string mission_id
+string map_id
+string map_frame
+string zone_revision
+inspection_interfaces/CaptureZone[] zones
+---
+bool success
+string message
+string run_id

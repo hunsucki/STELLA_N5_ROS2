@@ -43,6 +43,10 @@ def generate_launch_description():
     launch_hailo = param.get('launch_hailo', False)
     launch_linear_motor = param.get('launch_linear_motor', True)
     launch_battery = param.get('launch_battery', True)
+    launch_gimbal_camera_capture = param.get(
+        'launch_gimbal_camera_capture', True)
+    gimbal_camera_output_directory = str(
+        param.get('gimbal_camera_output_directory', '~/capture'))
     encoder_poll_rate_hz = int(param.get('encoder_poll_rate_hz', 30))
     imu_sync_period_ms = int(param.get('imu_sync_period_ms', 5))
     imu_publish_rate_hz = int(param.get('imu_publish_rate_hz', 100))
@@ -85,6 +89,12 @@ def generate_launch_description():
     battery_pkg_dir = LaunchConfiguration(
         'battery_pkg_dir',
         default=os.path.join(get_package_share_directory('battery'), 'launch'))
+
+    gimbal_camera_pkg_dir = LaunchConfiguration(
+        'gimbal_camera_pkg_dir',
+        default=os.path.join(
+            get_package_share_directory('gimbal_camera_capture'),
+            'launch'))
 
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
 
@@ -252,6 +262,17 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([battery_pkg_dir, '/battery.launch.py']),
             condition=IfCondition('true' if launch_battery else 'false')
+        ),
+
+        # Dual SIYI camera capture services for drive_manager
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                [gimbal_camera_pkg_dir, '/camera_capture.launch.py']),
+            launch_arguments={
+                'output_directory': gimbal_camera_output_directory,
+            }.items(),
+            condition=IfCondition(
+                'true' if launch_gimbal_camera_capture else 'false')
         ),
 
     ])

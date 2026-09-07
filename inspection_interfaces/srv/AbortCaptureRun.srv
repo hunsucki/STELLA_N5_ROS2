@@ -1,0 +1,7 @@
+string run_id
+string mission_id
+string reason
+---
+bool success
+string message
+string run_id

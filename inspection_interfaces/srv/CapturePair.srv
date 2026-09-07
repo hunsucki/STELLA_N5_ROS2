@@ -1,0 +1,17 @@
+string run_id
+string mission_id
+string request_id
+string zone_id
+builtin_interfaces/Time requested_at
+geometry_msgs/PoseWithCovarianceStamped robot_pose
+---
+bool success
+string message
+string run_id
+string request_id
+uint64 capture_id
+builtin_interfaces/Time captured_at
+string left_file
+string right_file
+string left_error
+string right_error

@@ -19,8 +19,36 @@ def generate_launch_description():
             default_value='/camera/capture/result',
         ),
         DeclareLaunchArgument(
+            'run_start_topic',
+            default_value='/camera/run/start',
+        ),
+        DeclareLaunchArgument(
+            'run_finish_topic',
+            default_value='/camera/run/finish',
+        ),
+        DeclareLaunchArgument(
+            'run_result_topic',
+            default_value='/camera/run/result',
+        ),
+        DeclareLaunchArgument(
+            'capture_run_start_service',
+            default_value='/camera/capture_run/start',
+        ),
+        DeclareLaunchArgument(
+            'capture_pair_service',
+            default_value='/camera/capture_pair',
+        ),
+        DeclareLaunchArgument(
+            'capture_run_finish_service',
+            default_value='/camera/capture_run/finish',
+        ),
+        DeclareLaunchArgument(
+            'capture_run_abort_service',
+            default_value='/camera/capture_run/abort',
+        ),
+        DeclareLaunchArgument(
             'output_directory',
-            default_value='~/capcture',
+            default_value='~/capture',
         ),
         DeclareLaunchArgument(
             'camera_1_url',
@@ -44,6 +72,21 @@ def generate_launch_description():
         parameters=[{
             'trigger_topic': LaunchConfiguration('trigger_topic'),
             'result_topic': LaunchConfiguration('result_topic'),
+            'run_start_topic': LaunchConfiguration('run_start_topic'),
+            'run_finish_topic': LaunchConfiguration('run_finish_topic'),
+            'run_result_topic': LaunchConfiguration('run_result_topic'),
+            'capture_run_start_service': LaunchConfiguration(
+                'capture_run_start_service'
+            ),
+            'capture_pair_service': LaunchConfiguration(
+                'capture_pair_service'
+            ),
+            'capture_run_finish_service': LaunchConfiguration(
+                'capture_run_finish_service'
+            ),
+            'capture_run_abort_service': LaunchConfiguration(
+                'capture_run_abort_service'
+            ),
             'output_directory': LaunchConfiguration('output_directory'),
             'camera_1_url': LaunchConfiguration('camera_1_url'),
             'camera_2_url': LaunchConfiguration('camera_2_url'),
