@@ -62,7 +62,77 @@ def generate_launch_description():
         DeclareLaunchArgument('read_timeout_ms', default_value='5000'),
         DeclareLaunchArgument('frame_read_attempts', default_value='5'),
         DeclareLaunchArgument('jpeg_quality', default_value='95'),
+        DeclareLaunchArgument('startup_initialize', default_value='true'),
+        DeclareLaunchArgument('startup_delay_sec', default_value='5.0'),
+        DeclareLaunchArgument(
+            'startup_center_settle_sec',
+            default_value='2.0',
+        ),
+        DeclareLaunchArgument(
+            'startup_ack_timeout_sec',
+            default_value='0.5',
+        ),
+        DeclareLaunchArgument(
+            'startup_command_retries',
+            default_value='4',
+        ),
+        DeclareLaunchArgument('left_initial_yaw_deg', default_value='-90.0'),
+        DeclareLaunchArgument(
+            'left_initial_pitch_deg',
+            default_value='20.0',
+            # .25, left카메라
+        ),
+        DeclareLaunchArgument('right_initial_yaw_deg', default_value='-90.0'),
+        DeclareLaunchArgument(
+            'right_initial_pitch_deg',
+            default_value='-20.0',
+        ),
     ]
+
+    gimbal_control_node = Node(
+        package='gimbal_camera_capture',
+        executable='control_node',
+        name='gimbal_control',
+        output='screen',
+        parameters=[{
+            'startup_initialize': ParameterValue(
+                LaunchConfiguration('startup_initialize'),
+                value_type=bool,
+            ),
+            'startup_delay_sec': ParameterValue(
+                LaunchConfiguration('startup_delay_sec'),
+                value_type=float,
+            ),
+            'startup_center_settle_sec': ParameterValue(
+                LaunchConfiguration('startup_center_settle_sec'),
+                value_type=float,
+            ),
+            'startup_ack_timeout_sec': ParameterValue(
+                LaunchConfiguration('startup_ack_timeout_sec'),
+                value_type=float,
+            ),
+            'startup_command_retries': ParameterValue(
+                LaunchConfiguration('startup_command_retries'),
+                value_type=int,
+            ),
+            'left_initial_yaw_deg': ParameterValue(
+                LaunchConfiguration('left_initial_yaw_deg'),
+                value_type=float,
+            ),
+            'left_initial_pitch_deg': ParameterValue(
+                LaunchConfiguration('left_initial_pitch_deg'),
+                value_type=float,
+            ),
+            'right_initial_yaw_deg': ParameterValue(
+                LaunchConfiguration('right_initial_yaw_deg'),
+                value_type=float,
+            ),
+            'right_initial_pitch_deg': ParameterValue(
+                LaunchConfiguration('right_initial_pitch_deg'),
+                value_type=float,
+            ),
+        }],
+    )
 
     camera_node = Node(
         package='gimbal_camera_capture',
@@ -109,4 +179,6 @@ def generate_launch_description():
         }],
     )
 
-    return LaunchDescription(arguments + [camera_node])
+    return LaunchDescription(
+        arguments + [gimbal_control_node, camera_node]
+    )

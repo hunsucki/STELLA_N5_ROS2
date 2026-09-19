@@ -14,7 +14,7 @@ def generate_launch_description():
         DeclareLaunchArgument('left_port', default_value='37260'),
         DeclareLaunchArgument(
             'left_bind_address',
-            default_value='192.168.144.10',
+            default_value='',
         ),
         DeclareLaunchArgument('left_yaw_direction', default_value='1'),
         DeclareLaunchArgument('left_pitch_direction', default_value='1'),
@@ -22,13 +22,37 @@ def generate_launch_description():
         DeclareLaunchArgument('right_port', default_value='37260'),
         DeclareLaunchArgument(
             'right_bind_address',
-            default_value='192.168.144.11',
+            default_value='',
         ),
         DeclareLaunchArgument('right_yaw_direction', default_value='1'),
         DeclareLaunchArgument('right_pitch_direction', default_value='1'),
         DeclareLaunchArgument('command_timeout_sec', default_value='0.5'),
         DeclareLaunchArgument('step_duration_sec', default_value='0.15'),
         DeclareLaunchArgument('step_speed', default_value='40'),
+        DeclareLaunchArgument('startup_initialize', default_value='true'),
+        DeclareLaunchArgument('startup_delay_sec', default_value='5.0'),
+        DeclareLaunchArgument(
+            'startup_center_settle_sec',
+            default_value='2.0',
+        ),
+        DeclareLaunchArgument(
+            'startup_ack_timeout_sec',
+            default_value='0.5',
+        ),
+        DeclareLaunchArgument(
+            'startup_command_retries',
+            default_value='4',
+        ),
+        DeclareLaunchArgument('left_initial_yaw_deg', default_value='-90.0'),
+        DeclareLaunchArgument(
+            'left_initial_pitch_deg',
+            default_value='20.0',
+        ),
+        DeclareLaunchArgument('right_initial_yaw_deg', default_value='-90.0'),
+        DeclareLaunchArgument(
+            'right_initial_pitch_deg',
+            default_value='-20.0',
+        ),
         DeclareLaunchArgument(
             'result_topic',
             default_value='/gimbal/control/result',
@@ -75,6 +99,42 @@ def generate_launch_description():
         'step_speed': ParameterValue(
             LaunchConfiguration('step_speed'),
             value_type=int,
+        ),
+        'startup_initialize': ParameterValue(
+            LaunchConfiguration('startup_initialize'),
+            value_type=bool,
+        ),
+        'startup_delay_sec': ParameterValue(
+            LaunchConfiguration('startup_delay_sec'),
+            value_type=float,
+        ),
+        'startup_center_settle_sec': ParameterValue(
+            LaunchConfiguration('startup_center_settle_sec'),
+            value_type=float,
+        ),
+        'startup_ack_timeout_sec': ParameterValue(
+            LaunchConfiguration('startup_ack_timeout_sec'),
+            value_type=float,
+        ),
+        'startup_command_retries': ParameterValue(
+            LaunchConfiguration('startup_command_retries'),
+            value_type=int,
+        ),
+        'left_initial_yaw_deg': ParameterValue(
+            LaunchConfiguration('left_initial_yaw_deg'),
+            value_type=float,
+        ),
+        'left_initial_pitch_deg': ParameterValue(
+            LaunchConfiguration('left_initial_pitch_deg'),
+            value_type=float,
+        ),
+        'right_initial_yaw_deg': ParameterValue(
+            LaunchConfiguration('right_initial_yaw_deg'),
+            value_type=float,
+        ),
+        'right_initial_pitch_deg': ParameterValue(
+            LaunchConfiguration('right_initial_pitch_deg'),
+            value_type=float,
         ),
         'result_topic': LaunchConfiguration('result_topic'),
     }

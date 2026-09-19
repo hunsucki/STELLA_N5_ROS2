@@ -1,7 +1,9 @@
 """ROS 2 topic control for two SIYI A8 mini gimbals."""
 
 from datetime import datetime
+import ipaddress
 import json
+import math
 import time
 from typing import Dict
 
@@ -41,17 +43,26 @@ class GimbalControlNode(Node):
 
         self.declare_parameter('left_ip', '192.168.144.25')
         self.declare_parameter('left_port', 37260)
-        self.declare_parameter('left_bind_address', '192.168.144.10')
+        self.declare_parameter('left_bind_address', '')
         self.declare_parameter('left_yaw_direction', 1)
         self.declare_parameter('left_pitch_direction', 1)
         self.declare_parameter('right_ip', '192.168.144.26')
         self.declare_parameter('right_port', 37260)
-        self.declare_parameter('right_bind_address', '192.168.144.11')
+        self.declare_parameter('right_bind_address', '')
         self.declare_parameter('right_yaw_direction', 1)
         self.declare_parameter('right_pitch_direction', 1)
         self.declare_parameter('command_timeout_sec', 0.5)
         self.declare_parameter('step_duration_sec', 0.15)
         self.declare_parameter('step_speed', 40)
+        self.declare_parameter('startup_initialize', True)
+        self.declare_parameter('startup_delay_sec', 5.0)
+        self.declare_parameter('startup_center_settle_sec', 2.0)
+        self.declare_parameter('startup_ack_timeout_sec', 0.5)
+        self.declare_parameter('startup_command_retries', 4)
+        self.declare_parameter('left_initial_yaw_deg', -90.0)
+        self.declare_parameter('left_initial_pitch_deg', 20.0)
+        self.declare_parameter('right_initial_yaw_deg', 90.0)
+        self.declare_parameter('right_initial_pitch_deg', -20.0)
         self.declare_parameter('result_topic', '/gimbal/control/result')
 
         self._timeout = max(
@@ -66,6 +77,50 @@ class GimbalControlNode(Node):
             1,
             min(100, int(self.get_parameter('step_speed').value)),
         )
+        self._startup_enabled = bool(
+            self.get_parameter('startup_initialize').value
+        )
+        self._startup_delay = max(
+            0.0,
+            float(self.get_parameter('startup_delay_sec').value),
+        )
+        self._startup_center_settle = max(
+            0.0,
+            float(
+                self.get_parameter('startup_center_settle_sec').value
+            ),
+        )
+        self._startup_ack_timeout = float(
+            self.get_parameter('startup_ack_timeout_sec').value
+        )
+        self._startup_command_retries = int(
+            self.get_parameter('startup_command_retries').value
+        )
+        if (
+            not math.isfinite(self._startup_ack_timeout)
+            or self._startup_ack_timeout <= 0.0
+        ):
+            raise ValueError(
+                'startup_ack_timeout_sec must be a positive finite value'
+            )
+        if self._startup_command_retries < 1:
+            raise ValueError('startup_command_retries must be at least 1')
+        self._initial_angles = {
+            name: (
+                float(
+                    self.get_parameter(
+                        f'{name}_initial_yaw_deg'
+                    ).value
+                ),
+                float(
+                    self.get_parameter(
+                        f'{name}_initial_pitch_deg'
+                    ).value
+                ),
+            )
+            for name in ('left', 'right')
+        }
+        self._validate_initial_angles()
         self._states: Dict[str, GimbalState] = {}
         try:
             for name in ('left', 'right'):
@@ -93,6 +148,7 @@ class GimbalControlNode(Node):
                     yaw_direction,
                     pitch_direction,
                 )
+                self._log_camera_route(name, client)
         except Exception:
             for state in self._states.values():
                 state.client.close()
@@ -146,10 +202,144 @@ class GimbalControlNode(Node):
             ])
 
         self._watchdog_timer = self.create_timer(0.05, self._watchdog)
+        self._startup_phase = 'waiting' if self._startup_enabled else 'done'
+        self._startup_deadline = time.monotonic() + self._startup_delay
+        self._startup_failures = 0
+        self._startup_timer = self.create_timer(
+            0.1,
+            self._initialize_gimbals,
+        )
+        if not self._startup_enabled:
+            self._startup_timer.cancel()
         self.get_logger().info(
             'Gimbal control ready: /gimbal/{left,right}/'
             'move, cmd_vel, zoom, center'
         )
+        if self._startup_enabled:
+            self.get_logger().info(
+                'Startup initialization scheduled: center, then absolute '
+                f'angles {self._initial_angles}'
+            )
+
+    def _log_camera_route(
+        self,
+        camera: str,
+        client: SiyiUdpClient,
+    ) -> None:
+        """Log the source IP Linux selected for one camera destination."""
+        try:
+            source = client.route_source_address()
+            source_address = ipaddress.ip_address(source)
+            remote_address = ipaddress.ip_address(client.remote[0])
+        except (OSError, ValueError) as error:
+            self.get_logger().warning(
+                f'Unable to inspect {camera} camera route: {error}'
+            )
+            return
+
+        route_message = (
+            f'{camera} camera route: {source} -> '
+            f'{client.remote[0]}:{client.remote[1]}'
+        )
+        if (
+            isinstance(source_address, ipaddress.IPv4Address)
+            and isinstance(remote_address, ipaddress.IPv4Address)
+            and source_address not in ipaddress.ip_network(
+                f'{remote_address}/24',
+                strict=False,
+            )
+        ):
+            self.get_logger().warning(
+                route_message
+                + '; source is outside the camera subnet. Check the '
+                'dedicated interface and /32 host route.'
+            )
+            return
+        self.get_logger().info(route_message)
+
+    def _validate_initial_angles(self) -> None:
+        for camera, (yaw, pitch) in self._initial_angles.items():
+            if not math.isfinite(yaw) or not math.isfinite(pitch):
+                raise ValueError(
+                    f'{camera} initial angles must be finite'
+                )
+            if not SiyiUdpClient.A8_MIN_YAW_DEG <= yaw <= (
+                SiyiUdpClient.A8_MAX_YAW_DEG
+            ):
+                raise ValueError(
+                    f'{camera}_initial_yaw_deg is outside A8 Mini limits'
+                )
+            if not SiyiUdpClient.A8_MIN_PITCH_DEG <= pitch <= (
+                SiyiUdpClient.A8_MAX_PITCH_DEG
+            ):
+                raise ValueError(
+                    f'{camera}_initial_pitch_deg is outside A8 Mini limits'
+                )
+
+    def _initialize_gimbals(self) -> None:
+        now = time.monotonic()
+        if self._startup_phase == 'waiting':
+            if now < self._startup_deadline:
+                return
+            for camera, state in self._states.items():
+                try:
+                    state.client.center_and_wait(
+                        self._startup_ack_timeout,
+                        self._startup_command_retries,
+                    )
+                    self._publish_result(camera, 'startup_center', True)
+                except (OSError, ValueError) as error:
+                    self._startup_failures += 1
+                    self._publish_result(
+                        camera,
+                        'startup_center',
+                        False,
+                        str(error),
+                    )
+            self._startup_phase = 'centering'
+            self._startup_deadline = now + self._startup_center_settle
+            return
+
+        if self._startup_phase != 'centering' or now < (
+            self._startup_deadline
+        ):
+            return
+
+        for camera, state in self._states.items():
+            yaw, pitch = self._initial_angles[camera]
+            try:
+                state.client.set_angles_and_wait(
+                    yaw,
+                    pitch,
+                    self._startup_ack_timeout,
+                    self._startup_command_retries,
+                )
+                self._publish_result(
+                    camera,
+                    'startup_set_angles',
+                    True,
+                    values={'yaw_deg': yaw, 'pitch_deg': pitch},
+                )
+            except (OSError, ValueError) as error:
+                self._startup_failures += 1
+                self._publish_result(
+                    camera,
+                    'startup_set_angles',
+                    False,
+                    str(error),
+                )
+        self._startup_phase = 'done'
+        self._startup_timer.cancel()
+        if self._startup_failures:
+            self.get_logger().error(
+                'Gimbal startup initialization finished with '
+                f'{self._startup_failures} failed command(s); inspect '
+                '/gimbal/control/result and camera routes'
+            )
+        else:
+            self.get_logger().info(
+                'Gimbal startup initialization acknowledged by all cameras'
+            )
 
     def _on_move(self, camera: str, message: String) -> None:
         commands = {
@@ -269,8 +459,11 @@ class GimbalControlNode(Node):
     def _on_center(self, camera: str, _message: Empty) -> None:
         self._stop_motion(camera)
         try:
-            self._states[camera].client.center()
-        except OSError as error:
+            self._states[camera].client.center_and_wait(
+                self._startup_ack_timeout,
+                self._startup_command_retries,
+            )
+        except (OSError, ValueError) as error:
             self._publish_result(camera, 'center', False, str(error))
             return
         self._publish_result(camera, 'center', True)

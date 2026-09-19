@@ -7,8 +7,10 @@ SIYI A8 mini 짐벌 카메라 두 대에서 ROS 2 토픽 명령을 받을 때마
 촬영 서비스 노드는 `stella_bringup/launch/robot.launch.py`에 등록되어 있다.
 `robot_launch_param.yaml`의 `launch_gimbal_camera_capture: true`가 기본값이므로
 로봇 bringup과 함께 시작해 촬영 요청을 기다린다. 대기 중에는 RTSP 스트림을
-열지 않으며 실제 촬영 요청을 처리할 때만 두 카메라에 접속한다. 수동 짐벌
-제어용 `control_node`는 별도로 실행한다.
+열지 않으며 실제 촬영 요청을 처리할 때만 두 카메라에 접속한다. 같은 launch가
+`control_node`도 시작하며, 카메라 부팅 대기 후 중앙 복귀와 설정된 절대각
+이동을 수행한다. bringup이 실행 중일 때 제어 launch를 다시 실행하면 같은
+제어 노드가 중복되므로 단독 시험에서만 별도로 실행한다.
 
 ## 1. 현재 구성 요약
 
@@ -365,6 +367,20 @@ source install/setup.bash
 ros2 launch gimbal_camera_capture gimbal_control.launch.py
 ```
 
+기본 시작 위치는 Left yaw `-90.0°`, pitch `20.0°`, Right yaw `-90.0°`,
+pitch `-20.0°`다. 노드는 5초 대기,
+중앙 복귀, 2초 안정화, 절대각 이동 순서로 실행한다. 중앙 복귀와 절대각 명령은
+SIYI ACK를 확인하며, 기본 0.5초 간격으로 최대 4회 시도한다. ACK가 없는
+카메라는 `/gimbal/control/result`에 `success: false`로 기록된다.
+
+시작 각도를 바꿔 단독 실행하는 예시는 다음과 같다.
+
+```bash
+ros2 launch gimbal_camera_capture gimbal_control.launch.py \
+  left_initial_yaw_deg:=-35.0 left_initial_pitch_deg:=-25.0 \
+  right_initial_yaw_deg:=-35.0 right_initial_pitch_deg:=-25.0
+```
+
 처음 시험할 때는 주변에 카메라가 부딪힐 물체가 없는지 확인한다. 다음 명령은
 각 카메라를 해당 방향으로 한 단계만 움직이고 자동 정지한다.
 
@@ -500,17 +516,26 @@ ros2 param get /gimbal_camera_capture camera_2_url
 |---|---|---|
 | `left_ip` | `192.168.144.25` | Left 제어 IP |
 | `left_port` | `37260` | Left 실제 SIYI UDP 포트 |
-| `left_bind_address` | `192.168.144.10` | Left 전용 로컬 출발지 IP |
+| `left_bind_address` | 빈 문자열 | 지정 시 Left UDP 소켓을 해당 로컬 IP에 고정 |
 | `left_yaw_direction` | `1` | Left yaw 방향 보정(`1`/`-1`) |
 | `left_pitch_direction` | `1` | Left pitch 방향 보정(`1`/`-1`) |
 | `right_ip` | `192.168.144.26` | Right 제어 IP |
 | `right_port` | `37260` | Right 실제 SIYI UDP 포트 |
-| `right_bind_address` | `192.168.144.11` | Right 전용 로컬 출발지 IP |
+| `right_bind_address` | 빈 문자열 | 지정 시 Right UDP 소켓을 해당 로컬 IP에 고정 |
 | `right_yaw_direction` | `1` | Right yaw 방향 보정(`1`/`-1`) |
 | `right_pitch_direction` | `1` | Right pitch 방향 보정(`1`/`-1`) |
 | `command_timeout_sec` | `0.5` | 명령 중단 후 자동 정지 시간 |
 | `step_duration_sec` | `0.15` | `move` 한 번의 이동 시간(초) |
 | `step_speed` | `40` | `move` 이동 속도(1~100) |
+| `startup_initialize` | `true` | 시작 시 중앙 복귀 후 절대각 설정 |
+| `startup_delay_sec` | `5.0` | 첫 초기화 명령 전 카메라 부팅 대기(초) |
+| `startup_center_settle_sec` | `2.0` | 중앙 복귀 후 절대각 명령까지 대기(초) |
+| `startup_ack_timeout_sec` | `0.5` | 초기화 명령 1회당 ACK 제한 시간(초) |
+| `startup_command_retries` | `4` | 초기화 명령 최대 전송 횟수 |
+| `left_initial_yaw_deg` | `-90.0` | Left 시작 yaw 절대각 |
+| `left_initial_pitch_deg` | `20.0` | Left 시작 pitch 절대각 |
+| `right_initial_yaw_deg` | `-90.0` | Right 시작 yaw 절대각 |
+| `right_initial_pitch_deg` | `-20.0` | Right 시작 pitch 절대각 |
 | `result_topic` | `/gimbal/control/result` | 제어 결과 JSON 토픽 |
 
 카메라 설치 방향 때문에 움직임이 반대라면 해당 축의 direction만 `-1`로
@@ -808,4 +833,6 @@ ros2 pkg prefix gimbal_camera_capture
 - [SIYI Gimbal Camera External SDK Protocol](https://siyi.biz/siyi_file/A8%20mini/SIYI_Gimbal_Camera_External_SDK_Protocol_Update_Log%20V0.1.1.pdf)
 
 현재 구현에서 사용하는 명령 ID는 회전 `0x07`, 중앙 복귀 `0x08`, 수동 줌
-`0x05`이며, CRC는 초기값 0의 CRC16-XMODEM 다.
+`0x05`, 절대각 설정 `0x0E`이며, CRC는 초기값 0의 CRC16-XMODEM 다. 시작 시
+중앙 복귀와 절대각 설정은 `need_ack` 플래그를 사용하고 응답 프레임의 헤더,
+길이, CRC, ACK 플래그와 명령 ID를 모두 검증한다.
