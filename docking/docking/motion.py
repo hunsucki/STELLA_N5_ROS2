@@ -1,4 +1,6 @@
 import math
+
+from docking.control import spin_for
 import time
 from typing import Any, Callable
 
@@ -6,6 +8,7 @@ from docking.docking_lidar import DockingLidar, ScanSnapshot
 from docking.lidar_geometry import (
     effective_range_limits,
     GuideCenterEstimate,
+    header_stamp_is_acceptable,
     has_consecutive_clearance_cluster,
     normalize_angle,
     rear_clearances,
@@ -16,7 +19,9 @@ from geometry_msgs.msg import Twist, Vector3Stamped
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import Imu
+from tf2_ros import TransformException
 
 
 class MotionController:
@@ -56,8 +61,11 @@ class MotionController:
             'backup_lidar_safety_sector_width', math.radians(60.0))
         node.declare_parameter('backup_rear_half_width', 0.22)
         node.declare_parameter('backup_rear_safety_margin', 0.02)
-        node.declare_parameter('backup_target_rear_clearance', 0.01)
-        node.declare_parameter('backup_clearance_tolerance', 0.005)
+        # base_scan2 is 0.0635 m ahead of the body rear reference.  These
+        # defaults therefore represent a measured LiDAR-to-wall target of
+        # 0.078 +/- 0.010 m at the successful fully inserted dock position.
+        node.declare_parameter('backup_target_rear_clearance', 0.0145)
+        node.declare_parameter('backup_clearance_tolerance', 0.010)
         node.declare_parameter('backup_rear_reference_x', -0.2295)
         node.declare_parameter('backup_lidar_min_range', 0.05)
         node.declare_parameter('backup_lidar_max_range', 2.0)
@@ -66,25 +74,33 @@ class MotionController:
             'backup_lidar_success_min_angle_span', math.radians(3.0))
         node.declare_parameter('backup_lidar_stable_cycles', 3)
         node.declare_parameter('backup_max_travel', 0.60)
-        node.declare_parameter('backup_max_yaw_drift', math.radians(5.0))
-        # The stationary LiDAR step establishes dock heading. During reverse,
-        # apply only a very weak, filtered rear-plane correction.
-        node.declare_parameter('backup_heading_kp', 0.20)
+        node.declare_parameter('backup_max_yaw_drift', math.radians(8.0))
+        # The stationary LiDAR step establishes dock heading.  The reverse
+        # controller must still be strong enough to cancel drivetrain skew.
+        node.declare_parameter('backup_heading_kp', 0.35)
         node.declare_parameter('backup_heading_kd', 0.0)
         # ROS angular.z keeps the same sign while reversing.  The measured
         # response from the failed run also followed the commanded sign.
         node.declare_parameter('backup_reverse_angular_command_sign', 1.0)
         node.declare_parameter(
             'backup_heading_tolerance', math.radians(1.0))
-        node.declare_parameter('backup_heading_max_angular_speed', 0.004)
-        node.declare_parameter('backup_heading_max_angular_accel', 0.010)
+        node.declare_parameter('backup_heading_max_angular_speed', 0.015)
+        node.declare_parameter('backup_heading_max_angular_accel', 0.030)
         node.declare_parameter(
             'backup_heading_pause_error', math.radians(3.0))
         node.declare_parameter('backup_heading_resume_stable_cycles', 3)
         node.declare_parameter('use_lidar_heading_during_backup', True)
         node.declare_parameter('backup_lidar_heading_filter_coef', 0.15)
         node.declare_parameter(
-            'backup_lidar_heading_max_error', math.radians(5.0))
+            'backup_lidar_heading_max_error', math.radians(8.0))
+        node.declare_parameter(
+            'backup_lidar_motion_residual', math.radians(2.0))
+        # A small translation-dependent RANSAC bias may disagree with both
+        # yaw groups even while encoder-only yaw confirms a straight chassis.
+        # After stable scans, hold wheel heading instead of steering from that
+        # suspect plane. Larger disagreement remains fail-closed.
+        node.declare_parameter(
+            'backup_lidar_wheel_guard_residual', math.radians(4.0))
         node.declare_parameter('backup_lidar_heading_min_inlier_ratio', 0.70)
         node.declare_parameter('backup_lidar_heading_min_line_length', 0.15)
         node.declare_parameter(
@@ -107,10 +123,12 @@ class MotionController:
         node.declare_parameter('backup_slowdown_clearance', 0.15)
         node.declare_parameter('backup_min_speed', 0.015)
         node.declare_parameter('backup_blocked_timeout_sec', 1.0)
+        node.declare_parameter('backup_plane_reacquire_timeout_sec', 2.0)
         node.declare_parameter('control_rate_hz', 20.0)
         node.declare_parameter('motion_timeout_sec', 45.0)
         node.declare_parameter('server_wait_timeout_sec', 10.0)
         node.declare_parameter('odom_max_age_sec', 0.50)
+        node.declare_parameter('motion_sensor_future_tolerance_sec', 0.05)
 
     def __init__(
             self, node: Node, lidar: DockingLidar,
@@ -138,12 +156,16 @@ class MotionController:
         )
         self.last_odom: Odometry | None = None
         self.last_odom_received_at = 0.0
+        self.last_odom_stamp_nanoseconds = 0
+        self.odom_sequence = 0
+        self.last_odom_error = 'no odometry received'
         self.last_imu_yaw_rate: float | None = None
         self.last_imu_received_at = 0.0
         self.last_imu_stamp_nanoseconds = 0
         self.integrated_imu_yaw = 0.0
         self.last_wheel_yaw: float | None = None
         self.last_wheel_yaw_received_at = 0.0
+        self.last_wheel_yaw_stamp_nanoseconds = 0
         self.backup_lidar_heading_estimator: (
             Callable[[ScanSnapshot], tuple[float, float, int, int, float] | None]
             | None
@@ -163,7 +185,8 @@ class MotionController:
                 and not self.odom_is_fresh()):
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if (self.node.get_clock().now() - start).nanoseconds / 1e9 > timeout:
-                self.node.get_logger().error('odom is not available')
+                self.node.get_logger().error(
+                    f'odom is not available: {self.last_odom_error}')
                 return False
 
         return self.odom_is_fresh()
@@ -377,6 +400,11 @@ class MotionController:
             'backup_lidar_heading_filter_coef').value)
         lidar_heading_max_error = abs(float(self.node.get_parameter(
             'backup_lidar_heading_max_error').value))
+        lidar_motion_residual_limit = abs(float(self.node.get_parameter(
+            'backup_lidar_motion_residual').value))
+        lidar_wheel_guard_residual_limit = abs(float(
+            self.node.get_parameter(
+                'backup_lidar_wheel_guard_residual').value))
         lidar_heading_min_inlier_ratio = float(self.node.get_parameter(
             'backup_lidar_heading_min_inlier_ratio').value)
         lidar_heading_min_line_length = abs(float(self.node.get_parameter(
@@ -387,8 +415,6 @@ class MotionController:
             'backup_lidar_heading_stable_cycles').value), 1)
         lidar_heading_disable_clearance = abs(float(self.node.get_parameter(
             'backup_lidar_heading_disable_clearance').value))
-        lidar_heading_rebase_error = abs(float(self.node.get_parameter(
-            'backup_lidar_heading_rebase_error').value))
         use_guide_centering = bool(self.node.get_parameter(
             'use_lidar_guide_centering').value)
         guide_center_kp = abs(float(self.node.get_parameter(
@@ -434,7 +460,13 @@ class MotionController:
         current_command = Twist()
         filtered_lidar_heading_error: float | None = None
         lidar_heading_error: float | None = None
+        lidar_heading_anchor_error: float | None = None
+        lidar_heading_anchor_imu = start_integrated_imu_yaw
+        lidar_heading_anchor_odom = start_odom_yaw
+        lidar_heading_anchor_wheel = start_wheel_yaw
         lidar_heading_stable_count = 0
+        wheel_guard_filtered_error: float | None = None
+        wheel_guard_stable_count = 0
         lidar_heading_status = 'not_evaluated'
         lidar_heading_control_available = False
         guide_center_offset: float | None = None
@@ -447,11 +479,33 @@ class MotionController:
         heading_settled_count = 0
         last_heading_command_at = time.monotonic()
         blocked_since: float | None = None
+        plane_missing_since: float | None = None
+        stationary_recovery_errors: list[float] = []
+        stationary_recovery_wheel: float | None = None
+        stationary_recovery_used = False
+        reacquire_timeout = float(self.node.get_parameter(
+            'backup_plane_reacquire_timeout_sec').value)
+        if not math.isfinite(reacquire_timeout) or reacquire_timeout <= 0.0:
+            self.stop_robot()
+            self.node.get_logger().error('Invalid backup plane reacquisition timeout')
+            return False
         last_log_time = 0.0
 
+        transform = getattr(self.lidar, 'transform', None)
+        lidar_target_log = ''
+        if transform is not None:
+            rear_reference_x = float(
+                self.node.get_parameter('backup_rear_reference_x').value)
+            lidar_target_range = (
+                transform.x - rear_reference_x + target_clearance)
+            lidar_target_log = (
+                f'lidar_target={lidar_target_range:.4f}'
+                f'+/-{tolerance:.4f}m, ')
         self.node.get_logger().info(
             'Backing up using LiDAR rear clearance: '
-            f'target={target_clearance:.3f}m, speed={speed:.3f}m/s, '
+            f'body_target={target_clearance:.4f}+/-{tolerance:.4f}m, '
+            f'{lidar_target_log}'
+            f'speed={speed:.3f}m/s, '
             f'completion_sector=rear+/-{completion_half_angle:.1f}deg, '
             f'safety_sector=rear+/-{safety_half_angle:.1f}deg')
 
@@ -497,6 +551,8 @@ class MotionController:
                 self.current_wheel_yaw() - wheel_heading_reference)
             snapshot = self.lidar.snapshot()
             if snapshot is None:
+                stationary_recovery_errors = []
+                stationary_recovery_wheel = None
                 stability.reset()
                 current_command = Twist()
                 self.cmd_vel_pub.publish(current_command)
@@ -513,20 +569,22 @@ class MotionController:
                         'Waiting for a fresh docking LiDAR scan: '
                         f'{self.lidar.last_error}')
                     last_log_time = now
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.should_stop)
                 continue
 
             if snapshot.sequence == stability.last_sequence:
                 self.cmd_vel_pub.publish(current_command)
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.should_stop)
                 continue
 
             indexed_clearances = self._rear_clearances(snapshot)
             if not indexed_clearances:
+                stationary_recovery_errors = []
+                stationary_recovery_wheel = None
                 stability.observe(snapshot.sequence, False)
                 current_command = Twist()
                 self.cmd_vel_pub.publish(current_command)
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.should_stop)
                 continue
 
             clearance = min(value for _, value in indexed_clearances)
@@ -567,6 +625,10 @@ class MotionController:
 
             lidar_heading_error = None
             lidar_heading_control_available = False
+            imu_motion_residual: float | None = None
+            odom_motion_residual: float | None = None
+            wheel_motion_residual: float | None = None
+            wheel_guard_active = False
             heading_source = (
                 'imu_gyro' if self.imu_is_fresh() else 'wheel_odom')
             if (
@@ -579,10 +641,93 @@ class MotionController:
                     (candidate_error, _, inliers, total_points,
                      line_length) = estimate
                     inlier_ratio = inliers / max(total_points, 1)
-                    if (
+                    quality_valid = (
                             abs(candidate_error) <= lidar_heading_max_error
                             and inlier_ratio >= lidar_heading_min_inlier_ratio
-                            and line_length >= lidar_heading_min_line_length):
+                            and line_length >= lidar_heading_min_line_length)
+                    motion_consistent = True
+                    if quality_valid and lidar_heading_anchor_error is not None:
+                        imu_motion_residual = self._lidar_heading_motion_residual(
+                            candidate_error,
+                            lidar_heading_anchor_error,
+                            self.current_integrated_imu_yaw(),
+                            lidar_heading_anchor_imu,
+                        )
+                        odom_motion_residual = self._lidar_heading_motion_residual(
+                            candidate_error,
+                            lidar_heading_anchor_error,
+                            self.current_yaw(),
+                            lidar_heading_anchor_odom,
+                        )
+                        wheel_motion_residual = (
+                            self._lidar_heading_motion_residual(
+                                candidate_error,
+                                lidar_heading_anchor_error,
+                                self.current_wheel_yaw(),
+                                lidar_heading_anchor_wheel,
+                            ))
+                        motion_consistent = (
+                            self._lidar_heading_motion_is_consistent(
+                                imu_motion_residual,
+                                odom_motion_residual,
+                                wheel_motion_residual,
+                                lidar_motion_residual_limit,
+                            )
+                        )
+                    # A fixed start anchor cannot recover from a changed
+                    # visible panel after translation. Permit ONE new anchor
+                    # only after stopping and observing five high-support,
+                    # tightly agreeing scans. Never rebase while driving.
+                    recovery_candidate = (
+                        quality_valid and not motion_consistent
+                        and not stationary_recovery_used
+                        and plane_missing_since is not None
+                        and current_command.linear.x == 0.0
+                        and current_command.angular.z == 0.0
+                        and inlier_ratio >= max(.75, lidar_heading_min_inlier_ratio)
+                        and line_length >= max(.30, lidar_heading_min_line_length)
+                        and abs(self.current_stationary_yaw_rate()[0])
+                        <= stationary_yaw_rate
+                        and abs(self.current_odom_yaw_rate()) <= stationary_yaw_rate
+                        and abs(wheel_heading_drift) < max_yaw_drift)
+                    if recovery_candidate:
+                        if (stationary_recovery_wheel is None
+                                or abs(self.normalize_angle(
+                                    self.current_wheel_yaw()
+                                    - stationary_recovery_wheel)) > math.radians(.5)
+                                or (stationary_recovery_errors and (
+                                    max(stationary_recovery_errors + [candidate_error])
+                                    - min(stationary_recovery_errors + [candidate_error]))
+                                    > math.radians(1.0))):
+                            stationary_recovery_errors = []
+                            stationary_recovery_wheel = self.current_wheel_yaw()
+                        stationary_recovery_errors.append(candidate_error)
+                        if (len(stationary_recovery_errors) >= 5
+                                and time.monotonic() - plane_missing_since >= .4):
+                            stationary_recovery_used = True
+                            lidar_heading_anchor_error = candidate_error
+                            lidar_heading_anchor_imu = self.current_integrated_imu_yaw()
+                            lidar_heading_anchor_odom = self.current_yaw()
+                            lidar_heading_anchor_wheel = self.current_wheel_yaw()
+                            imu_heading_reference = self.current_integrated_imu_yaw()
+                            filtered_lidar_heading_error = candidate_error
+                            lidar_heading_stable_count = 0
+                            heading_correction_active = True
+                            heading_settled_count = 0
+                            motion_consistent = True
+                            self.node.get_logger().warning(
+                                'Stationary rear plane recovered; aligning in place '
+                                'before resuming backup: '
+                                f'error={math.degrees(candidate_error):+.2f}deg, '
+                                f'inliers={inliers}/{total_points}, '
+                                f'length={line_length:.2f}m, scans='
+                                f'{len(stationary_recovery_errors)}')
+                    else:
+                        stationary_recovery_errors = []
+                        stationary_recovery_wheel = None
+                    if quality_valid and motion_consistent:
+                        wheel_guard_filtered_error = None
+                        wheel_guard_stable_count = 0
                         lidar_heading_error = candidate_error
                         (
                             next_filtered_error,
@@ -607,28 +752,110 @@ class MotionController:
                             heading_source = 'lidar'
                             lidar_heading_control_available = True
                             lidar_heading_status = 'tracking'
-                        if (
-                                sample_accepted
-                                and abs(candidate_error)
-                                <= lidar_heading_rebase_error):
-                            # A trustworthy near-parallel plane establishes a
-                            # new gyro reference. Intentional LiDAR corrections
-                            # must not accumulate as a safety-limit violation.
-                            imu_heading_reference = (
-                                self.current_integrated_imu_yaw())
-                            wheel_heading_reference = self.current_wheel_yaw()
-                            imu_heading_drift = 0.0
-                            wheel_heading_drift = 0.0
+                            if lidar_heading_anchor_error is None:
+                                # Freeze one stationary wall observation.  A
+                                # wall fixed in the world obeys
+                                # wall_error + robot_yaw = constant.  Keeping
+                                # this anchor exposes a wrong RANSAC surface;
+                                # rebasing it every scan hid 5.25 degrees of
+                                # inertial/plane disagreement in the September
+                                # 15 run.
+                                lidar_heading_anchor_error = (
+                                    filtered_lidar_heading_error)
+                                lidar_heading_anchor_imu = (
+                                    self.current_integrated_imu_yaw())
+                                lidar_heading_anchor_odom = self.current_yaw()
+                                lidar_heading_anchor_wheel = (
+                                    self.current_wheel_yaw())
+                    elif quality_valid:
+                        filtered_lidar_heading_error = None
+                        lidar_heading_stable_count = 0
+                        wheel_guard_eligible = (
+                            self.wheel_yaw_is_fresh()
+                            and not heading_correction_active
+                            and abs(candidate_error) < heading_pause_error
+                            and wheel_motion_residual is not None
+                            and self._backup_wheel_guard_is_allowed(
+                                wheel_motion_residual,
+                                wheel_heading_drift,
+                                lidar_wheel_guard_residual_limit,
+                                max_yaw_drift,
+                            ))
+                        if wheel_guard_eligible:
+                            (
+                                next_wheel_guard_error,
+                                wheel_guard_sample_accepted,
+                            ) = self._filter_lidar_heading_sample(
+                                wheel_guard_filtered_error,
+                                candidate_error,
+                                lidar_heading_filter_coef,
+                                lidar_heading_max_jump,
+                            )
+                            if wheel_guard_sample_accepted:
+                                wheel_guard_filtered_error = (
+                                    next_wheel_guard_error)
+                                wheel_guard_stable_count += 1
+                            else:
+                                wheel_guard_filtered_error = candidate_error
+                                wheel_guard_stable_count = 1
+                            wheel_guard_active = (
+                                wheel_guard_stable_count
+                                >= lidar_heading_stable_cycles)
+                            lidar_heading_error = candidate_error
+                            lidar_heading_status = (
+                                'wheel_guard'
+                                if wheel_guard_active
+                                else 'wheel_guard_warming_up')
+                            if wheel_guard_active:
+                                self.node.get_logger().warning(
+                                    'LiDAR plane has a bounded motion residual; '
+                                    'continuing with encoder-only heading guard: '
+                                    f'candidate={math.degrees(candidate_error):+.2f}deg, '
+                                    f'wheel_residual='
+                                    f'{math.degrees(wheel_motion_residual):+.2f}deg, '
+                                    f'wheel_drift='
+                                    f'{math.degrees(wheel_heading_drift):+.2f}deg, '
+                                    f'stable={wheel_guard_stable_count}/'
+                                    f'{lidar_heading_stable_cycles}',
+                                    throttle_duration_sec=1.0)
+                        else:
+                            wheel_guard_filtered_error = None
+                            wheel_guard_stable_count = 0
+                            lidar_heading_status = 'motion_inconsistent'
+                            self.node.get_logger().warning(
+                                'Rejected backup plane inconsistent with robot motion: '
+                                f'candidate={math.degrees(candidate_error):+.2f}deg, '
+                                f'imu_residual='
+                                f'{math.degrees(imu_motion_residual):+.2f}deg, '
+                                f'odom_residual='
+                                f'{math.degrees(odom_motion_residual):+.2f}deg, '
+                                f'wheel_residual='
+                                f'{math.degrees(wheel_motion_residual):+.2f}deg',
+                                throttle_duration_sec=1.0)
                     else:
                         filtered_lidar_heading_error = None
                         lidar_heading_stable_count = 0
+                        wheel_guard_filtered_error = None
+                        wheel_guard_stable_count = 0
                         lidar_heading_status = 'quality_rejected'
+                        self.node.get_logger().warning(
+                            'Rejected backup plane: '
+                            f'error={math.degrees(candidate_error):+.2f}deg, '
+                            f'inliers={inliers}/{total_points}, length={line_length:.3f}m',
+                            throttle_duration_sec=1.0)
                 else:
                     filtered_lidar_heading_error = None
                     lidar_heading_stable_count = 0
+                    wheel_guard_filtered_error = None
+                    wheel_guard_stable_count = 0
                     lidar_heading_status = 'ransac_unavailable'
+                    stationary_recovery_errors = []
+                    stationary_recovery_wheel = None
                 if not lidar_heading_control_available:
-                    heading_source = 'lidar_unavailable'
+                    heading_source = (
+                        'wheel_guard'
+                        if wheel_guard_active
+                        else 'lidar_unavailable')
             elif use_lidar_heading:
                 filtered_lidar_heading_error = None
                 lidar_heading_stable_count = 0
@@ -679,12 +906,61 @@ class MotionController:
             else:
                 guide_stable_count = 0
 
+            stationary_yaw_rate_value, stationary_source = (
+                self.current_stationary_yaw_rate())
+            if heading_source == 'lidar_unavailable':
+                # The old loop kept reversing with zero steering while the
+                # plane was rejected. Stop before drifting out of the guide.
+                current_command = Twist()
+                self.cmd_vel_pub.publish(current_command)
+                last_heading_command_at = time.monotonic()
+                # Reacquisition is stationary, not dead reckoning. A biased
+                # accumulated gyro must not bypass this bounded stop window.
+                # Independent wheel rotation still enforces the safety limit.
+                if abs(wheel_heading_drift) >= max_yaw_drift:
+                    self.stop_robot()
+                    self.node.get_logger().error(
+                        'Wheel yaw drift exceeded the safety limit while '
+                        'reacquiring the dock plane: '
+                        f'{math.degrees(abs(wheel_heading_drift)):.2f}deg >= '
+                        f'{math.degrees(max_yaw_drift):.2f}deg')
+                    return False
+                if plane_missing_since is None:
+                    plane_missing_since = time.monotonic()
+                    self.node.get_logger().warning(
+                        'Backup paused to reacquire the dock plane: '
+                        f'{lidar_heading_status}; '
+                        f'gyro_drift={math.degrees(imu_heading_drift):+.2f}deg, '
+                        f'wheel_drift={math.degrees(wheel_heading_drift):+.2f}deg')
+                # A rejected jump must be allowed to establish a new filtered
+                # value after the robot has stopped.  The fixed motion anchor
+                # still prevents an unrelated surface from being accepted.
+                if lidar_heading_status == 'jump_rejected':
+                    filtered_lidar_heading_error = None
+                    lidar_heading_stable_count = 0
+                if time.monotonic() - plane_missing_since >= reacquire_timeout:
+                    self.stop_robot()
+                    self.node.get_logger().error(
+                        'Dock plane did not recover while stopped; '
+                        f'status={lidar_heading_status}, '
+                        f'gyro_drift={math.degrees(imu_heading_drift):+.2f}deg, '
+                        f'wheel_drift={math.degrees(wheel_heading_drift):+.2f}deg, '
+                        'imu/odom/wheel_residual='
+                        f'{self._format_optional_degrees(imu_motion_residual)}/'
+                        f'{self._format_optional_degrees(odom_motion_residual)}/'
+                        f'{self._format_optional_degrees(wheel_motion_residual)}')
+                    return False
+                spin_for(self.node, sleep_time, self.should_stop)
+                continue
             # A validated dock plane is the physical heading authority and may
             # legitimately request several degrees of correction. Apply the
             # dead-reckoning drift limit only when that plane is unavailable.
             fallback_heading_drift = (
-                imu_heading_drift if self.imu_is_fresh()
-                else wheel_heading_drift)
+                wheel_heading_drift
+                if heading_source == 'wheel_guard'
+                else (
+                    imu_heading_drift if self.imu_is_fresh()
+                    else wheel_heading_drift))
             if self._backup_dead_reckoning_drift_exceeded(
                     heading_source, fallback_heading_drift, max_yaw_drift):
                 self.stop_robot()
@@ -697,8 +973,7 @@ class MotionController:
                     f'{self._format_optional_degrees(lidar_heading_error)}')
                 return False
 
-            stationary_yaw_rate_value, stationary_source = (
-                self.current_stationary_yaw_rate())
+            plane_missing_since = None
             if protective_clearance <= completion_threshold:
                 current_command = Twist()
                 if blocked_since is None:
@@ -712,9 +987,15 @@ class MotionController:
                     min_speed,
                     speed,
                 )
+                wall_heading_error = 0.0
                 if lidar_heading_control_available:
                     wall_heading_error = filtered_lidar_heading_error or 0.0
                     heading_error = wall_heading_error
+                elif heading_source == 'wheel_guard':
+                    # The RANSAC plane is stable but its translation-dependent
+                    # bias conflicts with both yaw groups. Do not steer from
+                    # it; preserve the encoder-confirmed straight heading.
+                    heading_error = -wheel_heading_drift
                 elif use_lidar_heading:
                     # Fail open-loop straight: never preserve a stale angular
                     # command when RANSAC is missing, rejected, or too close.
@@ -727,9 +1008,50 @@ class MotionController:
                 heading_error = normalize_angle(
                     heading_error + guide_center_heading)
 
-                # Never stop translation to rotate inside the station.
-                heading_correction_active = False
-                heading_settled_count = 0
+                # A large wall error produces a curved path if corrected while
+                # reversing.  Stop first, realign in place, then require stable
+                # stationary scans before translation resumes.
+                if heading_source == 'wheel_guard':
+                    heading_correction_active = False
+                    heading_settled_count = 0
+                was_heading_correction_active = heading_correction_active
+                heading_correction_active, heading_settled_count = (
+                    self._update_backup_heading_correction(
+                        heading_correction_active,
+                        heading_settled_count,
+                        lidar_heading_control_available,
+                        wall_heading_error if lidar_heading_control_available else 0.0,
+                        max(abs(stationary_yaw_rate_value),
+                            abs(self.current_odom_yaw_rate())),
+                        heading_tolerance,
+                        heading_pause_error,
+                        stationary_yaw_rate,
+                        heading_resume_stable_cycles,
+                    ))
+                if (
+                        heading_correction_active
+                        and not was_heading_correction_active):
+                    self.node.get_logger().warning(
+                        'Backup translation paused for heading correction: '
+                        f'wall_error={math.degrees(wall_heading_error):+.2f}deg')
+                elif (
+                        was_heading_correction_active
+                        and not heading_correction_active):
+                    # Confirmed physical alignment defines a new straight
+                    # heading. Intentional correction is not subsequent drift.
+                    imu_heading_reference = self.current_integrated_imu_yaw()
+                    wheel_heading_reference = self.current_wheel_yaw()
+                    lidar_heading_anchor_error = filtered_lidar_heading_error
+                    lidar_heading_anchor_imu = self.current_integrated_imu_yaw()
+                    lidar_heading_anchor_odom = self.current_yaw()
+                    lidar_heading_anchor_wheel = self.current_wheel_yaw()
+                    self.node.get_logger().info(
+                        'Backup heading correction settled; resuming translation '
+                        'with the verified heading as the new drift reference')
+                if heading_correction_active:
+                    # Rail centering is a path command.  Do not add it while
+                    # rotating in place to restore wall parallelism.
+                    heading_error = wall_heading_error
 
                 requested_heading_command = (
                     self._backup_heading_angular_velocity(
@@ -742,7 +1064,10 @@ class MotionController:
                         reverse_angular_command_sign,
                     ))
                 command_time = time.monotonic()
-                if use_lidar_heading and not lidar_heading_control_available:
+                if (
+                        use_lidar_heading
+                        and not lidar_heading_control_available
+                        and heading_source != 'wheel_guard'):
                     heading_command = 0.0
                 else:
                     heading_command = self._limit_command_rate(
@@ -804,6 +1129,12 @@ class MotionController:
                     f'filtered_heading_error='
                     f'{self._format_optional_degrees(
                         filtered_lidar_heading_error)}, '
+                    f'imu_plane_residual='
+                    f'{self._format_optional_degrees(imu_motion_residual)}, '
+                    f'odom_plane_residual='
+                    f'{self._format_optional_degrees(odom_motion_residual)}, '
+                    f'wheel_plane_residual='
+                    f'{self._format_optional_degrees(wheel_motion_residual)}, '
                     f'lidar_heading_status={lidar_heading_status}, '
                     f'lidar_heading_stable={lidar_heading_stable_count}/'
                     f'{lidar_heading_stable_cycles}, '
@@ -823,10 +1154,11 @@ class MotionController:
                     f'stationary_rate='
                     f'{math.degrees(stationary_yaw_rate_value):.2f}deg/s, '
                     f'stationary_source={stationary_source}, '
+                    f'linear_cmd={current_command.linear.x:.3f}m/s, '
                     f'heading_cmd={current_command.angular.z:.3f}rad/s')
                 last_log_time = now
 
-            rclpy.spin_once(self.node, timeout_sec=sleep_time)
+            spin_for(self.node, sleep_time, self.should_stop)
 
         self.stop_robot()
         return False
@@ -837,7 +1169,7 @@ class MotionController:
         stop = Twist()
         for _ in range(5):
             self.cmd_vel_pub.publish(stop)
-            rclpy.spin_once(self.node, timeout_sec=0.02)
+            spin_for(self.node, 0.02)
 
     def _run_until(
             self, done_cb: Any, cmd_cb: Any, timeout_sec: float,
@@ -863,7 +1195,7 @@ class MotionController:
                 return False
 
             self.cmd_vel_pub.publish(cmd_cb())
-            rclpy.spin_once(self.node, timeout_sec=sleep_time)
+            spin_for(self.node, sleep_time, self.should_stop)
 
         return False
 
@@ -872,9 +1204,10 @@ class MotionController:
             stable_cycles: int, direction: float,
             stationary_yaw_rate: float) -> Any:
         stable_count = 0
+        last_sequence = self.odom_sequence
 
         def done() -> bool:
-            nonlocal stable_count
+            nonlocal stable_count, last_sequence
             error = self._absolute_yaw_error(
                 target_yaw, self.current_yaw(), direction)
             stationary_yaw_rate_value, _ = (
@@ -883,9 +1216,11 @@ class MotionController:
                     abs(error) <= tolerance
                     and abs(stationary_yaw_rate_value)
                     <= stationary_yaw_rate):
-                stable_count += 1
+                if self.odom_sequence != last_sequence:
+                    stable_count += 1
             else:
                 stable_count = 0
+            last_sequence = self.odom_sequence
             return stable_count >= max(stable_cycles, 1)
 
         return done
@@ -929,8 +1264,61 @@ class MotionController:
         return done
 
     def _odom_callback(self, msg: Odometry) -> None:
+        stamp = Time.from_msg(msg.header.stamp).nanoseconds
+        if not self._sensor_stamp_is_acceptable(
+                stamp, self.last_odom_stamp_nanoseconds, 'odom_max_age_sec'):
+            self.last_odom_error = 'invalid, repeated, out-of-order or stale odom stamp'
+            return
+        if msg.header.frame_id.strip().lstrip('/') != str(
+                self.node.get_parameter('fixed_frame').value).lstrip('/'):
+            self.last_odom_error = 'odom header frame does not match fixed_frame'
+            return
+        if not self._odom_child_matches_base(msg):
+            self.last_odom_error = (
+                'odom child frame must match base_frame in planar position and rotation')
+            return
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        quaternion = (orientation.x, orientation.y, orientation.z, orientation.w)
+        if (
+                not all(math.isfinite(value) for value in (
+                    position.x, position.y, position.z, *quaternion,
+                    msg.twist.twist.linear.x, msg.twist.twist.linear.y,
+                    msg.twist.twist.angular.z))
+                or abs(sum(value * value for value in quaternion) - 1.0) > 1e-3):
+            self.last_odom_error = 'odom pose or velocity is invalid'
+            return
         self.last_odom = msg
         self.last_odom_received_at = time.monotonic()
+        self.last_odom_stamp_nanoseconds = stamp
+        self.odom_sequence += 1
+        self.last_odom_error = ''
+
+    def _odom_child_matches_base(self, msg: Odometry) -> bool:
+        child = msg.child_frame_id.strip().lstrip('/')
+        base = str(self.node.get_parameter('base_frame').value).lstrip('/')
+        if child == base:
+            return True
+        if not child:
+            return False
+        try:
+            transform = self.node.tf_buffer.lookup_transform(
+                child, base, Time.from_msg(msg.header.stamp)).transform
+        except TransformException:
+            return False
+        # STELLA odometry uses base_footprint. Its fixed base_link joint adds
+        # only 0.071 m in z, so x/y/yaw and planar twist are identical. Accept
+        # that verified equivalence, but never compare camera/offset poses as
+        # if they were the robot center.
+        translation = transform.translation
+        rotation = transform.rotation
+        return (
+            all(math.isfinite(value) for value in (
+                translation.x, translation.y, translation.z,
+                rotation.x, rotation.y, rotation.z, rotation.w))
+            and max(abs(translation.x), abs(translation.y), abs(rotation.x),
+                    abs(rotation.y), abs(rotation.z)) <= 1e-6
+            and abs(abs(rotation.w) - 1.0) <= 1e-6)
 
     def _imu_callback(self, msg: Imu) -> None:
         if not math.isfinite(msg.angular_velocity.z):
@@ -938,6 +1326,10 @@ class MotionController:
         stamp_nanoseconds = (
             int(msg.header.stamp.sec) * 1_000_000_000
             + int(msg.header.stamp.nanosec))
+        if not self._sensor_stamp_is_acceptable(
+                stamp_nanoseconds, self.last_imu_stamp_nanoseconds,
+                'imu_max_age_sec'):
+            return
         if (
                 self.last_imu_stamp_nanoseconds > 0
                 and stamp_nanoseconds > self.last_imu_stamp_nanoseconds):
@@ -956,8 +1348,14 @@ class MotionController:
         # vector.y is IMU yaw and vector.z is the fused odom yaw.
         if not math.isfinite(msg.vector.x):
             return
+        stamp = Time.from_msg(msg.header.stamp).nanoseconds
+        if not self._sensor_stamp_is_acceptable(
+                stamp, self.last_wheel_yaw_stamp_nanoseconds,
+                'wheel_yaw_max_age_sec'):
+            return
         self.last_wheel_yaw = msg.vector.x
         self.last_wheel_yaw_received_at = time.monotonic()
+        self.last_wheel_yaw_stamp_nanoseconds = stamp
 
     def rear_clearance(self) -> float | None:
         snapshot = self.lidar.snapshot()
@@ -1059,6 +1457,10 @@ class MotionController:
             'backup_lidar_heading_filter_coef').value)
         lidar_heading_max_error = float(self.node.get_parameter(
             'backup_lidar_heading_max_error').value)
+        lidar_motion_residual = float(self.node.get_parameter(
+            'backup_lidar_motion_residual').value)
+        lidar_wheel_guard_residual = float(self.node.get_parameter(
+            'backup_lidar_wheel_guard_residual').value)
         lidar_heading_min_inlier_ratio = float(self.node.get_parameter(
             'backup_lidar_heading_min_inlier_ratio').value)
         lidar_heading_min_line_length = float(self.node.get_parameter(
@@ -1126,6 +1528,7 @@ class MotionController:
             heading_tolerance, heading_max_speed, heading_max_accel,
             heading_pause_error,
             lidar_heading_filter_coef, lidar_heading_max_error,
+            lidar_motion_residual, lidar_wheel_guard_residual,
             lidar_heading_min_inlier_ratio, lidar_heading_min_line_length,
             lidar_heading_rebase_error, lidar_heading_max_jump,
             lidar_heading_disable_clearance,
@@ -1162,6 +1565,9 @@ class MotionController:
                 or heading_pause_error >= lidar_heading_max_error
                 or not 0.0 < lidar_heading_filter_coef <= 1.0
                 or not 0.0 < lidar_heading_max_error < math.pi / 2.0
+                or not 0.0 < lidar_motion_residual < lidar_heading_max_error
+                or not lidar_motion_residual < lidar_wheel_guard_residual <= (
+                    lidar_heading_max_error)
                 or not 0.0 < lidar_heading_min_inlier_ratio <= 1.0
                 or lidar_heading_min_line_length <= 0.0
                 or not 0.0 < lidar_heading_max_jump < math.pi / 2.0
@@ -1251,6 +1657,8 @@ class MotionController:
         return (
             self.last_odom_received_at > 0.0
             and time.monotonic() - self.last_odom_received_at <= max_age
+            and self._sensor_stamp_is_acceptable(
+                self.last_odom_stamp_nanoseconds, 0, 'odom_max_age_sec')
         )
 
     def wheel_yaw_is_fresh(self) -> bool:
@@ -1260,6 +1668,8 @@ class MotionController:
             self.last_wheel_yaw is not None
             and self.last_wheel_yaw_received_at > 0.0
             and time.monotonic() - self.last_wheel_yaw_received_at <= max_age
+            and self._sensor_stamp_is_acceptable(
+                self.last_wheel_yaw_stamp_nanoseconds, 0, 'wheel_yaw_max_age_sec')
         )
 
     def imu_is_fresh(self) -> bool:
@@ -1269,7 +1679,32 @@ class MotionController:
             self.last_imu_yaw_rate is not None
             and self.last_imu_received_at > 0.0
             and time.monotonic() - self.last_imu_received_at <= max_age
+            and self._sensor_stamp_is_acceptable(
+                self.last_imu_stamp_nanoseconds, 0, 'imu_max_age_sec')
         )
+
+    def _sensor_stamp_is_acceptable(
+            self, stamp: int, previous: int, age_parameter: str) -> bool:
+        max_age = float(self.node.get_parameter(age_parameter).value)
+        future = float(self.node.get_parameter(
+            'motion_sensor_future_tolerance_sec').value)
+        return (
+            math.isfinite(max_age) and max_age > 0.0
+            and math.isfinite(future) and future >= 0.0
+            and header_stamp_is_acceptable(
+                stamp, previous, self.node.get_clock().now().nanoseconds,
+                int(max_age * 1e9), int(future * 1e9)))
+
+    def is_stationary(self, linear_tolerance: float) -> bool:
+        if not self.odom_is_fresh():
+            return False
+        velocity = self.last_odom.twist.twist.linear
+        yaw_rate, _ = self.current_stationary_yaw_rate()
+        yaw_tolerance = float(self.node.get_parameter(
+            'imu_stationary_yaw_rate').value)
+        return (
+            math.hypot(velocity.x, velocity.y) <= linear_tolerance
+            and abs(yaw_rate) <= yaw_tolerance)
 
     def current_imu_yaw_rate(self) -> float:
         assert self.last_imu_yaw_rate is not None
@@ -1351,6 +1786,48 @@ class MotionController:
             return current, False
         coefficient = min(max(filter_coefficient, 0.0), 1.0)
         return normalize_angle(current + coefficient * residual), True
+
+    @staticmethod
+    def _lidar_heading_motion_residual(
+            candidate_error: float, anchor_error: float,
+            current_yaw: float, anchor_yaw: float) -> float:
+        """Residual of the fixed-wall invariant: error + robot yaw."""
+        return normalize_angle(
+            candidate_error - anchor_error + current_yaw - anchor_yaw)
+
+    @staticmethod
+    def _lidar_heading_motion_is_consistent(
+            imu_residual: float, odom_residual: float,
+            wheel_residual: float,
+            limit: float) -> bool:
+        """Accept agreement with either inertial yaw or encoder-only yaw.
+
+        Odom yaw is corrected from the same IMU, so IMU and odom are one
+        correlated evidence group.  Encoder-only yaw is independent.  A dock
+        plane is implausible only when it conflicts with both groups.  This
+        still accepts real chassis slip (plane + inertial agree while wheels
+        do not) and rejects an unrelated RANSAC surface when neither agrees.
+        """
+        threshold = abs(limit)
+        inertial_conflict = (
+            abs(imu_residual) > threshold
+            and abs(odom_residual) > threshold
+            and imu_residual * odom_residual > 0.0
+        )
+        wheel_conflict = abs(wheel_residual) > threshold
+        return not (inertial_conflict and wheel_conflict)
+
+    @staticmethod
+    def _backup_wheel_guard_is_allowed(
+            wheel_residual: float, wheel_heading_drift: float,
+            residual_limit: float, max_yaw_drift: float) -> bool:
+        """Bound straight encoder fallback when a stable plane is suspect."""
+        return (
+            math.isfinite(wheel_residual)
+            and math.isfinite(wheel_heading_drift)
+            and abs(wheel_residual) <= abs(residual_limit)
+            and abs(wheel_heading_drift) < abs(max_yaw_drift)
+        )
 
     @staticmethod
     def _backup_guide_center_heading(

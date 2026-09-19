@@ -2,6 +2,7 @@
 #include "MW_value.hpp"
 #include "MW_serial.hpp"
 #include "stella.hpp"
+#include "encoder_unwrap.hpp"
 #include <algorithm>
 #include <cmath>
 #include <math.h>
@@ -332,12 +333,26 @@ void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
   }
 
   const double radians_per_count = 2.0 * M_PI / counts_per_wheel_revolution;
+  const auto left_raw = static_cast<std::int32_t>(
+      MyMotorCommandReadValue.position[channel_1]);
+  const auto right_raw = static_cast<std::int32_t>(
+      MyMotorCommandReadValue.position[channel_2]);
+  double left_delta = 0.0;
+  double right_delta = 0.0;
+  if (wheel_encoder_initialized_)
+  {
+    left_delta = unwrap_signed_32bit_delta(
+        left_raw, left_encoder_prev_for_wheel_state_) * radians_per_count;
+    right_delta = unwrap_signed_32bit_delta(
+        right_raw, right_encoder_prev_for_wheel_state_) * radians_per_count;
+    left_wheel_position_ += left_delta;
+    right_wheel_position_ += right_delta;
+  }
+
   sensor_msgs::msg::JointState wheel_state;
   wheel_state.header.stamp = stamp;
   wheel_state.name = {"left_wheel", "right_wheel"};
-  wheel_state.position = {
-      MyMotorCommandReadValue.position[channel_1] * radians_per_count,
-      MyMotorCommandReadValue.position[channel_2] * radians_per_count};
+  wheel_state.position = {left_wheel_position_, right_wheel_position_};
   wheel_state.velocity = {0.0, 0.0};
 
   if (wheel_encoder_initialized_)
@@ -346,16 +361,14 @@ void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
     if (dt > 0.0)
     {
       wheel_state.velocity[0] =
-          (MyMotorCommandReadValue.position[channel_1] - left_encoder_prev_for_wheel_state_) *
-          radians_per_count / dt;
+          left_delta / dt;
       wheel_state.velocity[1] =
-          (MyMotorCommandReadValue.position[channel_2] - right_encoder_prev_for_wheel_state_) *
-          radians_per_count / dt;
+          right_delta / dt;
     }
   }
 
-  left_encoder_prev_for_wheel_state_ = MyMotorCommandReadValue.position[channel_1];
-  right_encoder_prev_for_wheel_state_ = MyMotorCommandReadValue.position[channel_2];
+  left_encoder_prev_for_wheel_state_ = left_raw;
+  right_encoder_prev_for_wheel_state_ = right_raw;
   last_wheel_encoder_stamp_ = stamp;
   wheel_encoder_initialized_ = true;
   wheel_encoder_pub_->publish(wheel_state);

@@ -12,17 +12,22 @@ class DockingLifecycleManager:
     def declare_parameters(node: Node) -> None:
         node.declare_parameter('activate_docking_server', True)
         node.declare_parameter('lifecycle_timeout_sec', 20.0)
+        node.declare_parameter('docking_server_node', '/docking_server')
 
-    def __init__(self, node: Node) -> None:
+    def __init__(self, node: Node, server_node_name: str | None = None) -> None:
         self.node = node
+        self.server_node_name = (
+            server_node_name or str(node.get_parameter('docking_server_node').value)
+        ).rstrip('/')
 
     def configure_and_activate(
             self, should_stop: Callable[[], bool] | None = None) -> bool:
         should_stop = should_stop or (lambda: False)
         timeout = float(self.node.get_parameter('lifecycle_timeout_sec').value)
-        get_state_client = self.node.create_client(GetState, '/docking_server/get_state')
+        get_state_client = self.node.create_client(
+            GetState, f'{self.server_node_name}/get_state')
         change_state_client = self.node.create_client(
-            ChangeState, '/docking_server/change_state')
+            ChangeState, f'{self.server_node_name}/change_state')
 
         self.node.get_logger().info('Waiting for docking_server lifecycle services...')
         if not self._wait_for_service(
@@ -94,6 +99,14 @@ class DockingLifecycleManager:
         deadline = time.monotonic() + timeout
         while not should_stop() and time.monotonic() < deadline:
             if client.wait_for_service(timeout_sec=0.2):
+                count = self.node.count_services(client.srv_name)
+                if count > 1:
+                    self.node.get_logger().error(
+                        f'Refusing ambiguous lifecycle service {client.srv_name}: '
+                        f'{count} servers are visible')
+                    return False
+                if count != 1:
+                    continue
                 return True
         return False
 

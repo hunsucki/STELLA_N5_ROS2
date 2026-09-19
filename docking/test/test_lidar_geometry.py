@@ -18,8 +18,8 @@ import pytest
 
 SENSOR_X = -0.166
 REAR_REFERENCE_X = -0.2295
-TARGET_CLEARANCE = 0.01
-TOLERANCE = 0.005
+TARGET_CLEARANCE = 0.0145
+TOLERANCE = 0.010
 MOUNT = PlanarTransform(SENSOR_X, 0.0, math.pi)
 
 
@@ -44,16 +44,28 @@ def project(ranges, angle_min, angle_increment):
 
 def test_new_mount_rear_clearance_at_target():
     ranges, angle_min, angle_increment = make_scan()
-    ranges[180] = 0.0735
+    ranges[180] = 0.078
 
     points = project(ranges, angle_min, angle_increment)
 
     assert points is not None
     assert len(points) == 1
-    assert points[0].x == pytest.approx(-0.2395)
+    assert points[0].x == pytest.approx(-0.244)
     assert points[0].y == pytest.approx(0.0, abs=1e-9)
     assert rear_clearances(points, REAR_REFERENCE_X)[0][1] == pytest.approx(
         TARGET_CLEARANCE)
+
+
+def test_successful_dock_target_is_78mm_from_lidar_origin():
+    nominal_range = SENSOR_X - (REAR_REFERENCE_X - TARGET_CLEARANCE)
+    minimum_range = SENSOR_X - (
+        REAR_REFERENCE_X - (TARGET_CLEARANCE - TOLERANCE))
+    maximum_range = SENSOR_X - (
+        REAR_REFERENCE_X - (TARGET_CLEARANCE + TOLERANCE))
+
+    assert nominal_range == pytest.approx(0.078)
+    assert minimum_range == pytest.approx(0.068)
+    assert maximum_range == pytest.approx(0.088)
 
 
 def test_tf_projection_corrects_off_axis_wall_range():
@@ -97,7 +109,7 @@ def test_completion_range_is_inside_driver_range():
     )
     limits = effective_range_limits(0.05, 12.0, 0.05, 2.0)
 
-    assert completion_range == pytest.approx(0.0785)
+    assert completion_range == pytest.approx(0.088)
     assert limits is not None
     assert limits[0] <= completion_range <= limits[1]
 

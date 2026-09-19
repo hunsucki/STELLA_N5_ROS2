@@ -11,12 +11,18 @@
   <depend>ament_index_python</depend>
   <depend>apriltag_ros</depend>
   <depend>geometry_msgs</depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>image_geometry</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <depend>launch_ros</depend>
   <depend>lifecycle_msgs</depend>
   <depend>nav2_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>opennav_docking</depend>
   <depend>rclpy</depend>
+  <exec_depend>python3-yaml</exec_depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>tf2_ros</depend>
@@ -24,6 +30,9 @@
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
+  <test_depend>apriltag_msgs</test_depend>
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>python3-opencv</test_depend>
   <test_depend>python3-yaml</test_depend>
   <test_depend>python3-pytest</test_depend>
 

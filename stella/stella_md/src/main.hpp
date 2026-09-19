@@ -2,6 +2,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <chrono>
+#include <cstdint>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
@@ -64,8 +65,10 @@ private:
     rclcpp::Time latest_filtered_yaw_stamp_{0, 0, RCL_ROS_TIME};
     
     int left_encoder_prev=0,right_encoder_prev=0;
-    long left_encoder_prev_for_wheel_state_ = 0;
-    long right_encoder_prev_for_wheel_state_ = 0;
+    std::int32_t left_encoder_prev_for_wheel_state_ = 0;
+    std::int32_t right_encoder_prev_for_wheel_state_ = 0;
+    double left_wheel_position_ = 0.0;
+    double right_wheel_position_ = 0.0;
     
     double ahrs_yaw=0.0, filtered_yaw_rad_=0.0, delta_th=0.0,delta_s=0.0,delta_x=0.0,delta_y=0.0,x=0.0,y=0.0,th=0.0,delta_left = 0,delta_right = 0;
 

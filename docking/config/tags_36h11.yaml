@@ -4,7 +4,8 @@
     family: 36h11
     size: 0.154
     max_hamming: 1
-    qos_profile: sensor_data
+    # Rectifier publishes reliable, bounded-rate mono images and CameraInfo.
+    qos_profile: default
 
     detector:
       threads: 1

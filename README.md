@@ -529,7 +529,8 @@ ros2 run docking dock_turn_backup --ros-args \
   -p lidar_align_sector_width:=1.0472 \
   -p lidar_align_tolerance:=0.01745 \
   -p lidar_align_angular_speed:=0.06 \
-  -p lidar_align_timeout_sec:=12.0
+  -p lidar_align_tracking_outlier_cycles:=2 \
+  -p lidar_align_timeout_sec:=18.0
 ```
 
 정렬 방향이 반대로 보이면 `-p lidar_align_kp:=-0.8`로 부호를 바꿔 테스트할 수 있음
@@ -1121,20 +1122,21 @@ LaserScan의 로컬 각도를 직접 가정하지 않고 모든 광선과 끝점
 | range | 0.15~2.0m |
 | 최소 점 / inlier | 20 / 12 |
 | RANSAC 반복 | 100 |
-| inlier 거리 threshold | 0.035m |
+| inlier 거리 threshold | 0.010m (PCA 후 지지점 재선정) |
 | 최소 직선 길이 | 0.15m |
 | 기대 방향 대비 후보 최대 오차 | 15도 |
 | 정렬 tolerance | 1도 |
 | 최대/최소 각속도 | 0.06 / 0.012rad/s |
 | 첫 획득 | 고유 scan 3개, 상호 잔차 3도 이내 |
 | tracking soft/hard 잔차 | 5도 / 12도 |
+| soft outlier 합의 | 2개 고유 scan 연속 |
 | 최대 추가 회전 | 18도 |
-| timeout | 12초 |
+| timeout | 18초 |
 
 RANSAC 후보는 단순 inlier 수뿐 아니라 `inlier 수 × 실제 선분 길이`로 평가한다.
 회전 직후 첫 왜곡 scan 하나로 움직이지 않고 3개 scan의 합의를 기다린다. 추적 중
-5~12도 jump는 정지 후 재획득하고, 12도 초과만 다른 구조물로 전환된 위험으로 보고
-실패한다. 평면의 접선이 로봇 좌우축과 평행하도록 맞추므로 패널 법선과 로봇 전후축이
+5~12도 jump 하나는 정지 상태에서 버리고 기존 평면을 유지하며, 2개 scan 연속이면
+재획득한다. 12도 초과는 다른 구조물로 전환된 위험으로 보고 즉시 실패한다. 평면의 접선이 로봇 좌우축과 평행하도록 맞추므로 패널 법선과 로봇 전후축이
 일치하고, 결과적으로 패널을 향해 수직으로 후진한다.
 
 #### LiDAR 거리 후진과 약한 heading 보정

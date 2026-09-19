@@ -129,6 +129,62 @@ def test_failed_run_tracking_jump_reacquires_instead_of_aborting():
     ) == 'abort'
 
 
+def test_isolated_soft_tracking_jumps_do_not_discard_tracked_plane():
+    decide = LidarPlaneAligner._tracking_jump_action
+    update_count = LidarPlaneAligner._update_tracking_outlier_count
+    count = 0
+
+    # These are the alternating residuals from the 16:45 failed run.  Each
+    # soft outlier was followed by a normal fit, so none should reacquire.
+    for residual_degrees in (-5.23, 5.24, -5.49, -5.26, -5.73):
+        assert decide(
+            math.radians(residual_degrees),
+            math.radians(5.0),
+            math.radians(12.0),
+        ) == 'reacquire'
+        count, should_reacquire = update_count(count, required=2)
+        assert count == 1
+        assert not should_reacquire
+        # A following fit consistent with the tracked plane clears the run.
+        count = 0
+
+
+def test_two_consecutive_soft_tracking_jumps_trigger_reacquisition():
+    update_count = LidarPlaneAligner._update_tracking_outlier_count
+
+    count, should_reacquire = update_count(0, required=2)
+    assert count == 1
+    assert not should_reacquire
+
+    count, should_reacquire = update_count(count, required=2)
+    assert count == 2
+    assert should_reacquire
+
+
+def test_reacquired_plane_extends_rotation_budget_for_remaining_error():
+    budget = LidarPlaneAligner._rotation_budget_after_acquisition(
+        rotation_travel=math.radians(3.0),
+        error=math.radians(14.96),
+        base_limit=math.radians(18.0),
+        margin=math.radians(3.0),
+        hard_limit=math.radians(30.0),
+    )
+
+    assert math.degrees(budget) == pytest.approx(20.96)
+
+
+def test_reacquisition_rotation_budget_never_exceeds_hard_limit():
+    budget = LidarPlaneAligner._rotation_budget_after_acquisition(
+        rotation_travel=math.radians(20.0),
+        error=math.radians(15.0),
+        base_limit=math.radians(18.0),
+        margin=math.radians(3.0),
+        hard_limit=math.radians(30.0),
+    )
+
+    assert budget == pytest.approx(math.radians(30.0))
+
+
 def _rotate_points(points, angle):
     cosine = math.cos(angle)
     sine = math.sin(angle)
@@ -196,3 +252,38 @@ def test_guide_center_rejects_a_single_visible_rail():
 
     assert aligner._estimate_guide_center_from_points(
         0.0, wall, wall + left) is None
+
+
+@pytest.mark.parametrize('rotation_degrees', [-3.0, 0.0, 3.0])
+@pytest.mark.parametrize('seed', [7, 42, 123])
+def test_recorded_panel_is_not_blended_with_bent_frame(rotation_degrees, seed):
+    import json
+    from pathlib import Path
+    from docking.lidar_geometry import line_orientation_error
+
+    fixture = json.loads((Path(__file__).parent / 'fixtures' /
+                          'rear_panel_with_frame.json').read_text())
+    node = _Node({})
+    node.declare_parameter = lambda k, v: node.values.__setitem__(k, v)
+    LidarPlaneAligner.declare_parameters(node)
+    aligner = LidarPlaneAligner.__new__(LidarPlaneAligner)
+    aligner.node = node
+    rotation = math.radians(rotation_degrees)
+    state = random.getstate()
+    random.seed(seed)
+    try:
+        for points in fixture['clouds']:
+            # The recorded XY plot separates the panel (y > -0.12) from
+            # its bent edge. This mask is only the independent test oracle;
+            # the runtime estimator must find the panel without this mask.
+            panel = [p for p in points if p[1] > -.12]
+            reference_angle, _ = aligner._fit_line_pca(panel)
+            moved = [(x + .05, y) for x, y in _rotate_points(points, rotation)]
+            inliers = aligner._ransac_line_inliers(moved)
+            angle, length = aligner._fit_line_pca(inliers)
+            assert abs(line_orientation_error(
+                angle, reference_angle + rotation)) < math.radians(.6)
+            assert length > .35
+            assert len(inliers) / len(points) > .75
+    finally:
+        random.setstate(state)

@@ -1,7 +1,9 @@
 docking_server:
   ros__parameters:
     controller_frequency: 10.0
-    max_retries: 0
+    # One automatic retreat/re-approach handles a transient lost tag without
+    # requiring the operator to restart the whole sequence.
+    max_retries: 1
     base_frame: base_link
     fixed_frame: odom
 
@@ -60,17 +62,30 @@ dock_turn_backup:
     tag_refinement_target_pose_topic: /dock_pose
     tag_refinement_target_wait_timeout_sec: 1.0
     tag_refinement_target_max_age_sec: 1.5
-    tag_refinement_timeout_sec: 18.0
+    # Position correction and final yaw settling need separate time budgets.
+    # The September 9 run exhausted 18s while still recovering its heading.
+    tag_refinement_timeout_sec: 45.0
     tag_refinement_longitudinal_tolerance: 0.04
     tag_refinement_lateral_tolerance: 0.025
     tag_refinement_yaw_tolerance: 0.034906585  # 2 deg
     tag_refinement_stable_cycles: 5
+    tag_refinement_stationary_linear_speed: 0.005
     tag_refinement_linear_kp: 0.50
     tag_refinement_angular_k_alpha: 1.00
     tag_refinement_angular_k_beta: -0.30
     tag_refinement_final_yaw_kp: 1.00
     tag_refinement_max_linear_speed: 0.025
     tag_refinement_max_angular_speed: 0.08
+    # Rotate toward the target point first. Translation fades to zero at 8 deg,
+    # preventing a wide arc from consuming the yaw/travel safety envelope.
+    tag_refinement_translation_heading_limit: 0.139626340  # 8 deg
+    # Only after stationary yaw stall; capped at the existing 180-degree spin speed.
+    tag_refinement_recovery_max_angular_speed: 0.15
+    # Nav2 stops anywhere in its 0.15 m radial docking region. Keep a 3 cm
+    # observation/control margin and apply the same rotation-invariant metric.
+    tag_refinement_max_initial_distance: 0.18
+    # Deprecated axis/yaw gates retained for compatible parameter files.
+    # Runtime feasibility uses radial distance and the planned yaw excursion.
     tag_refinement_max_initial_longitudinal: 0.18
     tag_refinement_max_initial_lateral: 0.10
     tag_refinement_max_initial_yaw: 0.436332313  # 25 deg
@@ -79,13 +94,23 @@ dock_turn_backup:
     tag_refinement_control_rate_hz: 20.0
     tag_refinement_abort_on_failure: true
 
+    # Covers one Nav2 retry plus bounded refinement, spin, alignment and backup.
+    total_timeout_sec: 180.0
+
     # Rear-plane alignment first acquires a stable surface while stopped.
-    # A small one-off RANSAC jump triggers reacquisition instead of aborting.
-    lidar_align_timeout_sec: 12.0
+    # Ignore one soft RANSAC jump; reacquire only when it repeats.
+    lidar_align_timeout_sec: 18.0
+    # Separate the panel from adjacent bent frame points (stationary scan replay).
+    lidar_align_ransac_threshold: 0.010
     lidar_align_max_rotation: 0.314159265  # 18 deg
+    # If a soft plane inconsistency forces reacquisition, preserve the spent
+    # rotation and add the new measured error plus margin, capped at 30 deg.
+    lidar_align_rotation_margin: 0.052359878  # 3 deg
+    lidar_align_hard_max_rotation: 0.523598776  # 30 deg
     lidar_align_acquisition_stable_cycles: 3
     lidar_align_acquisition_max_residual: 0.052359878  # 3 deg
     lidar_align_max_tracking_residual: 0.087266463  # 5 deg
+    lidar_align_tracking_outlier_cycles: 2
     lidar_align_hard_tracking_residual: 0.209439510  # 12 deg
 
     # The former blind one-second forward motion is disabled independently.
@@ -95,5 +120,43 @@ dock_turn_backup:
     pre_spin_forward_speed: 0.03
     pre_spin_forward_max_distance: 0.05
 
-    backup_target_rear_clearance: 0.020
-    backup_clearance_tolerance: 0.005
+    # The successful dock measured 0.078 m from the rear LiDAR origin to the
+    # wall.  The LiDAR is 0.0635 m ahead of the rear body reference, so this
+    # is a 0.0145 m body clearance.  A +/-0.010 m tolerance corresponds to a
+    # directly measurable LiDAR-to-wall range of 0.068..0.088 m.
+    backup_target_rear_clearance: 0.0145
+    backup_clearance_tolerance: 0.010
+    # Back up slowly enough to stop before a guide rail after a rejected scan.
+    backup_speed: 0.035
+    backup_min_speed: 0.012
+    backup_slowdown_clearance: 0.18
+
+    # Keep a fixed wall/robot-yaw invariant during reverse.  This catches the
+    # September 15 failure where RANSAC stayed near 0 deg while the chassis
+    # rotated more than 5 deg, then permits the real -5.5 deg plane to be
+    # reacquired and corrected while translation is stopped.
+    backup_heading_kp: 0.35
+    backup_heading_max_angular_speed: 0.015
+    backup_heading_max_angular_accel: 0.030
+    backup_heading_pause_error: 0.052359878  # 3 deg
+    backup_max_yaw_drift: 0.139626340  # 8 deg
+    backup_lidar_heading_max_error: 0.139626340  # 8 deg
+    backup_lidar_motion_residual: 0.034906585  # 2 deg
+    # Stable disagreement up to 4 deg may use encoder-only straight heading;
+    # the suspect LiDAR plane is never used to steer in this guarded mode.
+    backup_lidar_wheel_guard_residual: 0.069813170  # 4 deg
+    backup_plane_reacquire_timeout_sec: 3.0
+
+    # When both guide rails are visible, bias the reverse path toward their
+    # measured center.  The estimator requires two long parallel rails, so a
+    # single wall or isolated reflection cannot steer the robot.
+    use_lidar_guide_centering: true
+    backup_guide_center_kp: 1.0
+    backup_guide_center_tolerance: 0.010
+    backup_guide_center_max_heading: 0.069813170  # 4 deg
+
+# ManagedStack passes this same file to the bridge.
+apriltag_to_pose_bridge:
+  ros__parameters:
+    transform_max_age_sec: 0.50
+    transform_future_tolerance_sec: 0.05

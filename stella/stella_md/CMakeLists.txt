@@ -48,6 +48,12 @@ ament_target_dependencies(${PROJECT_NAME}_node
 
 target_link_libraries(${PROJECT_NAME}_node ${CMAKE_CURRENT_SOURCE_DIR}/lib/MW_MotorDriver_aarch64.a)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_encoder_unwrap test/test_encoder_unwrap.cpp)
+  target_include_directories(test_encoder_unwrap PRIVATE "${PROJECT_SOURCE_DIR}/include/mw")
+endif()
+
 ################################################################################
 # Install
 ################################################################################

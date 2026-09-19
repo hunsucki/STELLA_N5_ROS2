@@ -7,6 +7,7 @@ from sensor_msgs.msg import Imu
 
 def test_absolute_odom_spin_handles_yaw_wraparound_and_stability():
     controller = MotionController.__new__(MotionController)
+    controller.odom_sequence = 0
     target = math.radians(-91.0)
     samples = iter([
         math.radians(170.0),
@@ -27,15 +28,16 @@ def test_absolute_odom_spin_handles_yaw_wraparound_and_stability():
         stationary_yaw_rate=math.radians(0.5),
     )
 
-    assert not done()
-    assert not done()
-    assert not done()
-    assert not done()
+    for _ in range(4):
+        controller.odom_sequence += 1
+        assert not done()
+    controller.odom_sequence += 1
     assert done()
 
 
 def test_absolute_odom_spin_waits_until_imu_reports_stationary():
     controller = MotionController.__new__(MotionController)
+    controller.odom_sequence = 0
     controller.current_yaw = lambda: 0.0
     yaw_rates = iter([math.radians(2.0), math.radians(0.2)])
     controller.current_imu_yaw_rate = lambda: next(yaw_rates)
@@ -48,12 +50,15 @@ def test_absolute_odom_spin_waits_until_imu_reports_stationary():
         stationary_yaw_rate=math.radians(0.5),
     )
 
+    controller.odom_sequence += 1
     assert not done()
+    controller.odom_sequence += 1
     assert done()
 
 
 def test_absolute_odom_spin_uses_wheel_rate_during_imu_dropout():
     controller = MotionController.__new__(MotionController)
+    controller.odom_sequence = 0
     controller.current_yaw = lambda: 0.0
     controller.imu_is_fresh = lambda: False
     wheel_rates = iter([math.radians(2.0), math.radians(0.2)])
@@ -66,7 +71,9 @@ def test_absolute_odom_spin_uses_wheel_rate_during_imu_dropout():
         stationary_yaw_rate=math.radians(0.5),
     )
 
+    controller.odom_sequence += 1
     assert not done()
+    controller.odom_sequence += 1
     assert done()
 
 
@@ -140,6 +147,96 @@ def test_lidar_heading_filter_smooths_small_changes_and_rejects_jumps():
     assert unchanged == pytest.approx(current)
 
 
+def test_fixed_wall_motion_residual_rejects_plane_that_ignores_robot_yaw():
+    residual = MotionController._lidar_heading_motion_residual
+    anchor_error = math.radians(0.3)
+    anchor_yaw = math.radians(10.0)
+
+    # A fixed rear wall appears to rotate by the opposite amount.
+    assert residual(
+        math.radians(-4.7), anchor_error,
+        math.radians(15.0), anchor_yaw) == pytest.approx(0.0)
+
+    # This was the failed-run pattern: robot yaw changed, but the fitted
+    # surface stayed almost parallel and was therefore the wrong authority.
+    assert residual(
+        math.radians(-0.7), anchor_error,
+        math.radians(15.0), anchor_yaw) == pytest.approx(math.radians(4.0))
+
+
+def test_motion_consistency_accepts_either_inertial_or_wheel_agreement():
+    consistent = MotionController._lidar_heading_motion_is_consistent
+    limit = math.radians(2.0)
+
+    # All three disagree with the fitted plane: reject it.
+    assert not consistent(
+        math.radians(4.3), math.radians(3.2), math.radians(3.0), limit)
+    # IMU/odom are correlated and may drift together. LiDAR plus encoders win.
+    assert consistent(
+        math.radians(4.3), math.radians(3.2), math.radians(0.6), limit)
+    # Physical wheel slip is visible to LiDAR and inertial yaw, but not wheels.
+    assert consistent(
+        math.radians(0.4), math.radians(1.0), math.radians(-5.0), limit)
+
+
+def test_september_15_backup_trace_accepts_reacquired_slip_plane():
+    residual = MotionController._lidar_heading_motion_residual
+    consistent = MotionController._lidar_heading_motion_is_consistent
+    anchor = math.radians(0.28)
+    limit = math.radians(2.0)
+
+    stale_imu = residual(
+        math.radians(-0.68), anchor, math.radians(5.25), 0.0)
+    stale_odom = residual(
+        math.radians(-0.68), anchor, math.radians(4.14), 0.0)
+    stale_wheel = residual(
+        math.radians(-0.68), anchor, math.radians(0.01), 0.0)
+    # This sample is ambiguous: LiDAR and wheels agree, while the correlated
+    # IMU/odom group disagrees. It remains valid until a real plane jump makes
+    # the heading filter stop and reacquire.
+    assert consistent(stale_imu, stale_odom, stale_wheel, limit)
+
+    reacquired_imu = residual(
+        math.radians(-5.57), anchor, math.radians(5.25), 0.0)
+    reacquired_odom = residual(
+        math.radians(-5.57), anchor, math.radians(4.14), 0.0)
+    reacquired_wheel = residual(
+        math.radians(-5.57), anchor, math.radians(0.01), 0.0)
+    assert consistent(
+        reacquired_imu, reacquired_odom, reacquired_wheel, limit)
+
+
+def test_september_17_straight_backup_ignores_correlated_imu_bias():
+    residual = MotionController._lidar_heading_motion_residual
+    consistent = MotionController._lidar_heading_motion_is_consistent
+    anchor = math.radians(0.67)
+    limit = math.radians(2.0)
+
+    candidate = math.radians(1.32)
+    imu = residual(candidate, anchor, math.radians(1.52), 0.0)
+    odom = residual(candidate, anchor, math.radians(1.44), 0.0)
+    wheel = residual(candidate, anchor, math.radians(-0.05), 0.0)
+
+    assert math.degrees(imu) == pytest.approx(2.17)
+    assert math.degrees(odom) == pytest.approx(2.09)
+    assert math.degrees(wheel) == pytest.approx(0.60)
+    assert consistent(imu, odom, wheel, limit)
+
+
+def test_wheel_heading_guard_is_bounded_around_latest_failure():
+    allowed = MotionController._backup_wheel_guard_is_allowed
+
+    assert allowed(
+        math.radians(2.99), math.radians(0.13),
+        math.radians(4.0), math.radians(8.0))
+    assert not allowed(
+        math.radians(4.01), math.radians(0.13),
+        math.radians(4.0), math.radians(8.0))
+    assert not allowed(
+        math.radians(2.99), math.radians(8.0),
+        math.radians(4.0), math.radians(8.0))
+
+
 def test_failed_run_heading_sample_now_commands_the_correct_direction():
     command = MotionController._backup_heading_angular_velocity(
         math.radians(-2.24),
@@ -211,7 +308,17 @@ def test_backup_does_not_resume_without_lidar_or_while_still_rotating():
 
 
 def test_imu_yaw_rate_is_integrated_with_sensor_timestamps():
+    from types import SimpleNamespace
+
     controller = MotionController.__new__(MotionController)
+    controller.node = SimpleNamespace(
+        get_parameter=lambda name: SimpleNamespace(value={
+            'imu_max_age_sec': 0.25,
+            'motion_sensor_future_tolerance_sec': 0.05,
+        }[name]),
+        get_clock=lambda: SimpleNamespace(
+            now=lambda: SimpleNamespace(nanoseconds=10_020_000_000)),
+    )
     controller.last_imu_yaw_rate = None
     controller.last_imu_received_at = 0.0
     controller.last_imu_stamp_nanoseconds = 0

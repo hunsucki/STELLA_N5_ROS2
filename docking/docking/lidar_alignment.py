@@ -1,4 +1,6 @@
 import math
+
+from docking.control import spin_for
 import random
 import statistics
 import time
@@ -31,7 +33,7 @@ class LidarPlaneAligner:
     @staticmethod
     def declare_parameters(node: Node) -> None:
         node.declare_parameter('use_lidar_alignment', True)
-        node.declare_parameter('lidar_align_timeout_sec', 12.0)
+        node.declare_parameter('lidar_align_timeout_sec', 18.0)
         node.declare_parameter('lidar_align_sector_center', math.nan)
         node.declare_parameter('lidar_align_sector_center_base', math.pi)
         # Fit only the dock's rear-facing panel.  A wider fan also sees the
@@ -44,7 +46,8 @@ class LidarPlaneAligner:
         node.declare_parameter('lidar_align_min_points', 20)
         node.declare_parameter('lidar_align_min_inliers', 12)
         node.declare_parameter('lidar_align_ransac_iterations', 100)
-        node.declare_parameter('lidar_align_ransac_threshold', 0.035)
+        # A 35 mm band blended the rear panel with its bent side edge.
+        node.declare_parameter('lidar_align_ransac_threshold', 0.010)
         # The +/-30-degree sector exposes enough of the panel after a slightly
         # imperfect odom turn; keep the length threshold tolerant of occlusion.
         node.declare_parameter('lidar_align_min_line_length', 0.15)
@@ -57,6 +60,12 @@ class LidarPlaneAligner:
         node.declare_parameter('lidar_align_stable_cycles', 5)
         node.declare_parameter(
             'lidar_align_max_rotation', math.radians(18.0))
+        # Start with the normal limit, but a validated plane reacquisition may
+        # need to account for rotation already spent on the discarded fit.
+        node.declare_parameter(
+            'lidar_align_rotation_margin', math.radians(3.0))
+        node.declare_parameter(
+            'lidar_align_hard_max_rotation', math.radians(30.0))
         # Acquire the same stationary plane across multiple unique scans
         # before commanding motion.  This rejects a motion-distorted first
         # scan immediately after the odom spin.
@@ -65,8 +74,10 @@ class LidarPlaneAligner:
             'lidar_align_acquisition_max_residual', math.radians(3.0))
         node.declare_parameter(
             'lidar_align_max_tracking_residual', math.radians(5.0))
-        # A soft tracking jump stops and reacquires the plane.  Only a much
-        # larger jump is treated as an unsafe switch to another structure.
+        # A single soft jump can be a random RANSAC fit of the station frame.
+        # Keep the established plane unless the jump persists across scans.
+        node.declare_parameter('lidar_align_tracking_outlier_cycles', 2)
+        # A much larger jump is treated as an unsafe switch immediately.
         node.declare_parameter(
             'lidar_align_hard_tracking_residual', math.radians(12.0))
         # The two aluminum guide rails are fitted only after the rear panel
@@ -112,8 +123,16 @@ class LidarPlaneAligner:
         sleep_time = 1.0 / max(rate_hz, 1.0)
         start = self.node.get_clock().now()
         start_yaw = self.motion.current_yaw()
-        max_rotation = float(
+        base_max_rotation = float(
             self.node.get_parameter('lidar_align_max_rotation').value)
+        rotation_margin = float(
+            self.node.get_parameter('lidar_align_rotation_margin').value)
+        hard_max_rotation = float(
+            self.node.get_parameter('lidar_align_hard_max_rotation').value)
+        rotation_budget = base_max_rotation
+        rotation_travel = 0.0
+        previous_yaw = start_yaw
+        previous_odom_sequence = self.motion.odom_sequence
         stage_start_sequence = self.lidar.sequence
         stability = UniqueScanStability(
             stable_cycles_required, stage_start_sequence)
@@ -128,6 +147,9 @@ class LidarPlaneAligner:
             'lidar_align_acquisition_stable_cycles').value), 1)
         acquisition_max_residual = abs(float(self.node.get_parameter(
             'lidar_align_acquisition_max_residual').value))
+        tracking_outlier_count = 0
+        tracking_outliers_required = max(int(self.node.get_parameter(
+            'lidar_align_tracking_outlier_cycles').value), 1)
 
         self.node.get_logger().info('Fine-aligning yaw using LiDAR plane...')
 
@@ -144,14 +166,19 @@ class LidarPlaneAligner:
                 self.node.get_logger().error(
                     'Odometry became stale during LiDAR alignment')
                 return False
-            rotation = abs(MotionController.normalize_angle(
-                self.motion.current_yaw() - start_yaw))
-            if rotation >= max_rotation:
+            current_yaw = self.motion.current_yaw()
+            if self.motion.odom_sequence != previous_odom_sequence:
+                rotation_travel += abs(MotionController.normalize_angle(
+                    current_yaw - previous_yaw))
+                previous_yaw = current_yaw
+                previous_odom_sequence = self.motion.odom_sequence
+            if rotation_travel >= rotation_budget:
                 self.motion.stop_robot()
                 self.node.get_logger().error(
                     'LiDAR alignment exceeded the rotation safety limit: '
-                    f'{math.degrees(rotation):.2f}deg >= '
-                    f'{math.degrees(max_rotation):.2f}deg')
+                    f'travel={math.degrees(rotation_travel):.2f}deg >= '
+                    f'budget={math.degrees(rotation_budget):.2f}deg '
+                    f'(hard={math.degrees(hard_max_rotation):.2f}deg)')
                 return False
 
             snapshot = self.lidar.snapshot()
@@ -167,17 +194,18 @@ class LidarPlaneAligner:
                         'Docking LiDAR failed during alignment: '
                         f'{self.lidar.last_error}')
                     return False
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
                 continue
 
             if snapshot.sequence == stability.last_sequence:
                 self.motion.cmd_vel_pub.publish(current_command)
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
                 continue
 
             estimate = self.estimate_error(snapshot)
             if estimate is None:
                 stability.observe(snapshot.sequence, False)
+                tracking_outlier_count = 0
                 acquisition_error = None
                 acquisition_yaw = None
                 acquisition_count = 0
@@ -189,7 +217,7 @@ class LidarPlaneAligner:
                         f'{self.last_station_alignment_error}')
                     last_log_time = now
                 self.motion.cmd_vel_pub.publish(current_command)
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
                 continue
 
             error, line_angle, inliers, total_points, line_length = estimate
@@ -201,6 +229,7 @@ class LidarPlaneAligner:
 
             if tracked_error is None or tracked_yaw is None:
                 stability.observe(snapshot.sequence, False)
+                tracking_outlier_count = 0
                 current_command = Twist()
                 if abs(stationary_yaw_rate_value) > stationary_yaw_rate:
                     acquisition_error = None
@@ -224,14 +253,25 @@ class LidarPlaneAligner:
                     if acquired:
                         tracked_error = error
                         tracked_yaw = current_yaw
+                        rotation_budget = self._rotation_budget_after_acquisition(
+                            rotation_travel,
+                            error,
+                            base_max_rotation,
+                            rotation_margin,
+                            hard_max_rotation,
+                        )
                         self.node.get_logger().info(
                             'LiDAR rear plane acquired: '
                             f'error={math.degrees(error):.2f}deg, '
+                            'rotation_travel='
+                            f'{math.degrees(rotation_travel):.2f}deg, '
+                            'rotation_budget='
+                            f'{math.degrees(rotation_budget):.2f}deg, '
                             f'consistent_scans={acquisition_count}, '
                             f'inliers={inliers}/{total_points}, '
                             f'line_length={line_length:.2f}m')
                 self.motion.cmd_vel_pub.publish(current_command)
-                rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
                 continue
 
             if tracked_error is not None and tracked_yaw is not None:
@@ -264,24 +304,55 @@ class LidarPlaneAligner:
                             f'{math.degrees(hard_tracking_residual):.2f}deg')
                         return False
 
+                    tracking_outlier_count, should_reacquire = (
+                        self._update_tracking_outlier_count(
+                            tracking_outlier_count,
+                            tracking_outliers_required,
+                        ))
                     self.motion.stop_robot()
+                    stability.observe(snapshot.sequence, False)
+                    current_command = Twist()
+                    if not should_reacquire:
+                        self.node.get_logger().warning(
+                            'Ignoring isolated inconsistent LiDAR plane update '
+                            'while stopped; retaining the tracked rear plane: '
+                            f'error={math.degrees(error):.2f}deg, '
+                            f'tracking_residual='
+                            f'{math.degrees(tracking_residual):.2f}deg, '
+                            f'limit={math.degrees(max_tracking_residual):.2f}deg, '
+                            f'outliers={tracking_outlier_count}/'
+                            f'{tracking_outliers_required}')
+                        self.motion.cmd_vel_pub.publish(current_command)
+                        spin_for(
+                            self.node, sleep_time, self.motion.should_stop)
+                        continue
+
                     self.node.get_logger().warning(
-                        'Rejecting one inconsistent LiDAR plane update and '
+                        'Consecutive inconsistent LiDAR plane updates; '
                         'reacquiring while stopped: '
                         f'error={math.degrees(error):.2f}deg, '
                         f'tracking_residual='
                         f'{math.degrees(tracking_residual):.2f}deg, '
-                        f'limit={math.degrees(max_tracking_residual):.2f}deg')
+                        f'limit={math.degrees(max_tracking_residual):.2f}deg, '
+                        f'outliers={tracking_outlier_count}/'
+                        f'{tracking_outliers_required}')
+                    rotation_budget = self._rotation_budget_after_acquisition(
+                        rotation_travel,
+                        error,
+                        base_max_rotation,
+                        rotation_margin,
+                        hard_max_rotation,
+                    )
                     tracked_error = None
                     tracked_yaw = None
                     acquisition_error = None
                     acquisition_yaw = None
                     acquisition_count = 0
-                    stability.reset()
-                    current_command = Twist()
+                    tracking_outlier_count = 0
                     self.motion.cmd_vel_pub.publish(current_command)
-                    rclpy.spin_once(self.node, timeout_sec=sleep_time)
+                    spin_for(self.node, sleep_time, self.motion.should_stop)
                     continue
+            tracking_outlier_count = 0
             tracked_error = error
             tracked_yaw = current_yaw
 
@@ -325,6 +396,8 @@ class LidarPlaneAligner:
                     f'normal=rear:{math.degrees(error):.2f}deg, '
                     'mode=rear_only, '
                     f'cmd={current_command.angular.z:.3f}rad/s, '
+                    f'rotation={math.degrees(rotation_travel):.2f}/'
+                    f'{math.degrees(rotation_budget):.2f}deg, '
                     f'stationary_rate='
                     f'{math.degrees(stationary_yaw_rate_value):.2f}deg/s, '
                     f'stationary_source={stationary_source}, '
@@ -332,7 +405,7 @@ class LidarPlaneAligner:
                     f'line_length={line_length:.2f}m')
                 last_log_time = now
 
-            rclpy.spin_once(self.node, timeout_sec=sleep_time)
+            spin_for(self.node, sleep_time, self.motion.should_stop)
 
         self.motion.stop_robot()
         return False
@@ -596,6 +669,10 @@ class LidarPlaneAligner:
                 'lidar_align_min_angular_speed').value),
             'max_rotation': float(self.node.get_parameter(
                 'lidar_align_max_rotation').value),
+            'rotation_margin': float(self.node.get_parameter(
+                'lidar_align_rotation_margin').value),
+            'hard_max_rotation': float(self.node.get_parameter(
+                'lidar_align_hard_max_rotation').value),
             'acquisition_max_residual': float(self.node.get_parameter(
                 'lidar_align_acquisition_max_residual').value),
             'max_tracking_residual': float(self.node.get_parameter(
@@ -648,6 +725,8 @@ class LidarPlaneAligner:
             'lidar_align_stable_cycles').value)
         acquisition_cycles = int(self.node.get_parameter(
             'lidar_align_acquisition_stable_cycles').value)
+        tracking_outlier_cycles = int(self.node.get_parameter(
+            'lidar_align_tracking_outlier_cycles').value)
         guide_min_inliers = int(self.node.get_parameter(
             'lidar_guide_min_inliers').value)
         threshold = float(self.node.get_parameter(
@@ -670,6 +749,9 @@ class LidarPlaneAligner:
                 or values['max_speed'] <= 0.0
                 or not 0.0 < values['min_speed'] <= values['max_speed']
                 or values['max_rotation'] <= 0.0
+                or values['rotation_margin'] < 0.0
+                or not values['max_rotation'] <= (
+                    values['hard_max_rotation']) < math.pi
                 or not 0.0 < values['acquisition_max_residual'] < (
                     values['max_tracking_residual'])
                 or not 0.0 < values['max_tracking_residual'] < math.pi / 2.0
@@ -696,6 +778,7 @@ class LidarPlaneAligner:
                 or iterations < 1
                 or stable_cycles < 1
                 or acquisition_cycles < 1
+                or tracking_outlier_cycles < 1
                 or guide_min_inliers < 2
                 or threshold <= 0.0
                 or min_line_length <= 0.0):
@@ -741,6 +824,20 @@ class LidarPlaneAligner:
                 point for point in points
                 if abs(a * point[0] + b * point[1] + c) <= threshold
             ]
+            for _ in range(3):
+                line = self._fit_line_pca(inliers)
+                if line is None:
+                    break
+                angle, _ = line
+                nx, ny = -math.sin(angle), math.cos(angle)
+                offset = statistics.median(nx * x + ny * y for x, y in inliers)
+                refined = [
+                    (x, y) for x, y in points
+                    if abs(nx * x + ny * y - offset) <= threshold
+                ]
+                if refined == inliers:
+                    break
+                inliers = refined
             line = self._fit_line_pca(inliers)
             if line is None:
                 continue
@@ -813,6 +910,22 @@ class LidarPlaneAligner:
         if magnitude > abs(soft_limit):
             return 'reacquire'
         return 'accept'
+
+    @staticmethod
+    def _update_tracking_outlier_count(
+            count: int, required: int) -> tuple[int, bool]:
+        """Require repeated soft jumps before discarding a tracked plane."""
+        new_count = max(int(count), 0) + 1
+        required = max(int(required), 1)
+        return new_count, new_count >= required
+
+    @staticmethod
+    def _rotation_budget_after_acquisition(
+            rotation_travel: float, error: float,
+            base_limit: float, margin: float, hard_limit: float) -> float:
+        """Budget a new fit without discarding rotation already consumed."""
+        required = rotation_travel + abs(error) + margin
+        return min(hard_limit, max(base_limit, required))
 
     @staticmethod
     def _fit_line_pca(

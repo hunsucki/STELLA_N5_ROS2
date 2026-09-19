@@ -162,6 +162,16 @@ class DockingLidar:
             self.last_error = f'docking LiDAR scan is stale ({age:.3f}s old)'
             return None
 
+        if not header_stamp_is_acceptable(
+                self.last_stamp_nanoseconds, 0,
+                self.node.get_clock().now().nanoseconds,
+                int(float(self.node.get_parameter(
+                    'docking_lidar_header_max_age_sec').value) * 1e9),
+                int(float(self.node.get_parameter(
+                    'docking_lidar_future_tolerance_sec').value) * 1e9)):
+            self.last_error = 'docking LiDAR header stamp has expired'
+            return None
+
         actual_frame = self._normalize_frame(scan.header.frame_id)
         expected_frame = self.expected_frame()
         if actual_frame != expected_frame:

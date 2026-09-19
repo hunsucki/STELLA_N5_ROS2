@@ -11,8 +11,10 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from docking.charging import ChargingVerifier
+from docking.control import PrecisionYawController, spin_for
 from docking.docking_lidar import DockingLidar
 from docking.lidar_alignment import LidarPlaneAligner
+from docking.lidar_geometry import header_stamp_is_acceptable, UniqueScanStability
 from docking.lifecycle import DockingLifecycleManager
 from docking.motion import MotionController
 from docking.safety import (
@@ -27,6 +29,8 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from rclpy.signals import SignalHandlerOptions
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -61,7 +65,7 @@ class DockTurnBackup(Node):
         self.motion = MotionController(self, self.lidar, self.should_stop)
         self.stack = ManagedStack(
             self, self.motion.stop_robot, self.should_stop)
-        self.lifecycle = DockingLifecycleManager(self)
+        self.lifecycle = DockingLifecycleManager(self, self.stack.server_node_name)
         self.lidar_aligner = LidarPlaneAligner(
             self, self.motion, self.lidar)
         self.motion.set_backup_lidar_heading_estimator(
@@ -72,7 +76,7 @@ class DockTurnBackup(Node):
         self.dock_pose_sequence = 0
         self.dock_pose_sub = self.create_subscription(
             PoseStamped,
-            self.get_parameter('dock_pose_topic').value,
+            self.stack.detected_pose_topic,
             self._dock_pose_callback,
             10)
         self.last_refinement_target_pose: PoseStamped | None = None
@@ -86,12 +90,12 @@ class DockTurnBackup(Node):
         refinement_qos.durability = DurabilityPolicy.VOLATILE
         self.refinement_target_sub = self.create_subscription(
             PoseStamped,
-            self.get_parameter('tag_refinement_target_pose_topic').value,
+            self.stack.refinement_pose_topic,
             self._refinement_target_callback,
             refinement_qos)
 
         self.dock_client = ActionClient(
-            self, DockRobot, self.get_parameter('dock_action').value)
+            self, DockRobot, self.stack.dock_action)
 
     def run(self) -> DockingExitCode:
         total_timeout = float(self.get_parameter('total_timeout_sec').value)
@@ -211,6 +215,8 @@ class DockTurnBackup(Node):
         self.declare_parameter('max_staging_time', 40.0)
         self.declare_parameter('dock_pose_topic', 'detected_dock_pose')
         self.declare_parameter('dock_pose_wait_timeout_sec', 10.0)
+        self.declare_parameter('dock_pose_ready_samples', 5)
+        self.declare_parameter('dock_pose_ready_max_gap_sec', 0.4)
         # Optional bounded pose trim after Nav2 DockRobot succeeds.  The target
         # is Nav2's already filtered /dock_pose in odom, so disabling this flag
         # restores the previously successful motion sequence exactly.
@@ -218,20 +224,29 @@ class DockTurnBackup(Node):
         self.declare_parameter('tag_refinement_target_pose_topic', '/dock_pose')
         self.declare_parameter('tag_refinement_target_wait_timeout_sec', 1.0)
         self.declare_parameter('tag_refinement_target_max_age_sec', 1.5)
-        self.declare_parameter('tag_refinement_timeout_sec', 18.0)
+        self.declare_parameter('tag_refinement_timeout_sec', 45.0)
         self.declare_parameter('tag_refinement_longitudinal_tolerance', 0.04)
         self.declare_parameter('tag_refinement_lateral_tolerance', 0.025)
         self.declare_parameter(
             'tag_refinement_yaw_tolerance', math.radians(2.0))
         self.declare_parameter('tag_refinement_stable_cycles', 5)
+        self.declare_parameter('tag_refinement_stationary_linear_speed', 0.005)
         self.declare_parameter('tag_refinement_linear_kp', 0.50)
         self.declare_parameter('tag_refinement_angular_k_alpha', 1.00)
         self.declare_parameter('tag_refinement_angular_k_beta', -0.30)
         self.declare_parameter('tag_refinement_final_yaw_kp', 1.00)
         self.declare_parameter('tag_refinement_max_linear_speed', 0.025)
         self.declare_parameter('tag_refinement_max_angular_speed', 0.08)
+        self.declare_parameter(
+            'tag_refinement_translation_heading_limit', math.radians(8.0))
+        self.declare_parameter('tag_refinement_recovery_max_angular_speed', 0.15)
+        self.declare_parameter('tag_refinement_max_initial_distance', 0.18)
+        # Deprecated axis limits are still declared so old command lines and
+        # parameter files load, but the radial guard below is authoritative.
         self.declare_parameter('tag_refinement_max_initial_longitudinal', 0.18)
         self.declare_parameter('tag_refinement_max_initial_lateral', 0.10)
+        # Deprecated fixed yaw gate. Feasibility is checked against the actual
+        # planned excursion and tag_refinement_max_yaw_excursion instead.
         self.declare_parameter(
             'tag_refinement_max_initial_yaw', math.radians(25.0))
         self.declare_parameter('tag_refinement_max_travel', 0.18)
@@ -251,7 +266,7 @@ class DockTurnBackup(Node):
         self.declare_parameter('tag_front_verify_timeout_sec', 3.0)
 
     def _declare_safety_parameters(self) -> None:
-        self.declare_parameter('total_timeout_sec', 100.0)
+        self.declare_parameter('total_timeout_sec', 180.0)
         self.declare_parameter('development_test_mode', True)
 
     def _declare_tf_parameters(self) -> None:
@@ -263,13 +278,31 @@ class DockTurnBackup(Node):
     def _wait_for_dock_server(self) -> bool:
         timeout = float(self.get_parameter('server_wait_timeout_sec').value)
 
-        self.get_logger().info('Waiting for dock_robot action server...')
+        self.get_logger().info(
+            f'Waiting for docking action server {self.stack.dock_action}...')
         deadline = time.monotonic() + timeout
         while not self.should_stop() and time.monotonic() < deadline:
             if self.dock_client.wait_for_server(timeout_sec=0.2):
-                return True
+                if self._dock_server_is_unique():
+                    return True
+                if any(count > 1 for count in self._dock_server_counts()):
+                    return False
         self.get_logger().error('dock_robot action server is not available')
         return False
+
+    def _dock_server_counts(self) -> tuple[int, int, int]:
+        action = self.stack.dock_action.rstrip('/')
+        return tuple(self.count_services(f'{action}/_action/{service}')
+                     for service in ('send_goal', 'get_result', 'cancel_goal'))
+
+    def _dock_server_is_unique(self) -> bool:
+        counts = self._dock_server_counts()
+        if any(count > 1 for count in counts):
+            self.get_logger().error(
+                f'Multiple docking action servers on {self.stack.dock_action}: '
+                f'send_goal/get_result/cancel_goal={counts}. '
+                'Refusing to send a goal to ambiguous action endpoints.')
+        return counts == (1, 1, 1)
 
     def _wait_for_base_transform(self) -> bool:
         timeout = float(self.get_parameter('tf_wait_timeout_sec').value)
@@ -363,21 +396,43 @@ class DockTurnBackup(Node):
 
     def _wait_for_detected_dock_pose(self) -> bool:
         timeout = float(self.get_parameter('dock_pose_wait_timeout_sec').value)
-        topic = str(self.get_parameter('dock_pose_topic').value)
+        topic = self.stack.detected_pose_topic
+        required = int(self.get_parameter('dock_pose_ready_samples').value)
+        max_gap = float(self.get_parameter('dock_pose_ready_max_gap_sec').value)
+        if required < 2 or not math.isfinite(max_gap) or max_gap <= 0.0:
+            self.get_logger().error('Dock pose readiness parameters are invalid')
+            return False
+        count = 0
+        previous_stamp = None
         start = self.get_clock().now()
         last_log_time = time.monotonic()
 
         self.get_logger().info(f'Waiting for detected dock pose on {topic}...')
 
         while rclpy.ok() and not self.should_stop():
-            if self.last_dock_pose is not None:
-                self.get_logger().info(f'Detected dock pose is available on {topic}')
-                return True
+            if self._pose_is_fresh(
+                    self.last_dock_pose, self.last_dock_pose_received_at,
+                    float(self.get_parameter('tag_front_pose_max_age_sec').value)):
+                stamp = Time.from_msg(self.last_dock_pose.header.stamp).nanoseconds
+                if stamp != previous_stamp:
+                    gap = ((stamp - previous_stamp) / 1e9
+                           if previous_stamp is not None else math.inf)
+                    count = count + 1 if 0.0 < gap <= max_gap else 1
+                    previous_stamp = stamp
+                if count >= required:
+                    self.get_logger().info(
+                        f'Detected dock pose stream is ready on {topic}: '
+                        f'{count} distinct observations, gaps <= {max_gap:.2f}s')
+                    return True
+            else:
+                count = 0
+                previous_stamp = None
 
             now = time.monotonic()
             if now - last_log_time >= 1.0:
                 self.get_logger().info(
-                    f'Still waiting for {topic}; check AprilTag visibility and QoS')
+                    f'Still waiting for {topic}: stable samples={count}/{required}; '
+                    'check AprilTag visibility and camera delivery')
                 last_log_time = now
 
             rclpy.spin_once(self, timeout_sec=0.1)
@@ -390,13 +445,35 @@ class DockTurnBackup(Node):
         return False
 
     def _dock_pose_callback(self, msg: PoseStamped) -> None:
+        received_at = time.monotonic()
+        if not self._pose_is_fresh(
+                msg, received_at,
+                float(self.get_parameter('tag_front_pose_max_age_sec').value)):
+            return
+        if self.last_dock_pose is not None and (
+                Time.from_msg(msg.header.stamp).nanoseconds
+                <= Time.from_msg(self.last_dock_pose.header.stamp).nanoseconds):
+            return
         self.last_dock_pose = msg
-        self.last_dock_pose_received_at = time.monotonic()
+        self.last_dock_pose_received_at = received_at
         self.dock_pose_sequence += 1
 
     def _refinement_target_callback(self, msg: PoseStamped) -> None:
         self.last_refinement_target_pose = msg
         self.last_refinement_target_received_at = time.monotonic()
+
+    def _pose_is_fresh(
+            self, pose: PoseStamped | None, received_at: float,
+            max_age: float) -> bool:
+        # A recently delivered (or republished) message can still describe an
+        # old camera observation. Check both clocks without restamping it.
+        return (
+            pose is not None and received_at > 0.0
+            and 0.0 <= time.monotonic() - received_at <= max_age
+            and header_stamp_is_acceptable(
+                Time.from_msg(pose.header.stamp).nanoseconds, 0,
+                self.get_clock().now().nanoseconds, int(max_age * 1e9),
+                50_000_000))
 
     def _refine_tag_front_pose(self) -> bool:
         if not bool(self.get_parameter('use_tag_pose_refinement').value):
@@ -411,15 +488,16 @@ class DockTurnBackup(Node):
             'tag_refinement_longitudinal_tolerance',
             'tag_refinement_lateral_tolerance',
             'tag_refinement_yaw_tolerance',
+            'tag_refinement_stationary_linear_speed',
             'tag_refinement_linear_kp',
             'tag_refinement_angular_k_alpha',
             'tag_refinement_angular_k_beta',
             'tag_refinement_final_yaw_kp',
             'tag_refinement_max_linear_speed',
             'tag_refinement_max_angular_speed',
-            'tag_refinement_max_initial_longitudinal',
-            'tag_refinement_max_initial_lateral',
-            'tag_refinement_max_initial_yaw',
+            'tag_refinement_translation_heading_limit',
+            'tag_refinement_recovery_max_angular_speed',
+            'tag_refinement_max_initial_distance',
             'tag_refinement_max_travel',
             'tag_refinement_max_yaw_excursion',
             'tag_refinement_control_rate_hz',
@@ -437,9 +515,18 @@ class DockTurnBackup(Node):
                 not all(math.isfinite(value) for value in values.values())
                 or any(values[name] <= 0.0 for name in positive_names)
                 or values['tag_refinement_angular_k_beta'] >= 0.0
+                or values['tag_refinement_translation_heading_limit'] >
+                math.radians(45.0)
                 or stable_cycles < 1):
             return self._tag_refinement_failure(
                 'Tag refinement parameters are outside safe bounds')
+
+        try:
+            yaw_controller = PrecisionYawController(
+                values['tag_refinement_max_angular_speed'],
+                values['tag_refinement_recovery_max_angular_speed'])
+        except ValueError as exc:
+            return self._tag_refinement_failure(str(exc))
 
         # When DockRobot starts inside its 15 cm completion radius, the action
         # can finish in the same executor cycle that /dock_pose is published.
@@ -449,27 +536,20 @@ class DockTurnBackup(Node):
             time.monotonic()
             + values['tag_refinement_target_wait_timeout_sec'])
         while rclpy.ok() and not self.should_stop():
-            target_age = (
-                time.monotonic() - self.last_refinement_target_received_at
-                if self.last_refinement_target_received_at > 0.0
-                else math.inf)
-            if (
-                    self.last_refinement_target_pose is not None
-                    and target_age <= values[
-                        'tag_refinement_target_max_age_sec']):
+            if self._pose_is_fresh(
+                    self.last_refinement_target_pose,
+                    self.last_refinement_target_received_at,
+                    values['tag_refinement_target_max_age_sec']):
                 break
             if time.monotonic() >= target_wait_deadline:
                 break
             rclpy.spin_once(self, timeout_sec=0.05)
 
         target = self.last_refinement_target_pose
-        target_age = (
-            time.monotonic() - self.last_refinement_target_received_at
-            if self.last_refinement_target_received_at > 0.0
-            else math.inf)
         fixed_frame = str(self.get_parameter('fixed_frame').value)
-        if target is None or target_age > values[
-                'tag_refinement_target_max_age_sec']:
+        if not self._pose_is_fresh(
+                target, self.last_refinement_target_received_at,
+                values['tag_refinement_target_max_age_sec']):
             return self._tag_refinement_failure(
                 'No fresh filtered Nav2 dock pose is available for refinement')
         if target.header.frame_id != fixed_frame:
@@ -498,18 +578,29 @@ class DockTurnBackup(Node):
         initial_errors = self._fixed_goal_errors_in_target(
             target_x, target_y, target_yaw,
             current_x, current_y, current_yaw)
+        initial_base_errors = self._fixed_goal_errors_in_base(
+            target_x, target_y, target_yaw,
+            current_x, current_y, current_yaw)
+        initial_distance = math.hypot(initial_errors[0], initial_errors[1])
+        planned_yaw_excursion, initial_bearing = (
+            self._planned_refinement_yaw_excursion(
+                initial_base_errors[0], initial_base_errors[1],
+                initial_errors[2],
+                values['tag_refinement_translation_heading_limit']))
         if (
-                abs(initial_errors[0]) > values[
-                    'tag_refinement_max_initial_longitudinal']
-                or abs(initial_errors[1]) > values[
-                    'tag_refinement_max_initial_lateral']
-                or abs(initial_errors[2]) > values[
-                    'tag_refinement_max_initial_yaw']):
+                initial_distance > values[
+                    'tag_refinement_max_initial_distance']
+                or planned_yaw_excursion > values[
+                    'tag_refinement_max_yaw_excursion']):
             return self._tag_refinement_failure(
                 'Refusing an unexpectedly large tag refinement: '
                 f'x={initial_errors[0]:+.3f}m, '
                 f'y={initial_errors[1]:+.3f}m, '
-                f'yaw={math.degrees(initial_errors[2]):+.2f}deg')
+                f'distance={initial_distance:.3f}m, '
+                f'yaw={math.degrees(initial_errors[2]):+.2f}deg, '
+                f'bearing={math.degrees(initial_bearing):+.2f}deg, '
+                'planned_yaw_excursion='
+                f'{math.degrees(planned_yaw_excursion):.2f}deg')
 
         self.motion.stop_robot()
         self.get_logger().info(
@@ -517,23 +608,35 @@ class DockTurnBackup(Node):
             'dock pose: '
             f'x={initial_errors[0]:+.3f}m, '
             f'y={initial_errors[1]:+.3f}m, '
-            f'yaw={math.degrees(initial_errors[2]):+.2f}deg')
+            f'distance={initial_distance:.3f}m, '
+            f'yaw={math.degrees(initial_errors[2]):+.2f}deg, '
+            f'bearing={math.degrees(initial_bearing):+.2f}deg, '
+            'planned_yaw_excursion='
+            f'{math.degrees(planned_yaw_excursion):.2f}deg')
 
+        longitudinal, lateral, yaw_error = initial_errors
         start_yaw = current_yaw
         previous_x = current_x
         previous_y = current_y
         traveled = 0.0
-        stable_count = 0
+        stability = UniqueScanStability(
+            stable_cycles, self.motion.odom_sequence)
         last_log_time = 0.0
         deadline = time.monotonic() + values['tag_refinement_timeout_sec']
         period = 1.0 / values['tag_refinement_control_rate_hz']
+        aligning_yaw = False
+        bearing_controller = PrecisionYawController(
+            values['tag_refinement_max_angular_speed'],
+            values['tag_refinement_recovery_max_angular_speed'])
 
         while rclpy.ok() and not self.should_stop():
-            rclpy.spin_once(self, timeout_sec=period)
+            spin_for(self, period, self.should_stop)
             now = time.monotonic()
             if now >= deadline:
                 return self._tag_refinement_failure(
-                    'Tag pose refinement timed out', traveled)
+                    'Tag pose refinement timed out: '
+                    f'x={longitudinal:+.3f}m, y={lateral:+.3f}m, '
+                    f'yaw={math.degrees(yaw_error):+.2f}deg', traveled)
             if not self.motion.odom_is_fresh():
                 return self._tag_refinement_failure(
                     'Odometry became stale during tag refinement', traveled)
@@ -547,10 +650,15 @@ class DockTurnBackup(Node):
                 current_yaw - start_yaw))
             if traveled > values['tag_refinement_max_travel']:
                 return self._tag_refinement_failure(
-                    'Tag refinement exceeded its travel limit', traveled)
+                    'Tag refinement exceeded its travel limit: '
+                    f'{traveled:.3f}m > '
+                    f'{values["tag_refinement_max_travel"]:.3f}m', traveled)
             if yaw_excursion > values['tag_refinement_max_yaw_excursion']:
                 return self._tag_refinement_failure(
-                    'Tag refinement exceeded its yaw excursion limit', traveled)
+                    'Tag refinement exceeded its yaw excursion limit: '
+                    f'{math.degrees(yaw_excursion):.2f}deg > '
+                    f'{math.degrees(values["tag_refinement_max_yaw_excursion"]):.2f}deg',
+                    traveled)
 
             # Position tolerances belong to the frozen dock pose axes.  If they
             # were evaluated in the rotating base frame, a final in-place yaw
@@ -571,10 +679,15 @@ class DockTurnBackup(Node):
                     'tag_refinement_lateral_tolerance'])
             within_yaw = abs(yaw_error) <= values[
                 'tag_refinement_yaw_tolerance']
-            stable_count = (
-                stable_count + 1 if within_position and within_yaw else 0)
+            settled = (
+                within_position and within_yaw
+                and self.motion.is_stationary(values[
+                    'tag_refinement_stationary_linear_speed']))
+            if not settled:
+                stability.reset()
+            complete = stability.observe(self.motion.odom_sequence, settled)
 
-            if stable_count >= stable_cycles:
+            if complete:
                 self.motion.stop_robot()
                 self.get_logger().info(
                     'Tag pose refinement complete: '
@@ -583,18 +696,59 @@ class DockTurnBackup(Node):
                     f'travel={traveled:.3f}m')
                 return True
 
+            # Finish the in-place turn before responding to small position
+            # changes at the tolerance boundary. Success still checks both.
+            aligning_yaw = within_position or (aligning_yaw and not within_yaw)
             linear_x, angular_z = self._tag_refinement_command(
                 base_longitudinal,
                 base_lateral,
                 yaw_error,
-                within_position,
+                aligning_yaw,
                 values['tag_refinement_linear_kp'],
                 values['tag_refinement_angular_k_alpha'],
                 values['tag_refinement_angular_k_beta'],
                 values['tag_refinement_final_yaw_kp'],
                 values['tag_refinement_max_linear_speed'],
                 values['tag_refinement_max_angular_speed'],
+                values['tag_refinement_translation_heading_limit'],
             )
+            measured_rate, measured_source = (
+                self.motion.current_stationary_yaw_rate())
+            wheel_rate = self.motion.current_odom_yaw_rate()
+            _, _, drive_bearing = self._point_drive_geometry(
+                base_longitudinal, base_lateral)
+            aligning_position_heading = (
+                not aligning_yaw
+                and abs(drive_bearing) >= values[
+                    'tag_refinement_translation_heading_limit'])
+            if aligning_yaw and not within_yaw:
+                bearing_controller.reset()
+                angular_z = yaw_controller.update(
+                    yaw_error, measured_rate, wheel_rate, now,
+                    values['tag_refinement_final_yaw_kp'],
+                    allow_recovery=self.motion.imu_is_fresh())
+                if yaw_controller.fault:
+                    return self._tag_refinement_failure(
+                        f'{yaw_controller.fault}; '
+                        f'yaw={math.degrees(yaw_error):+.2f}deg, '
+                        f'gyro_or_wheel_rate={measured_rate:+.4f}rad/s, '
+                        f'wheel_rate={wheel_rate:+.4f}rad/s', traveled)
+            elif aligning_position_heading:
+                yaw_controller.reset()
+                angular_z = bearing_controller.update(
+                    drive_bearing, measured_rate, wheel_rate, now,
+                    values['tag_refinement_angular_k_alpha'],
+                    allow_recovery=self.motion.imu_is_fresh())
+                if bearing_controller.fault:
+                    return self._tag_refinement_failure(
+                        f'{bearing_controller.fault} while aligning to the '
+                        'target point; '
+                        f'bearing={math.degrees(drive_bearing):+.2f}deg, '
+                        f'gyro_or_wheel_rate={measured_rate:+.4f}rad/s, '
+                        f'wheel_rate={wheel_rate:+.4f}rad/s', traveled)
+            else:
+                yaw_controller.reset()
+                bearing_controller.reset()
             if within_position and within_yaw:
                 linear_x = 0.0
                 angular_z = 0.0
@@ -602,13 +756,24 @@ class DockTurnBackup(Node):
                 linear_x=linear_x, angular_z=angular_z))
 
             if now - last_log_time >= 1.0:
+                phase = (
+                    'yaw' if aligning_yaw
+                    else 'point_heading' if aligning_position_heading
+                    else 'position')
                 self.get_logger().info(
                     'Tag refinement: '
                     f'x={longitudinal:+.3f}m, y={lateral:+.3f}m, '
                     f'yaw={math.degrees(yaw_error):+.2f}deg, '
                     f'cmd=({linear_x:+.3f}m/s, '
                     f'{angular_z:+.3f}rad/s), '
-                    f'stable={stable_count}/{stable_cycles}')
+                    f'stable={stability.count}/{stable_cycles}, '
+                    f'phase={phase}, '
+                    f'bearing={math.degrees(drive_bearing):+.2f}deg, '
+                    f'remaining={max(deadline - now, 0.0):.1f}s, '
+                    f'measured_rate={measured_rate:+.4f}rad/s '
+                    f'({measured_source}), '
+                    f'wheel_rate={wheel_rate:+.4f}rad/s, '
+                    f'recovery_floor={yaw_controller.recovery_floor:.3f}rad/s')
                 last_log_time = now
 
         self.motion.stop_robot()
@@ -630,6 +795,10 @@ class DockTurnBackup(Node):
     @staticmethod
     def _quaternion_yaw(
             x: float, y: float, z: float, w: float) -> float:
+        norm = math.hypot(x, y, z, w)
+        if not math.isfinite(norm) or norm < 1e-6:
+            return math.nan
+        x, y, z, w = (value / norm for value in (x, y, z, w))
         return math.atan2(
             2.0 * (w * z + x * y),
             1.0 - 2.0 * (y * y + z * z),
@@ -676,34 +845,60 @@ class DockTurnBackup(Node):
             linear_kp: float, angular_k_alpha: float,
             angular_k_beta: float, final_yaw_kp: float,
             max_linear_speed: float,
-            max_angular_speed: float) -> tuple[float, float]:
+            max_angular_speed: float,
+            translation_heading_limit: float = math.radians(8.0),
+            ) -> tuple[float, float]:
         if within_position:
             linear_x = 0.0
             angular_z = final_yaw_kp * yaw_error
         else:
-            distance = math.hypot(longitudinal, lateral)
-            bearing = math.atan2(lateral, longitudinal)
-            direction = 1.0
-            if math.cos(bearing) < 0.0:
-                direction = -1.0
-                bearing = math.atan2(
-                    math.sin(bearing - math.pi),
-                    math.cos(bearing - math.pi),
-                )
-            terminal_heading = math.atan2(
-                math.sin(yaw_error - bearing),
-                math.cos(yaw_error - bearing),
-            )
-            linear_x = direction * linear_kp * distance
-            angular_z = (
-                angular_k_alpha * bearing
-                + angular_k_beta * terminal_heading)
+            distance, direction, bearing = (
+                DockTurnBackup._point_drive_geometry(longitudinal, lateral))
+            # First face the target point, then translate, and only after the
+            # position settles rotate to the final dock yaw. Mixing terminal
+            # yaw into this phase made the real robot keep turning while it
+            # missed a nearby lateral target. Fade translation to zero as the
+            # point bearing reaches the configured limit.
+            heading_scale = max(
+                0.0, 1.0 - abs(bearing) / translation_heading_limit)
+            linear_x = direction * linear_kp * distance * heading_scale
+            angular_z = angular_k_alpha * bearing
+
+        # Retained in the signature for compatibility with existing tuning
+        # calls. Terminal-heading feedback is intentionally deferred above.
+        _ = angular_k_beta
 
         linear_x = max(
             -max_linear_speed, min(max_linear_speed, linear_x))
         angular_z = max(
             -max_angular_speed, min(max_angular_speed, angular_z))
         return linear_x, angular_z
+
+    @staticmethod
+    def _point_drive_geometry(
+            longitudinal: float, lateral: float,
+            ) -> tuple[float, float, float]:
+        distance = math.hypot(longitudinal, lateral)
+        bearing = math.atan2(lateral, longitudinal)
+        direction = 1.0
+        if math.cos(bearing) < 0.0:
+            direction = -1.0
+            bearing = math.atan2(
+                math.sin(bearing - math.pi),
+                math.cos(bearing - math.pi),
+            )
+        return distance, direction, bearing
+
+    @staticmethod
+    def _planned_refinement_yaw_excursion(
+            base_longitudinal: float, base_lateral: float,
+            final_yaw_error: float, translation_heading_limit: float,
+            ) -> tuple[float, float]:
+        """Return the largest planned offset from the refinement start yaw."""
+        _, _, bearing = DockTurnBackup._point_drive_geometry(
+            base_longitudinal, base_lateral)
+        point_turn = max(abs(bearing) - translation_heading_limit, 0.0)
+        return max(point_turn, abs(final_yaw_error)), bearing
 
     def _verify_tag_front_stop_pose(self) -> bool:
         if not bool(self.get_parameter('verify_tag_front_stop_pose').value):
@@ -759,10 +954,11 @@ class DockTurnBackup(Node):
             last_sequence = self.dock_pose_sequence
 
             pose = self.last_dock_pose
-            pose_is_fresh = (
-                pose is not None
-                and self.last_dock_pose_received_at > 0.0
-                and now - self.last_dock_pose_received_at <= max_age)
+            pose_is_fresh = self._pose_is_fresh(
+                pose, self.last_dock_pose_received_at, max_age)
+            pose_is_fresh = pose_is_fresh and (
+                pose.header.frame_id.lstrip('/')
+                == str(self.get_parameter('base_frame').value).lstrip('/'))
             if not pose_is_fresh:
                 stable_count = 0
                 continue
@@ -835,14 +1031,25 @@ class DockTurnBackup(Node):
             self.get_logger().error(
                 'Docking step failed: '
                 f'status={result.status}, error_code={dock_result.error_code}, '
+                f'retries={dock_result.num_retries}, '
                 f'error_msg="{dock_result.error_msg}"')
+            if dock_result.error_code == DockRobot.Result.FAILED_TO_DETECT_DOCK:
+                self.get_logger().error(
+                    'Dock detection was lost during approach. Check rectifier '
+                    'image/CameraInfo/pair counters, transport delay and tag visibility; '
+                    'cached tag TF is intentionally not treated as a new detection.')
             return False
 
         self.get_logger().info(
-            'Docking step complete; robot is at the tag-front stop point')
+            'Docking step complete; robot is at the tag-front stop point; '
+            f'retries={dock_result.num_retries}')
         return True
 
     def _send_and_wait(self, client: ActionClient, goal: Any) -> Any:
+        # Recheck immediately before sending, including externally managed mode.
+        if not self._dock_server_is_unique():
+            self.get_logger().error('A unique docking action server is not available')
+            return None
         send_future = client.send_goal_async(goal)
         if not self._wait_for_future(send_future):
             return None
@@ -863,7 +1070,18 @@ class DockTurnBackup(Node):
                 rclpy.spin_once(self, timeout_sec=0.05)
             self.get_logger().warn('Docking action was cancelled during shutdown')
             return None
-        return result_future.result()
+        result = result_future.result()
+        if result is not None and result.status == GoalStatus.STATUS_UNKNOWN:
+            self.get_logger().error(
+                'Docking action returned STATUS_UNKNOWN for an accepted goal. '
+                'The responding server does not know this goal; check duplicate '
+                f'servers or server restarts on {self.stack.dock_action}.')
+            cancel_future = goal_handle.cancel_goal_async()
+            deadline = time.monotonic() + 1.0
+            while rclpy.ok() and not cancel_future.done() and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.05)
+            return None
+        return result
 
     def _wait_for_future(self, future: Any) -> bool:
         while rclpy.ok() and not self.should_stop():
@@ -933,7 +1151,8 @@ def main(args=None) -> int:
             else:
                 cli_args.extend([
                     '--ros-args', '--params-file', default_params])
-        rclpy.init(args=cli_args)
+        # Keep ROS alive until zero velocity and child cleanup have finished.
+        rclpy.init(args=cli_args, signal_handler_options=SignalHandlerOptions.NO)
         node = DockTurnBackup()
         if pending_signal is not None:
             node.request_stop(pending_signal)

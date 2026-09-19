@@ -101,3 +101,13 @@ def test_invalid_new_messages_do_not_refresh_last_usable_scan():
 
     assert lidar.snapshot() is None
     assert lidar.last_valid_received_at == last_valid_received_at
+
+
+def test_delayed_scan_expires_by_acquisition_time_even_just_after_receipt():
+    lidar = make_lidar_without_subscription()
+    lidar._scan_callback(valid_scan_with_stamp(9, 510_000_000))
+    assert lidar.snapshot() is not None
+
+    lidar.node.clock.nanoseconds += 20_000_000
+    assert lidar.snapshot() is None
+    assert 'expired' in lidar.last_error
