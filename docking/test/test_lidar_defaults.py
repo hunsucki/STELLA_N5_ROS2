@@ -103,8 +103,12 @@ def test_declared_lidar_defaults_match_new_mount_contract():
     assert node.defaults['use_tag_pose_refinement'] is True
     assert node.defaults['tag_refinement_target_pose_topic'] == '/dock_pose'
     assert node.defaults['tag_refinement_target_wait_timeout_sec'] == 1.0
-    assert node.defaults['tag_refinement_longitudinal_tolerance'] == 0.04
-    assert node.defaults['tag_refinement_lateral_tolerance'] == 0.025
+    assert node.defaults['tag_refinement_longitudinal_tolerance'] == 0.02
+    assert node.defaults['tag_refinement_lateral_tolerance'] == 0.010
+    assert node.defaults['use_lidar_tag_centering'] is False
+    assert node.defaults['use_apriltag_front_centering'] is True
+    assert node.defaults['tag_centering_lidar_topic'] == '/scan'
+    assert node.defaults['tag_centering_lidar_frame'] == 'base_scan'
     assert node.defaults['tag_refinement_yaw_tolerance'] == math.radians(2.0)
     assert node.defaults['tag_refinement_timeout_sec'] == 45.0
     assert node.defaults['tag_refinement_translation_heading_limit'] == (
@@ -124,7 +128,7 @@ def test_declared_lidar_defaults_match_new_mount_contract():
     assert node.defaults['lidar_align_tracking_outlier_cycles'] == 2
     assert node.defaults['lidar_align_hard_tracking_residual'] == (
         math.radians(12.0))
-    assert node.defaults['lidar_guide_sector_width'] == math.radians(150.0)
+    assert node.defaults['lidar_guide_sector_width'] == math.radians(220.0)
     assert node.defaults['lidar_guide_min_abs_y'] == 0.14
     assert node.defaults['lidar_guide_max_abs_y'] == 0.40
     assert node.defaults['lidar_guide_min_separation'] == 0.44
@@ -284,8 +288,19 @@ def test_latest_logged_pose_is_feasible_inside_runtime_yaw_envelope():
         base_longitudinal, base_lateral, final_yaw, math.radians(8.0))
 
     assert math.degrees(bearing) == pytest.approx(28.40, abs=0.02)
-    assert math.degrees(excursion) == pytest.approx(26.18)
+    assert math.degrees(excursion) == pytest.approx(28.40, abs=0.02)
     assert excursion < math.radians(30.0)
+
+
+@pytest.mark.parametrize('side', [-1, 1])
+def test_trial28_full_point_turn_exceeds_existing_yaw_budget(side):
+    bearing = side * math.radians(32.84)
+    excursion, actual_bearing = DockTurnBackup._planned_refinement_yaw_excursion(
+        .173 * math.cos(bearing), .173 * math.sin(bearing),
+        -side * math.radians(8.96), math.radians(8))
+    assert actual_bearing == pytest.approx(bearing)
+    assert excursion == pytest.approx(abs(bearing))
+    assert excursion > math.radians(30)
 
 
 def test_positive_point_turn_reduces_positive_target_bearing():
@@ -314,11 +329,15 @@ def test_camera_approach_keeps_room_for_the_spin():
 
     assert parameters['max_retries'] == 1
     assert parameters['simple_charging_dock']['filter_coef'] == 0.1
-    assert parameters['simple_charging_dock']['docking_threshold'] == 0.15
+    assert parameters['simple_charging_dock']['docking_threshold'] == 0.45
     assert parameters['controller']['v_linear_max'] == 0.10
     assert parameters['controller']['v_linear_min'] == 0.05
 
     helper_parameters = config['dock_turn_backup']['ros__parameters']
+    assert helper_parameters['apriltag_front_standoff'] == pytest.approx(
+        -parameters['simple_charging_dock']['external_detection_translation_x'])
+    assert helper_parameters['use_apriltag_front_centering'] is True
+    assert helper_parameters['use_lidar_tag_centering'] is False
     assert helper_parameters['use_tag_pose_refinement'] is True
     assert helper_parameters['use_pre_spin_forward'] is False
     assert helper_parameters['tag_refinement_abort_on_failure'] is True
@@ -332,6 +351,12 @@ def test_camera_approach_keeps_room_for_the_spin():
     assert helper_parameters['backup_lidar_heading_max_error'] == pytest.approx(
         math.radians(8.0))
     assert helper_parameters['use_lidar_guide_centering'] is True
+    assert helper_parameters['tag_refinement_longitudinal_tolerance'] == .02
+    assert helper_parameters['tag_refinement_lateral_tolerance'] == .025
+    assert helper_parameters['tag_refinement_max_initial_distance'] >= (
+        parameters['simple_charging_dock']['docking_threshold'] + .03)
+    assert helper_parameters['tag_refinement_max_travel'] >= (
+        parameters['simple_charging_dock']['docking_threshold'])
     assert helper_parameters['lidar_align_timeout_sec'] == 18.0
     assert helper_parameters['lidar_align_ransac_threshold'] == .010
     assert helper_parameters['lidar_align_tracking_outlier_cycles'] == 2

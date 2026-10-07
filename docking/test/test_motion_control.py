@@ -100,6 +100,19 @@ def test_absolute_odom_spin_slows_down_and_corrects_small_overshoot():
     assert correction < 0.0
 
 
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_spin_startup_noise_cannot_reverse_requested_direction(direction):
+    controller = MotionController.__new__(MotionController)
+    start = math.radians(-2.76)
+    target = MotionController.normalize_angle(start + direction * math.pi)
+    for jitter in [.02, -.03, .1, -.2, .4, -1.0, 2.0]:
+        controller.current_yaw = lambda: start + math.radians(jitter)
+        command = controller._spin_angular_velocity(
+            target, direction, math.radians(2), math.radians(30), .03, .15)
+        assert command * direction > 0
+        assert abs(command) <= .15
+
+
 def test_backup_speed_slows_near_rear_target():
     assert MotionController._backup_speed_for_clearance(
         0.20, 0.01, 0.15, 0.015, 0.05) == 0.05
@@ -257,7 +270,7 @@ def test_guide_center_heading_steers_reverse_path_toward_opening_center():
         kp=0.35,
         max_heading=math.radians(2.0),
     )
-    assert heading == pytest.approx(-math.radians(2.0))
+    assert heading == pytest.approx(-0.35 * (0.10 - 0.015))
     assert MotionController._backup_guide_center_heading(
         -0.05, 0.015, 0.35, math.radians(2.0)) > 0.0
     assert MotionController._backup_guide_center_heading(
@@ -271,6 +284,16 @@ def test_valid_lidar_plane_overrides_dead_reckoning_drift_abort():
     assert not exceeded('lidar', math.radians(8.0), limit)
     assert exceeded('imu_gyro', math.radians(5.1), limit)
     assert exceeded('wheel_odom', math.radians(-5.1), limit)
+
+
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_guide_steering_has_no_jump_at_deadband(direction):
+    heading = MotionController._backup_guide_center_heading
+    inside = heading(direction * .004999, .005, 1, .07, .25)
+    outside = heading(direction * .005001, .005, 1, .07, .25)
+    assert inside == 0
+    assert abs(outside - inside) < .00001
+    assert outside * direction < 0
 
 
 def test_backup_pauses_for_large_lidar_error_and_resumes_after_stability():

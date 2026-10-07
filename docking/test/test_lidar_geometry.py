@@ -1,4 +1,5 @@
 import math
+import random
 
 from docking.lidar_geometry import (
     effective_range_limits,
@@ -40,6 +41,47 @@ def project(ranges, angle_min, angle_increment):
         0.05,
         2.0,
     )
+
+
+@pytest.mark.parametrize('increment', [math.pi / 180.0, -math.pi / 180.0])
+@pytest.mark.parametrize('yaw', [0.0, math.pi, -0.72])
+@pytest.mark.parametrize('width', [20.0, 60.0, 360.0])
+def test_cached_projection_matches_original_geometry_with_changing_ranges(
+        increment, yaw, width):
+    rng = random.Random(42)
+    mount = PlanarTransform(-0.166, 0.02, yaw)
+    center = math.pi
+    width = math.radians(width)
+    for count in (361, 720, 361):
+        ranges = [rng.choice([math.inf, math.nan, rng.uniform(0.01, 4.0)])
+                  for _ in range(count)]
+        expected = []
+        for index, distance in enumerate(ranges):
+            angle = -math.pi + index * increment
+            ray = math.atan2(math.sin(angle + yaw), math.cos(angle + yaw))
+            delta = math.atan2(math.sin(ray - center), math.cos(ray - center))
+            if abs(delta) > width / 2.0 or not 0.05 <= distance <= 2.0:
+                continue
+            x, y = distance * math.cos(angle), distance * math.sin(angle)
+            expected.append((index,
+                             mount.x + math.cos(yaw) * x - math.sin(yaw) * y,
+                             mount.y + math.sin(yaw) * x + math.cos(yaw) * y,
+                             distance))
+        actual = project_scan_to_base(
+            ranges, -math.pi, increment, 0.05, 12.0,
+            mount, center, width, 0.05, 2.0)
+        # Identical beam selection and arithmetic, including sector boundaries.
+        assert [(p.beam_index, p.x, p.y, p.distance) for p in actual] == expected
+
+
+@pytest.mark.parametrize('mount', [
+    PlanarTransform(math.nan, 0.0, 0.0),
+    PlanarTransform(0.0, math.inf, 0.0),
+    PlanarTransform(0.0, 0.0, math.inf),
+])
+def test_projection_rejects_invalid_transform(mount):
+    assert project_scan_to_base(
+        [1.0], 0.0, 0.01, 0.05, 12.0, mount, 0.0, 1.0, 0.05, 2.0) is None
 
 
 def test_new_mount_rear_clearance_at_target():

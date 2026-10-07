@@ -100,17 +100,17 @@ public:
     }
 
     yaw_diagnostics_pub_ = create_publisher<geometry_msgs::msg::Vector3Stamped>(
-      "wheel_odometry/yaw_diagnostics", rclcpp::QoS(10));
+      "wheel_odometry/yaw_diagnostics", rclcpp::QoS(1).best_effort());
     if (enabled_)
     {
       create_output_publishers();
     }
 
     wheel_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-      wheel_topic_, rclcpp::QoS(10),
+      wheel_topic_, rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&WheelOdometryNode::wheel_callback, this, std::placeholders::_1));
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic_, rclcpp::QoS(10),
+      imu_topic_, rclcpp::SensorDataQoS(),
       std::bind(&WheelOdometryNode::imu_callback, this, std::placeholders::_1));
 
     RCLCPP_INFO(
@@ -479,11 +479,13 @@ private:
   {
     if (!odom_pub_)
     {
-      odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::QoS(10));
+      odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::QoS(1));
     }
     if (publish_tf_ && !tf_broadcaster_)
     {
-      tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+      // A slow remote TF listener must not accumulate 100 old odom poses and
+      // block the encoder callback. Keep reliable compatibility with TF listeners.
+      tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this, rclcpp::QoS(1));
     }
   }
 

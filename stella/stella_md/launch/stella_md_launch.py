@@ -11,6 +11,8 @@ def generate_launch_description():
     encoder_poll_rate_hz = LaunchConfiguration('encoder_poll_rate_hz')
     enable_legacy_odom = LaunchConfiguration('enable_legacy_odom')
     cpu_affinity = LaunchConfiguration('cpu_affinity')
+    cmd_vel_timeout_sec = LaunchConfiguration('cmd_vel_timeout_sec')
+    serial_transaction_timeout_ms = LaunchConfiguration('serial_transaction_timeout_ms')
 
     driver_node = LifecycleNode(package='stella_md',
                                 executable='stella_md_node',
@@ -29,7 +31,10 @@ def generate_launch_description():
                                     'imu_yaw_max_rate': 2.0,
                                     'imu_yaw_filter_tau_sec': 0.0,
                                     'imu_yaw_jump_warn_threshold': 0.25,
-                                    'cmd_vel_timeout_sec': 0.5,
+                                    'cmd_vel_timeout_sec': ParameterValue(
+                                        cmd_vel_timeout_sec, value_type=float),
+                                    'serial_transaction_timeout_ms': ParameterValue(
+                                        serial_transaction_timeout_ms, value_type=int),
                                 }],
                                 namespace='/',
                                 )
@@ -45,5 +50,11 @@ def generate_launch_description():
        DeclareLaunchArgument(
            'cpu_affinity', default_value='2',
            description='Linux CPU core list assigned to the motor driver'),
+       DeclareLaunchArgument(
+           'cmd_vel_timeout_sec', default_value='0.5',
+           description='Stop after this many seconds without /cmd_vel; 0 disables'),
+       DeclareLaunchArgument(
+           'serial_transaction_timeout_ms', default_value='100',
+           description='Deadline for each motor serial transaction (10-500 ms)'),
        driver_node,
     ])

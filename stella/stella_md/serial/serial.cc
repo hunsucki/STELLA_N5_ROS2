@@ -10,6 +10,7 @@
 #endif
 
 #include "serial.h"
+#include "serial_deadline.hpp"
 
 #ifdef _WIN32
 #include "serial/impl/win.h"
@@ -98,7 +99,16 @@ Serial::isOpen () const
 size_t
 Serial::available ()
 {
-  return pimpl_->available ();
+  motor_serial::check_deadline();
+  size_t count = pimpl_->available();
+  if (count == 0) {
+    // Wait in the kernel instead of continuously issuing TIOCINQ ioctls.
+    // A short wait keeps the vendor parser responsive to partial packets.
+    pimpl_->waitReadable(2);
+    motor_serial::check_deadline();
+    count = pimpl_->available();
+  }
+  return count;
 }
 
 bool
@@ -117,14 +127,20 @@ Serial::waitByteTimes (size_t count)
 size_t
 Serial::read_ (uint8_t *buffer, size_t size)
 {
-  return this->pimpl_->read (buffer, size);
+  motor_serial::check_deadline();
+  const size_t received = this->pimpl_->read (buffer, size);
+  motor_serial::check_deadline();
+  return received;
 }
 
 size_t
 Serial::read (uint8_t *buffer, size_t size)
 {
   ScopedReadLock lock(this->pimpl_);
-  return this->pimpl_->read (buffer, size);
+  motor_serial::check_deadline();
+  const size_t received = this->pimpl_->read (buffer, size);
+  motor_serial::check_deadline();
+  return received;
 }
 
 size_t
@@ -177,6 +193,12 @@ size_t
 Serial::readline (string &buffer, size_t size, string eol)
 {
   ScopedReadLock lock(this->pimpl_);
+  const bool motor_transaction = motor_serial::deadline_state().active;
+  if (motor_transaction) {
+    // The vendor ASCII command parser copies this line into a 100-byte buffer
+    // although it asks readline for 65536 bytes. Reject long/corrupt replies.
+    size = std::min(size, static_cast<size_t>(96));
+  }
   size_t eol_len = eol.length ();
   uint8_t *buffer_ = static_cast<uint8_t*>
                               (alloca (size * sizeof (uint8_t)));
@@ -196,6 +218,10 @@ Serial::readline (string &buffer, size_t size, string eol)
     if (read_so_far == size) {
       break; // Reached the maximum read length
     }
+  }
+  if (motor_transaction && (read_so_far < eol_len ||
+    string(reinterpret_cast<const char *>(buffer_ + read_so_far - eol_len), eol_len) != eol)) {
+    throw std::runtime_error("Incomplete or oversized motor command acknowledgement");
   }
   buffer.append(reinterpret_cast<const char*> (buffer_), read_so_far);
   return read_so_far;
@@ -276,6 +302,7 @@ Serial::write (const uint8_t *data, size_t size)
 size_t
 Serial::write_ (const uint8_t *data, size_t length)
 {
+  motor_serial::check_deadline();
   return pimpl_->write (data, length);
 }
 

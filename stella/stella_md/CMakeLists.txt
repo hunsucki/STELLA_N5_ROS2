@@ -52,6 +52,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_encoder_unwrap test/test_encoder_unwrap.cpp)
   target_include_directories(test_encoder_unwrap PRIVATE "${PROJECT_SOURCE_DIR}/include/mw")
+  ament_add_gtest(test_serial_deadline test/test_serial_deadline.cpp
+    serial/serial.cc serial/unix.cc serial/list_ports_linux.cc)
 endif()
 
 ################################################################################

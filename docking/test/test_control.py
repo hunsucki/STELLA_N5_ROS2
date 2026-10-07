@@ -96,3 +96,90 @@ def test_stale_gyro_does_not_allow_a_stronger_recovery_command():
     assert control.fault == 'cannot recover yaw stall without fresh independent gyro'
     assert max(commands) <= .08
     assert commands[-1] == 0.0
+
+
+@pytest.mark.parametrize('direction', [-1, 1])
+def test_final_yaw_floor_crosses_trial30_wheel_only_low_speed_region(direction):
+    control = PrecisionYawController(minimum_speed=.04)
+    error = direction * math.radians(2.64)
+    gyro = wheel = 0.0
+    commands = []
+    for i in range(120):
+        if abs(error) <= math.radians(1):
+            break
+        command = control.update(error, gyro, wheel, i * .05)
+        assert control.fault is None
+        commands.append(command)
+        wheel = command
+        gyro = .4 * command if abs(command) >= .025 else 0.0
+        error -= gyro * .05
+    assert abs(error) <= math.radians(1)
+    assert i * .05 < 3
+    assert max(abs(c) for c in commands) <= .08
+    assert all(abs(b-a) <= .015 + 1e-9 for a, b in zip(commands, commands[1:]))
+
+
+def test_final_yaw_floor_still_stops_when_only_wheels_turn():
+    control = PrecisionYawController(minimum_speed=.04)
+    command = 0.0
+    for i in range(60):
+        command = control.update(math.radians(1.05), 0.0, command, i * .05)
+        if control.fault:
+            break
+    assert control.fault == 'heading is not converging despite measured rotation'
+    assert command == 0.0
+    assert control.recovery_floor == 0.0
+    assert i * .05 <= 2.1
+
+
+@pytest.mark.parametrize('minimum', [-.01, .09, math.nan, math.inf])
+def test_invalid_precision_yaw_minimum_is_rejected(minimum):
+    with pytest.raises(ValueError):
+        PrecisionYawController(minimum_speed=minimum)
+
+
+def test_centerline_stage_needs_distinct_observations_and_ignores_boundary_jitter():
+    from docking.control import CenterlineLatch
+    latch = CenterlineLatch(.025)
+    for _ in range(20):
+        assert not latch.update(1, .02, False)
+        assert latch.pending
+    assert not latch.update(2, .02, False)
+    assert latch.update(3, .02, False)
+    for sequence,lateral in enumerate([.024,.030,.026,.028,.024],4):
+        assert latch.update(sequence,lateral,False)
+    # Returning to straight drive still requires the original tolerance.
+    assert latch.update(9,.030,True) and latch.pending
+    assert latch.update(10,.030,True) and latch.pending
+    assert not latch.update(11,.030,True)
+
+
+def test_persistent_center_drift_and_missing_observations_reset_the_stage():
+    from docking.control import CenterlineLatch
+    latch = CenterlineLatch(.025)
+    for seq in range(3):
+        latch.update(seq,.01,False)
+    assert latch.centered
+    assert latch.update(3,.04,False)
+    assert latch.update(4,.04,False)
+    assert not latch.update(5,.04,False)
+    latch.update(6,.01,False)
+    latch.reset()
+    assert not latch.update(7,.01,False)
+    assert not latch.update(8,math.nan,False)
+    assert not latch.centered
+
+
+def test_axle_centering_keeps_yaw_stage_but_checks_body_before_straight_drive():
+    from docking.control import CenterlineLatch
+    latch = CenterlineLatch(.025, entering_tolerance=.012)
+    for seq in range(3):
+        latch.update(seq,.01,False,settled_lateral=.035)
+    assert latch.centered
+    # Small axle residual during a turn must not restart point steering.
+    assert latch.update(3,.020,False,settled_lateral=.035)
+    assert not latch.pending
+    # Settled heading requires the original body tolerance, regardless of axle.
+    assert latch.update(4,.010,True,settled_lateral=.030) and latch.pending
+    assert latch.update(5,.010,True,settled_lateral=.030) and latch.pending
+    assert not latch.update(6,.010,True,settled_lateral=.030)

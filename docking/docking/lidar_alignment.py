@@ -82,7 +82,11 @@ class LidarPlaneAligner:
             'lidar_align_hard_tracking_residual', math.radians(12.0))
         # The two aluminum guide rails are fitted only after the rear panel
         # establishes the dock-aligned coordinate frame.
-        node.declare_parameter('lidar_guide_sector_width', math.radians(150.0))
+        # During reverse entry the visible rail tips move beside the sensor.
+        # +/-75 deg drops those returns before guide centering is finished.
+        # Include the sides; keep candidates bounded by the same wall-aligned
+        # x/y corridor and retain the two-rail geometry checks.
+        node.declare_parameter('lidar_guide_sector_width', math.radians(220.0))
         node.declare_parameter('lidar_guide_min_range', 0.05)
         node.declare_parameter('lidar_guide_max_range', 1.20)
         node.declare_parameter('lidar_guide_min_abs_y', 0.14)

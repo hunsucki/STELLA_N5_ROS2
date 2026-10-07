@@ -155,3 +155,26 @@ def test_cleanup_signals_launch_once_but_signals_ros2_run_process_group(monkeypa
     launch.send_signal.assert_called_once_with(signal.SIGINT)
     wrapper.send_signal.assert_not_called()
     killpg.assert_called_once_with(wrapper.pid, signal.SIGINT)
+
+
+def test_cleanup_reaps_children_and_removes_params_when_stop_publisher_fails(monkeypatch):
+    failure = RuntimeError('publisher unavailable')
+    stop = Mock(side_effect=failure)
+    stack = ManagedStack(FakeNode(), stop, lambda: False)
+    command = stack._server_command('/usr/bin/ros2')
+    params = Path(command[command.index('--params-file') + 1])
+    running = [True]
+    process = SimpleNamespace(
+        pid=1001, poll=lambda: None if running[0] else 0,
+        wait=lambda timeout: running.__setitem__(0, False))
+    stack.processes = [process]
+    killpg = Mock()
+    monkeypatch.setattr('docking.stack_manager.os.killpg', killpg)
+
+    with pytest.raises(RuntimeError) as caught:
+        stack.cleanup()
+    assert caught.value is failure
+    killpg.assert_called_once_with(process.pid, signal.SIGINT)
+    assert not running[0]
+    assert not params.exists()
+    assert stop.call_count == 3

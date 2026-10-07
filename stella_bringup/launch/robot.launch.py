@@ -17,9 +17,9 @@
 import os
 import yaml
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, ThisLaunchFileDir
 from launch.conditions import IfCondition
@@ -56,6 +56,16 @@ def generate_launch_description():
     imu_cpu_affinity = str(param.get('imu_cpu_affinity', 3))
     launch_wheel_odometry = param.get('launch_wheel_odometry', True)
     enable_legacy_odom = param.get('enable_legacy_odom', False)
+    cmd_vel_timeout_sec = float(param.get('cmd_vel_timeout_sec', 0.5))
+    serial_transaction_timeout_ms = int(param.get('serial_transaction_timeout_ms', 100))
+    environment_actions = []
+    if param.get('guard_dds_udp_send', True):
+        guard_library = os.path.join(
+            get_package_prefix('stella_bringup'), 'lib', 'libstella_dds_udp_guard.so')
+        if not os.path.isfile(guard_library):
+            raise RuntimeError('DDS UDP guard is missing; rebuild stella_bringup')
+        preload = ' '.join(filter(None, [guard_library, os.environ.get('LD_PRELOAD', '')]))
+        environment_actions.append(SetEnvironmentVariable('LD_PRELOAD', preload))
 
     if launch_wheel_odometry and enable_legacy_odom:
         raise RuntimeError(
@@ -98,7 +108,7 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
 
-    return LaunchDescription([
+    return LaunchDescription(environment_actions + [
         DeclareLaunchArgument(
             'use_sim_time',
             default_value=use_sim_time,
@@ -135,6 +145,8 @@ def generate_launch_description():
                 'encoder_poll_rate_hz': str(encoder_poll_rate_hz),
                 'enable_legacy_odom': str(enable_legacy_odom).lower(),
                 'cpu_affinity': motor_cpu_affinity,
+                'cmd_vel_timeout_sec': str(cmd_vel_timeout_sec),
+                'serial_transaction_timeout_ms': str(serial_transaction_timeout_ms),
             }.items()
         ),
 

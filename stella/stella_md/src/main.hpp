@@ -3,6 +3,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
@@ -36,12 +40,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_data_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr ahrs_yaw_sub_;
     
-    rclcpp::Time time_now;
-    
     std::unique_ptr<tf2_ros::TransformBroadcaster> odom_broadcaster;
     
-    double goal_linear_velocity_ = 0.0;
-    double goal_angular_velocity_ = 0.0;
     double imu_timeout_sec_ = 0.0;
     double imu_yaw_max_rate_ = 2.0;
     double imu_yaw_filter_tau_sec_ = 0.0;
@@ -58,6 +58,21 @@ private:
     bool cmd_vel_watchdog_stopped_ = false;
     bool wheel_encoder_initialized_ = false;
     bool previous_legacy_odom_enabled_ = false;
+    // Only the worker touches the vendor serial port and global read values.
+    std::atomic_bool serial_running_{false};
+    std::thread serial_thread_;
+    std::mutex command_mutex_;
+    std::condition_variable command_changed_;
+    double pending_linear_velocity_ = 0.0;
+    double pending_angular_velocity_ = 0.0;
+    std::uint64_t command_sequence_ = 0;
+    std::uint64_t applied_command_sequence_ = 0;
+    int serial_transaction_timeout_ms_ = 100;
+    std::mutex encoder_mutex_;
+    std::int32_t sampled_left_encoder_ = 0;
+    std::int32_t sampled_right_encoder_ = 0;
+    rclcpp::Time sampled_encoder_stamp_{0, 0, RCL_ROS_TIME};
+    bool encoder_sample_pending_ = false;
     std::chrono::steady_clock::time_point last_cmd_vel_time_;
     rclcpp::Time last_wheel_encoder_stamp_{0, 0, RCL_ROS_TIME};
     rclcpp::Time latest_imu_stamp_{0, 0, RCL_ROS_TIME};
@@ -76,6 +91,9 @@ private:
     void ahrs_yaw_data_callback(const std_msgs::msg::Float64::SharedPtr msg);
     void command_velocity_callback(const geometry_msgs::msg::Twist::SharedPtr cmd_vel_msg);
     void serial_callback();
-    void publish_wheel_encoder_state(const rclcpp::Time & stamp);
-    bool update_odometry();
+    void serial_loop();
+    bool apply_pending_command();
+    void publish_wheel_encoder_state(
+        const rclcpp::Time & stamp, std::int32_t left_raw, std::int32_t right_raw);
+    bool update_odometry(std::int32_t left_raw, std::int32_t right_raw);
 };

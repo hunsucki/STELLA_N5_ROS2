@@ -26,6 +26,9 @@
   <exec_depend>stella_description</exec_depend>
   <exec_depend>stella_md</exec_depend>
   <exec_depend>wheel_odometry</exec_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>rmw_cyclonedds_cpp</test_depend>
   <export>
     <build_type>ament_cmake</build_type>
   </export>

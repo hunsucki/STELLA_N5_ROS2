@@ -1,5 +1,6 @@
 """Wireless charger command and physical charging verification."""
 
+import math
 import time
 from typing import Callable
 
@@ -138,11 +139,11 @@ class ChargingVerifier:
             msg.present
             and msg.power_supply_status
             == BatteryState.POWER_SUPPLY_STATUS_CHARGING
+            and math.isfinite(msg.current)
             and msg.current >= min_current)
 
     def _charging_is_stable(self, now: float) -> bool:
-        if not self._charger_is_available(now) or not self._battery_is_charging(now):
-            return False
+        self._update_charging_stability(now)
         if self.charging_since is None:
             return False
         stable_sec = float(self.node.get_parameter('charging_stable_sec').value)
@@ -151,18 +152,27 @@ class ChargingVerifier:
     def _is_fresh(self, received_at: float, now: float) -> bool:
         max_age = float(
             self.node.get_parameter('charging_status_max_age_sec').value)
-        return now - received_at <= max_age
+        return received_at > 0.0 and 0.0 <= now - received_at <= max_age
 
-    def _available_callback(self, msg: BatteryState) -> None:
-        self.last_available = msg
-        self.last_available_at = time.monotonic()
-
-    def _battery_callback(self, msg: BatteryState) -> None:
-        now = time.monotonic()
-        self.last_battery = msg
-        self.last_battery_at = now
-        if self._battery_is_charging(now):
+    def _update_charging_stability(self, now: float) -> None:
+        if self._charger_is_available(now) and self._battery_is_charging(now):
             if self.charging_since is None:
                 self.charging_since = now
         else:
             self.charging_since = None
+
+    def _available_callback(self, msg: BatteryState) -> None:
+        now = time.monotonic()
+        # Check the previous samples before refreshing their receipt times:
+        # a gap in either stream must restart the continuous stability window.
+        self._update_charging_stability(now)
+        self.last_available = msg
+        self.last_available_at = now
+        self._update_charging_stability(now)
+
+    def _battery_callback(self, msg: BatteryState) -> None:
+        now = time.monotonic()
+        self._update_charging_stability(now)
+        self.last_battery = msg
+        self.last_battery_at = now
+        self._update_charging_stability(now)

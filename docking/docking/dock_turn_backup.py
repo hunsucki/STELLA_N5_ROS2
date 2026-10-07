@@ -11,8 +11,10 @@ from typing import Any
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from docking.charging import ChargingVerifier
-from docking.control import PrecisionYawController, spin_for
+from docking.control import (
+    CenterlineLatch, PrecisionYawController, front_axle_goal_errors, spin_for)
 from docking.docking_lidar import DockingLidar
+from docking.entry_recovery import DockEntryRecovery
 from docking.lidar_alignment import LidarPlaneAligner
 from docking.lidar_geometry import header_stamp_is_acceptable, UniqueScanStability
 from docking.lifecycle import DockingLifecycleManager
@@ -23,6 +25,7 @@ from docking.safety import (
     SingleInstanceLock,
 )
 from docking.stack_manager import ManagedStack
+from docking.tag_centering import AprilTagCentering, LidarTagCentering
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import DockRobot
 import rclpy
@@ -70,7 +73,16 @@ class DockTurnBackup(Node):
             self, self.motion, self.lidar)
         self.motion.set_backup_lidar_heading_estimator(
             self.lidar_aligner.estimate_error)
+        self.motion.set_backup_lidar_guide_estimator(
+            self.lidar_aligner.estimate_guide_center)
         self.charging = ChargingVerifier(self, self.should_stop)
+        if bool(self.get_parameter('use_apriltag_front_centering').value):
+            self.tag_centering = AprilTagCentering(self)
+        elif bool(self.get_parameter('use_lidar_tag_centering').value):
+            self.tag_centering = LidarTagCentering(self)
+        else:
+            self.tag_centering = None
+        self.entry_recovery = DockEntryRecovery(self)
         self.last_dock_pose: PoseStamped | None = None
         self.last_dock_pose_received_at = 0.0
         self.dock_pose_sequence = 0
@@ -99,8 +111,8 @@ class DockTurnBackup(Node):
 
     def run(self) -> DockingExitCode:
         total_timeout = float(self.get_parameter('total_timeout_sec').value)
-        if total_timeout <= 0.0:
-            self.get_logger().error('total_timeout_sec must be greater than zero')
+        if not math.isfinite(total_timeout) or total_timeout <= 0.0:
+            self.get_logger().error('total_timeout_sec must be finite and greater than zero')
             return DockingExitCode.INVALID_REQUEST
         self.total_deadline = time.monotonic() + total_timeout
 
@@ -160,6 +172,10 @@ class DockTurnBackup(Node):
         if not self._verify_tag_front_stop_pose():
             return self._failure_code(DockingExitCode.DOCKING_FAILED)
 
+        centerer = getattr(self, 'tag_centering', None)
+        if centerer is not None and not centerer.verify_before_spin():
+            return self._failure_code(DockingExitCode.DOCKING_FAILED)
+
         if not self.motion.advance_before_spin():
             return self._failure_code(DockingExitCode.DOCKING_FAILED)
 
@@ -169,6 +185,10 @@ class DockTurnBackup(Node):
         if bool(self.get_parameter('use_lidar_alignment').value):
             if not self.lidar_aligner.align():
                 return self._failure_code(DockingExitCode.DOCKING_FAILED)
+
+        recovery = getattr(self, 'entry_recovery', None)
+        if recovery is not None and not recovery.run():
+            return self._failure_code(DockingExitCode.DOCKING_FAILED)
 
         if not self.motion.backup():
             return self._failure_code(DockingExitCode.DOCKING_FAILED)
@@ -186,10 +206,21 @@ class DockTurnBackup(Node):
         return DockingExitCode.SUCCESS
 
     def cleanup_managed_processes(self) -> None:
-        self.charging.cancel_unconfirmed_charging()
-        self.motion.stop_robot()
-        self.stack.cleanup()
-        self.motion.stop_robot()
+        first_error = None
+        for cleanup in (
+                self.motion.stop_robot,
+                self.charging.cancel_unconfirmed_charging,
+                self.stack.cleanup,
+                self.motion.stop_robot):
+            try:
+                cleanup()
+            except Exception as exc:  # noqa: BLE001
+                # A failed charger command must not skip stopping the robot
+                # or terminating the processes that can still publish velocity.
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def request_stop(self, signum: int) -> None:
         if self.stop_signal is None:
@@ -209,6 +240,8 @@ class DockTurnBackup(Node):
         return False
 
     def _declare_docking_parameters(self) -> None:
+        LidarTagCentering.declare_parameters(self)
+        DockEntryRecovery.declare_parameters(self)
         self.declare_parameter('dock_action', '/dock_robot')
         self.declare_parameter('dock_id', 'home_dock')
         self.declare_parameter('navigate_to_staging_pose', False)
@@ -225,8 +258,8 @@ class DockTurnBackup(Node):
         self.declare_parameter('tag_refinement_target_wait_timeout_sec', 1.0)
         self.declare_parameter('tag_refinement_target_max_age_sec', 1.5)
         self.declare_parameter('tag_refinement_timeout_sec', 45.0)
-        self.declare_parameter('tag_refinement_longitudinal_tolerance', 0.04)
-        self.declare_parameter('tag_refinement_lateral_tolerance', 0.025)
+        self.declare_parameter('tag_refinement_longitudinal_tolerance', 0.02)
+        self.declare_parameter('tag_refinement_lateral_tolerance', 0.010)
         self.declare_parameter(
             'tag_refinement_yaw_tolerance', math.radians(2.0))
         self.declare_parameter('tag_refinement_stable_cycles', 5)
@@ -482,6 +515,7 @@ class DockTurnBackup(Node):
             return True
 
         parameter_names = (
+            'apriltag_front_axle_x',
             'tag_refinement_target_wait_timeout_sec',
             'tag_refinement_target_max_age_sec',
             'tag_refinement_timeout_sec',
@@ -510,11 +544,12 @@ class DockTurnBackup(Node):
             self.get_parameter('tag_refinement_stable_cycles').value)
         positive_names = tuple(
             name for name in parameter_names
-            if name != 'tag_refinement_angular_k_beta')
+            if name not in ('tag_refinement_angular_k_beta', 'apriltag_front_axle_x'))
         if (
                 not all(math.isfinite(value) for value in values.values())
                 or any(values[name] <= 0.0 for name in positive_names)
                 or values['tag_refinement_angular_k_beta'] >= 0.0
+                or not 0.0 <= values['apriltag_front_axle_x'] <= .20
                 or values['tag_refinement_translation_heading_limit'] >
                 math.radians(45.0)
                 or stable_cycles < 1):
@@ -524,7 +559,11 @@ class DockTurnBackup(Node):
         try:
             yaw_controller = PrecisionYawController(
                 values['tag_refinement_max_angular_speed'],
-                values['tag_refinement_recovery_max_angular_speed'])
+                values['tag_refinement_recovery_max_angular_speed'],
+                # Trial 30: below ~0.025 rad/s the wheels still turned but
+                # chassis yaw stalled at 1.05 degrees. Use a nominal floor
+                # for the final turn; retain acceleration and slip guards.
+                minimum_speed=min(0.04, values['tag_refinement_max_angular_speed']))
         except ValueError as exc:
             return self._tag_refinement_failure(str(exc))
 
@@ -557,6 +596,36 @@ class DockTurnBackup(Node):
                 'Refinement target frame mismatch: '
                 f'expected "{fixed_frame}", got "{target.header.frame_id}"')
 
+        refinement_deadline = time.monotonic() + values['tag_refinement_timeout_sec']
+        if getattr(self, 'tag_centering', None) is not None:
+            target = self.tag_centering.refine(target, allow_standoff_yaw_correction=True)
+            if not self.tag_centering.last_verified_alignment:
+                return self._tag_refinement_failure(
+                    'Front station observations are not verified; refusing '
+                    'refinement from an uncorrected tag orientation')
+            observations = self.tag_centering.last_verified_alignment
+            current_x, current_y = self.motion.current_xy()
+            distance_to_goal = math.hypot(
+                target.pose.position.x-current_x, target.pose.position.y-current_y)
+            initial_center_limit = getattr(
+                self.tag_centering, 'initial_alignment_center_limit', .05)
+            # Align while approach distance is still available, then measure
+            # the center anew. A caster/pivot-induced shift during a late turn
+            # must not invalidate an already completed lateral correction.
+            if (.06 <= distance_to_goal <= values['tag_refinement_max_initial_distance']
+                    and all(abs(y) <= initial_center_limit
+                            and math.radians(1) < abs(a) <= math.radians(18)
+                            for y, a in observations)):
+                self.get_logger().info(
+                    'Aligning the live station heading before translation; '
+                    'the center target will be measured again after rotation')
+                if not self.tag_centering._correct_live_heading(initial=True):
+                    return self._tag_refinement_failure('Initial live front heading alignment failed')
+                target = self.tag_centering.refine(target)
+                if not self.tag_centering.last_verified_alignment:
+                    return self._tag_refinement_failure(
+                        'Front center could not be remeasured after initial rotation')
+
         target_x = float(target.pose.position.x)
         target_y = float(target.pose.position.y)
         target_yaw = self._quaternion_yaw(
@@ -581,12 +650,45 @@ class DockTurnBackup(Node):
         initial_base_errors = self._fixed_goal_errors_in_base(
             target_x, target_y, target_yaw,
             current_x, current_y, current_yaw)
+        centerer = getattr(self, 'tag_centering', None)
+        live_standoff = getattr(centerer, 'last_verified_standoff', None)
+        live_anchor = None
+        if live_standoff is not None:
+            if not math.isfinite(live_standoff) or not .5 <= live_standoff <= 1.5:
+                return self._tag_refinement_failure('Live front standoff is outside bounds')
+            live_anchor = centerer.control_observation(live_standoff)
+            if live_anchor is None:
+                return self._tag_refinement_failure('No fresh synchronized front observation')
+            initial_errors = live_anchor
+            lx, ly, angle = initial_errors
+            c, s = math.cos(angle), math.sin(angle)
+            initial_base_errors = (c * lx - s * ly, s * lx + c * ly, angle)
+        pose_source = (getattr(centerer, 'pose_source', 'live_front')
+                       if live_anchor is not None else 'odom')
+        tag_line_approach = isinstance(centerer, AprilTagCentering)
+        front_axle_x = values['apriltag_front_axle_x'] if tag_line_approach else 0.0
         initial_distance = math.hypot(initial_errors[0], initial_errors[1])
         planned_yaw_excursion, initial_bearing = (
             self._planned_refinement_yaw_excursion(
                 initial_base_errors[0], initial_base_errors[1],
                 initial_errors[2],
                 values['tag_refinement_translation_heading_limit']))
+        if (abs(initial_errors[1]) <= values['tag_refinement_lateral_tolerance']
+                and (tag_line_approach or abs(initial_errors[0]) <=
+                     values['tag_refinement_longitudinal_tolerance'])):
+            # AprilTag's accepted lateral residual is finished along the
+            # normal line. Do not budget a point turn that is never commanded.
+            planned_yaw_excursion = abs(initial_errors[2])
+        elif (initial_distance < .06
+              and abs(initial_errors[1]) > values['tag_refinement_lateral_tolerance']
+              and planned_yaw_excursion > values['tag_refinement_translation_heading_limit']):
+            # A same-pose retry with centimeters of runway can demand a large
+            # out-and-back turn for millimeters of lateral correction. Trial 17
+            # showed that odom does not capture the resulting lateral shift.
+            return self._tag_refinement_failure(
+                'Insufficient approach distance for lateral refinement: '
+                f'distance={initial_distance:.3f}m, lateral={initial_errors[1]:+.3f}m; '
+                'reposition at the tag-facing start before retrying')
         if (
                 initial_distance > values[
                     'tag_refinement_max_initial_distance']
@@ -604,8 +706,9 @@ class DockTurnBackup(Node):
 
         self.motion.stop_robot()
         self.get_logger().info(
-            'Starting bounded tag pose refinement against the frozen Nav2 '
-            'dock pose: '
+            'Starting bounded tag pose refinement: '
+            f'pose_source={pose_source}, '
+            f'front_axle_x={front_axle_x:.3f}m, '
             f'x={initial_errors[0]:+.3f}m, '
             f'y={initial_errors[1]:+.3f}m, '
             f'distance={initial_distance:.3f}m, '
@@ -622,9 +725,21 @@ class DockTurnBackup(Node):
         stability = UniqueScanStability(
             stable_cycles, self.motion.odom_sequence)
         last_log_time = 0.0
-        deadline = time.monotonic() + values['tag_refinement_timeout_sec']
+        deadline = refinement_deadline
         period = 1.0 / values['tag_refinement_control_rate_hz']
         aligning_yaw = False
+        front_missing_since = None
+        # Reserve the sideways shift possible during the last accepted yaw
+        # plus 10 mm for the estimated axle pivot. Success still uses base's
+        # configured tolerance, not this intermediate steering target.
+        steering_margin = (front_axle_x*math.sin(values['tag_refinement_yaw_tolerance'])+.01
+                           if front_axle_x else 0.0)
+        centerline_latch = CenterlineLatch(values['tag_refinement_lateral_tolerance'],
+            entering_tolerance=max(.005,
+                values['tag_refinement_lateral_tolerance']-steering_margin))
+        # Use the configured window; live panel and rear guide checks handle
+        # the residual instead of demanding half the acceptance tolerance.
+        command_yaw_tolerance = values['tag_refinement_yaw_tolerance']
         bearing_controller = PrecisionYawController(
             values['tag_refinement_max_angular_speed'],
             values['tag_refinement_recovery_max_angular_speed'])
@@ -648,6 +763,30 @@ class DockTurnBackup(Node):
             previous_x, previous_y = current_x, current_y
             yaw_excursion = abs(self.motion.normalize_angle(
                 current_yaw - start_yaw))
+            observation = None
+            if live_anchor is not None:
+                if not (self.motion.imu_is_fresh() and self.motion.wheel_yaw_is_fresh()):
+                    return self._tag_refinement_failure(
+                        'Independent motion feedback became stale during live front refinement', traveled)
+                observation = centerer.control_observation(live_standoff)
+                if observation is None:
+                    self.motion.stop_robot()
+                    stability.reset()
+                    centerline_latch.reset()
+                    if front_missing_since is None:
+                        front_missing_since = now
+                    if now - front_missing_since >= .5:
+                        return self._tag_refinement_failure(
+                            'Live front observations did not recover while stopped', traveled)
+                    continue
+                front_missing_since = None
+                observed_travel = math.hypot(
+                    observation[0] - live_anchor[0], observation[1] - live_anchor[1])
+                if observed_travel > values['tag_refinement_max_travel']:
+                    return self._tag_refinement_failure(
+                        'Live station-relative displacement exceeded the travel limit', observed_travel)
+                yaw_excursion = max(yaw_excursion, abs(self.motion.normalize_angle(
+                    observation[2] - live_anchor[2])))
             if traveled > values['tag_refinement_max_travel']:
                 return self._tag_refinement_failure(
                     'Tag refinement exceeded its travel limit: '
@@ -660,10 +799,9 @@ class DockTurnBackup(Node):
                     f'{math.degrees(values["tag_refinement_max_yaw_excursion"]):.2f}deg',
                     traveled)
 
-            # Position tolerances belong to the frozen dock pose axes.  If they
-            # were evaluated in the rotating base frame, a final in-place yaw
-            # correction would appear to create a new lateral position error
-            # even though the robot base has not translated.
+            # Position tolerances belong to station axes. Live observations
+            # also capture real displacement during a caster-induced pivot,
+            # which the wheel-based odometry can miss.
             longitudinal, lateral, yaw_error = (
                 self._fixed_goal_errors_in_target(
                     target_x, target_y, target_yaw,
@@ -672,20 +810,37 @@ class DockTurnBackup(Node):
                 self._fixed_goal_errors_in_base(
                     target_x, target_y, target_yaw,
                     current_x, current_y, current_yaw))
+            if observation is not None:
+                longitudinal, lateral, yaw_error = observation
+                c, s = math.cos(yaw_error), math.sin(yaw_error)
+                base_longitudinal = c * longitudinal - s * lateral
+                base_lateral = s * longitudinal + c * lateral
             within_position = (
                 abs(longitudinal) <= values[
                     'tag_refinement_longitudinal_tolerance']
                 and abs(lateral) <= values[
                     'tag_refinement_lateral_tolerance'])
-            within_yaw = abs(yaw_error) <= values[
-                'tag_refinement_yaw_tolerance']
+            lateral_centered = abs(lateral) <= values['tag_refinement_lateral_tolerance']
+            within_yaw = abs(yaw_error) <= command_yaw_tolerance
             settled = (
                 within_position and within_yaw
                 and self.motion.is_stationary(values[
-                    'tag_refinement_stationary_linear_speed']))
+                    'tag_refinement_stationary_linear_speed'])
+                and abs(self.motion.current_odom_yaw_rate()) <= math.radians(.5))
             if not settled:
                 stability.reset()
-            complete = stability.observe(self.motion.odom_sequence, settled)
+            sequence = (centerer.control_observation_sequence
+                        if live_anchor is not None else self.motion.odom_sequence)
+            steering_longitudinal, steering_lateral = front_axle_goal_errors(
+                longitudinal, lateral, yaw_error, front_axle_x)
+            if tag_line_approach:
+                c, s = math.cos(yaw_error), math.sin(yaw_error)
+                base_longitudinal = c*steering_longitudinal - s*steering_lateral
+                base_lateral = s*steering_longitudinal + c*steering_lateral
+            following_centerline = (centerline_latch.update(
+                sequence, steering_lateral, within_yaw, settled_lateral=lateral)
+                                    if tag_line_approach else lateral_centered)
+            complete = stability.observe(sequence, settled)
 
             if complete:
                 self.motion.stop_robot()
@@ -696,9 +851,14 @@ class DockTurnBackup(Node):
                     f'travel={traveled:.3f}m')
                 return True
 
-            # Finish the in-place turn before responding to small position
-            # changes at the tolerance boundary. Success still checks both.
-            aligning_yaw = within_position or (aligning_yaw and not within_yaw)
+            # Center the driven axle before the final axle-centered turn;
+            # stopping/verification still require the actual base pose.
+            if tag_line_approach:
+                aligning_yaw = following_centerline and not within_yaw
+            elif live_anchor is not None:
+                aligning_yaw = within_position
+            else:
+                aligning_yaw = within_position or (aligning_yaw and not within_yaw)
             linear_x, angular_z = self._tag_refinement_command(
                 base_longitudinal,
                 base_lateral,
@@ -712,6 +872,16 @@ class DockTurnBackup(Node):
                 values['tag_refinement_max_angular_speed'],
                 values['tag_refinement_translation_heading_limit'],
             )
+            if tag_line_approach and following_centerline and within_yaw:
+                # Once on the tag-normal line, finish the remaining distance
+                # along that line. A tolerated 2 cm lateral residual must not
+                # demand a new large point turn and push the tag out of view.
+                linear_x = max(-values['tag_refinement_max_linear_speed'], min(
+                    values['tag_refinement_max_linear_speed'],
+                    values['tag_refinement_linear_kp']*longitudinal))
+                angular_z = max(-values['tag_refinement_max_angular_speed'], min(
+                    values['tag_refinement_max_angular_speed'],
+                    values['tag_refinement_final_yaw_kp']*yaw_error))
             measured_rate, measured_source = (
                 self.motion.current_stationary_yaw_rate())
             wheel_rate = self.motion.current_odom_yaw_rate()
@@ -719,6 +889,7 @@ class DockTurnBackup(Node):
                 base_longitudinal, base_lateral)
             aligning_position_heading = (
                 not aligning_yaw
+                and not (tag_line_approach and (following_centerline or centerline_latch.pending))
                 and abs(drive_bearing) >= values[
                     'tag_refinement_translation_heading_limit'])
             if aligning_yaw and not within_yaw:
@@ -749,7 +920,7 @@ class DockTurnBackup(Node):
             else:
                 yaw_controller.reset()
                 bearing_controller.reset()
-            if within_position and within_yaw:
+            if (within_position and within_yaw) or (tag_line_approach and centerline_latch.pending):
                 linear_x = 0.0
                 angular_z = 0.0
             self.motion.cmd_vel_pub.publish(self.motion.twist(
@@ -757,12 +928,15 @@ class DockTurnBackup(Node):
 
             if now - last_log_time >= 1.0:
                 phase = (
-                    'yaw' if aligning_yaw
+                    'center_check' if tag_line_approach and centerline_latch.pending
+                    else 'yaw' if aligning_yaw
+                    else 'straight_to_standoff' if tag_line_approach and following_centerline
                     else 'point_heading' if aligning_position_heading
                     else 'position')
                 self.get_logger().info(
                     'Tag refinement: '
                     f'x={longitudinal:+.3f}m, y={lateral:+.3f}m, '
+                    f'axle_y={steering_lateral:+.3f}m, '
                     f'yaw={math.degrees(yaw_error):+.2f}deg, '
                     f'cmd=({linear_x:+.3f}m/s, '
                     f'{angular_z:+.3f}rad/s), '
@@ -772,6 +946,7 @@ class DockTurnBackup(Node):
                     f'remaining={max(deadline - now, 0.0):.1f}s, '
                     f'measured_rate={measured_rate:+.4f}rad/s '
                     f'({measured_source}), '
+                    f'pose_source={pose_source}, '
                     f'wheel_rate={wheel_rate:+.4f}rad/s, '
                     f'recovery_floor={yaw_controller.recovery_floor:.3f}rad/s')
                 last_log_time = now
@@ -897,7 +1072,12 @@ class DockTurnBackup(Node):
         """Return the largest planned offset from the refinement start yaw."""
         _, _, bearing = DockTurnBackup._point_drive_geometry(
             base_longitudinal, base_lateral)
-        point_turn = max(abs(bearing) - translation_heading_limit, 0.0)
+        # Translation starts inside this cone, but point steering continues
+        # until the bearing is zero. Subtracting the cone predicted 24.84 deg
+        # for trial 28's 32.84-degree turn, then hit the 30-degree runtime cap.
+        # Budget the full turn before commanding any motion.
+        _ = translation_heading_limit
+        point_turn = abs(bearing)
         return max(point_turn, abs(final_yaw_error)), bearing
 
     def _verify_tag_front_stop_pose(self) -> bool:

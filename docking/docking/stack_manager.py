@@ -142,7 +142,17 @@ class ManagedStack:
         return True
 
     def cleanup(self) -> None:
-        self.stop_robot()
+        stop_errors = []
+
+        def try_stop() -> None:
+            try:
+                self.stop_robot()
+            except Exception as exc:  # noqa: BLE001
+                # Still terminate velocity publishers if the ROS publisher
+                # used for the zero-velocity command has already failed.
+                stop_errors.append(exc)
+
+        try_stop()
 
         for process in reversed(self.processes):
             if process.poll() is None:
@@ -168,7 +178,7 @@ class ManagedStack:
                     except ProcessLookupError:
                         pass
 
-        self.stop_robot()
+        try_stop()
 
         for process in reversed(self.processes):
             if process.poll() is None:
@@ -188,11 +198,13 @@ class ManagedStack:
                     self.node.get_logger().error(
                         f'Could not reap managed process pid={process.pid}')
 
-        self.stop_robot()
+        try_stop()
 
         if self._params_directory is not None:
             self._params_directory.cleanup()
             self._params_directory = None
+        if stop_errors:
+            raise stop_errors[0]
 
     def _start_process(self, name: str, command: list[str]) -> None:
         self.node.get_logger().info(f'Starting {name}: {" ".join(command)}')

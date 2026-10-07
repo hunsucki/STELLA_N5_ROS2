@@ -1,6 +1,7 @@
 """Pure 2-D geometry helpers for the docking LiDAR."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import Sequence
 
@@ -139,21 +140,23 @@ def project_scan_to_base(
         return None
     if half_width <= 0.0:
         return []
+    if not all(math.isfinite(value) for value in (
+            transform.x, transform.y, transform.yaw)):
+        return None
 
     cos_yaw = math.cos(transform.yaw)
     sin_yaw = math.sin(transform.yaw)
     points: list[ProjectedPoint] = []
 
-    for beam_index, distance in enumerate(ranges):
-        angle = angle_min + beam_index * angle_increment
-        base_ray_angle = normalize_angle(angle + transform.yaw)
-        if abs(normalize_angle(base_ray_angle - sector_center)) > half_width:
-            continue
+    for beam_index, cos_angle, sin_angle in _sector_rays(
+            len(ranges), angle_min, angle_increment, transform.yaw,
+            sector_center, half_width):
+        distance = ranges[beam_index]
         if not math.isfinite(distance) or not lower <= distance <= upper:
             continue
 
-        scan_x = distance * math.cos(angle)
-        scan_y = distance * math.sin(angle)
+        scan_x = distance * cos_angle
+        scan_y = distance * sin_angle
         points.append(ProjectedPoint(
             beam_index=beam_index,
             x=transform.x + cos_yaw * scan_x - sin_yaw * scan_y,
@@ -162,6 +165,21 @@ def project_scan_to_base(
         ))
 
     return points
+
+
+@lru_cache(maxsize=16)
+def _sector_rays(
+        count: int, angle_min: float, angle_increment: float, yaw: float,
+        sector_center: float, half_width: float
+        ) -> tuple[tuple[int, float, float], ...]:
+    """Cache only scan geometry; ranges and observation ages are never cached."""
+    rays = []
+    for beam_index in range(count):
+        angle = angle_min + beam_index * angle_increment
+        base_ray_angle = normalize_angle(angle + yaw)
+        if abs(normalize_angle(base_ray_angle - sector_center)) <= half_width:
+            rays.append((beam_index, math.cos(angle), math.sin(angle)))
+    return tuple(rays)
 
 
 def rear_clearances(

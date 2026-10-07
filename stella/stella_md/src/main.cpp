@@ -3,6 +3,10 @@
 #include "MW_serial.hpp"
 #include "stella.hpp"
 #include "encoder_unwrap.hpp"
+#include "serial_deadline.hpp"
+#include "serial.h"
+
+extern serial::Serial _serial;
 #include <algorithm>
 #include <cmath>
 #include <math.h>
@@ -40,9 +44,20 @@ inline double pulse2meter()
   return meter; //엔코더 역상
 }
 
-stellaN5_node::stellaN5_node() : Node("stella_md_node")
+stellaN5_node::stellaN5_node() : Node("stella_md_node", rclcpp::NodeOptions().enable_rosout(false))
 {
-  auto qos = rclcpp::QoS(rclcpp::KeepLast(10));
+  auto qos = rclcpp::QoS(rclcpp::KeepLast(1));
+  serial_transaction_timeout_ms_ = this->declare_parameter<int>("serial_transaction_timeout_ms", 100);
+  if (serial_transaction_timeout_ms_ < 10 || serial_transaction_timeout_ms_ > 500) {
+    throw std::invalid_argument("serial_transaction_timeout_ms must be in [10, 500]");
+  }
+  auto serial_timeout = serial::Timeout::simpleTimeout(serial_transaction_timeout_ms_);
+  _serial.setTimeout(serial_timeout);
+  {
+    // Start from a stopped controller even after an unclean previous exit.
+    motor_serial::Deadline deadline{std::chrono::milliseconds(serial_transaction_timeout_ms_)};
+    dual_m_command(dual_m_command_select::m_lav, 0.0, 0.0);
+  }
 
   use_imu_data_orientation_ = this->declare_parameter<bool>("use_imu_data_orientation", false);
   imu_timeout_sec_ = this->declare_parameter<double>("imu_timeout_sec", 0.0);
@@ -92,30 +107,37 @@ stellaN5_node::stellaN5_node() : Node("stella_md_node")
     imu_data_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("imu/data", 10, std::bind(&stellaN5_node::imu_data_callback, this, std::placeholders::_1));
   }
   ahrs_yaw_sub_ = this->create_subscription<std_msgs::msg::Float64>("imu/yaw", 1, std::bind(&stellaN5_node::ahrs_yaw_data_callback, this, std::placeholders::_1));
-  cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>("cmd_vel", 10, std::bind(&stellaN5_node::command_velocity_callback, this, std::placeholders::_1));
+  cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>("cmd_vel", rclcpp::QoS(1), std::bind(&stellaN5_node::command_velocity_callback, this, std::placeholders::_1));
   wheel_encoder_pub_ = this->create_publisher<sensor_msgs::msg::JointState>("wheel/encoders", qos);
   if (enable_legacy_odom_)
   {
     odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", qos);
-    odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this, rclcpp::QoS(1));
   }
 
-  auto serial_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>(1.0 / encoder_poll_rate_hz_));
-  Serial_timer = this->create_wall_timer(serial_period, std::bind(&stellaN5_node::serial_callback, this));
+  // Drain the latest completed query promptly, independently of the serial
+  // polling phase. Empty callbacks do not publish or fabricate sensor samples.
+  Serial_timer = this->create_wall_timer(
+    std::chrono::milliseconds(10), std::bind(&stellaN5_node::serial_callback, this));
 
   RCLCPP_INFO(
       this->get_logger(),
       "Encoder polling: %d Hz; wheel topic: /wheel/encoders; legacy odom: %s",
       encoder_poll_rate_hz_, enable_legacy_odom_ ? "enabled" : "disabled");
+  serial_running_.store(true);
+  serial_thread_ = std::thread(&stellaN5_node::serial_loop, this);
 }
 
 stellaN5_node::~stellaN5_node()
 {
+  serial_running_.store(false);
+  command_changed_.notify_all();
+  if (serial_thread_.joinable()) {serial_thread_.join();}
   if (RUN)
   {
     try
     {
+      motor_serial::Deadline deadline{std::chrono::milliseconds(serial_transaction_timeout_ms_)};
       dual_m_command(dual_m_command_select::m_lav, 0.0, 0.0);
     }
     catch (const std::exception & e)
@@ -209,79 +231,133 @@ void stellaN5_node::ahrs_yaw_data_callback(const std_msgs::msg::Float64::SharedP
   yaw_received_ = true;
 }
 
-void stellaN5_node::command_velocity_callback(const geometry_msgs::msg::Twist::SharedPtr cmd_vel_msg)
+void stellaN5_node::command_velocity_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
 {
-  if(RUN)
+  if (!std::isfinite(msg->linear.x) || !std::isfinite(msg->angular.z)) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Ignoring non-finite /cmd_vel");
+    return;
+  }
   {
-    goal_linear_velocity_ = cmd_vel_msg->linear.x;
-    goal_angular_velocity_ = cmd_vel_msg->angular.z ;
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    pending_linear_velocity_ = msg->linear.x;
+    pending_angular_velocity_ = msg->angular.z;
     last_cmd_vel_time_ = std::chrono::steady_clock::now();
     cmd_vel_received_ = true;
-    cmd_vel_watchdog_stopped_ = false;
+    ++command_sequence_;
+  }
+  command_changed_.notify_one();
+}
 
-    try
-    {
-      dual_m_command(dual_m_command_select::m_lav, goal_linear_velocity_, goal_angular_velocity_);
+bool stellaN5_node::apply_pending_command()
+{
+  std::uint64_t sequence;
+  double linear;
+  double angular;
+  double age;
+  bool timed_out;
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    if (!cmd_vel_received_) {return true;}
+    sequence = command_sequence_;
+    age = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_cmd_vel_time_).count();
+    timed_out = cmd_vel_timeout_sec_ > 0.0 && age > cmd_vel_timeout_sec_;
+    if (sequence == applied_command_sequence_ && (!timed_out || cmd_vel_watchdog_stopped_)) {
+      return true;
     }
-    catch (const std::exception & e)
-    {
-      RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 2000,
-          "Motor command serial write failed: %s", e.what());
+    linear = timed_out ? 0.0 : pending_linear_velocity_;
+    angular = timed_out ? 0.0 : pending_angular_velocity_;
+  }
+  try {
+    motor_serial::Deadline deadline{std::chrono::milliseconds(serial_transaction_timeout_ms_)};
+    dual_m_command(dual_m_command_select::m_lav, linear, angular);
+    applied_command_sequence_ = sequence;
+    cmd_vel_watchdog_stopped_ = timed_out;
+    if (timed_out) {
+      RCLCPP_WARN(get_logger(), "/cmd_vel timeout after %.3f s; motors stopped", age);
+    }
+    return true;
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+      "Motor command failed (stop=%s): %s", timed_out ? "true" : "false", e.what());
+    return false;  // Retry on the next worker iteration, including stop commands.
+  }
+}
+
+void stellaN5_node::serial_loop()
+{
+  const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(1.0 / encoder_poll_rate_hz_));
+  auto next_poll = std::chrono::steady_clock::now();
+  while (rclcpp::ok() && serial_running_.load() && RUN) {
+    const bool command_ok = apply_pending_command();
+    auto now = std::chrono::steady_clock::now();
+    if (now >= next_poll && command_ok) {
+      const auto start = this->now();
+      try {
+        {
+          motor_serial::Deadline deadline{std::chrono::milliseconds(serial_transaction_timeout_ms_)};
+          if (Motor_MonitoringCommand(channel_1, _position) < 0) {
+            throw std::runtime_error("Left encoder query failed");
+          }
+        }
+        if (!apply_pending_command()) {  // Check the stop deadline between serial queries.
+          throw std::runtime_error("Pending motor command failed");
+        }
+        {
+          motor_serial::Deadline deadline{std::chrono::milliseconds(serial_transaction_timeout_ms_)};
+          if (Motor_MonitoringCommand(channel_2, _position) < 0) {
+            throw std::runtime_error("Right encoder query failed");
+          }
+        }
+        const auto end = this->now();
+        std::lock_guard<std::mutex> lock(encoder_mutex_);
+        sampled_left_encoder_ = static_cast<std::int32_t>(MyMotorCommandReadValue.position[channel_1]);
+        sampled_right_encoder_ = static_cast<std::int32_t>(MyMotorCommandReadValue.position[channel_2]);
+        sampled_encoder_stamp_ = rclcpp::Time(
+          start.nanoseconds() + (end.nanoseconds() - start.nanoseconds()) / 2,
+          get_clock()->get_clock_type());
+        encoder_sample_pending_ = true;
+      } catch (const std::exception & e) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Encoder query failed; no sample published: %s", e.what());
+        // Discard a partial/late response before issuing the next request.
+        try {_serial.flushInput();} catch (const std::exception &) {}
+      }
+      now = std::chrono::steady_clock::now();
+      next_poll += period;
+      if (next_poll <= now) {next_poll = now;}
+    }
+    std::unique_lock<std::mutex> lock(command_mutex_);
+    auto wake = std::min(next_poll, std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
+    command_changed_.wait_until(lock, wake, [this] {
+      return !serial_running_.load() || command_sequence_ != applied_command_sequence_;
+    });
+    if (!command_ok) {
+      // A failing pending command must not create an unbounded retry loop.
+      command_changed_.wait_for(lock, std::chrono::milliseconds(10));
     }
   }
 }
 
 void stellaN5_node::serial_callback()
 {
-  if(RUN)
+  std::int32_t left_raw;
+  std::int32_t right_raw;
+  rclcpp::Time stamp(0, 0, get_clock()->get_clock_type());
   {
-    if (cmd_vel_timeout_sec_ > 0.0 && cmd_vel_received_ && !cmd_vel_watchdog_stopped_)
-    {
-      const double command_age = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - last_cmd_vel_time_).count();
-      if (command_age > cmd_vel_timeout_sec_)
-      {
-        goal_linear_velocity_ = 0.0;
-        goal_angular_velocity_ = 0.0;
-        try
-        {
-          dual_m_command(dual_m_command_select::m_lav, 0.0, 0.0);
-          cmd_vel_watchdog_stopped_ = true;
-          RCLCPP_WARN(
-              this->get_logger(),
-              "/cmd_vel timeout after %.3f s; motors stopped",
-              command_age);
-        }
-        catch (const std::exception & e)
-        {
-          RCLCPP_ERROR_THROTTLE(
-              this->get_logger(), *this->get_clock(), 1000,
-              "Motor watchdog stop failed: %s", e.what());
-        }
-      }
-    }
-
-    try
-    {
-      const rclcpp::Time encoder_read_start = this->now();
-      Motor_MonitoringCommand(channel_1, _position);
-      Motor_MonitoringCommand(channel_2, _position);
-      const rclcpp::Time encoder_read_end = this->now();
-      const rclcpp::Time encoder_stamp(
-        encoder_read_start.nanoseconds() +
-        (encoder_read_end.nanoseconds() - encoder_read_start.nanoseconds()) / 2,
-        this->get_clock()->get_clock_type());
-      publish_wheel_encoder_state(encoder_stamp);
-    }
-    catch (const std::exception & e)
-    {
-      RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 2000,
-          "Motor monitoring serial read failed: %s", e.what());
-      return;
-    }
-
+    std::lock_guard<std::mutex> lock(encoder_mutex_);
+    if (!encoder_sample_pending_) {return;}
+    left_raw = sampled_left_encoder_;
+    right_raw = sampled_right_encoder_;
+    stamp = sampled_encoder_stamp_;
+    encoder_sample_pending_ = false;
+  }
+  // DDS calls run only in the executor. The serial worker and stop watchdog
+  // continue even when a remote reader or the network send queue stalls.
+  publish_wheel_encoder_state(stamp, left_raw, right_raw);
+  if (RUN)
+  {
     enable_legacy_odom_ = this->get_parameter("enable_legacy_odom").as_bool();
     if (enable_legacy_odom_)
     {
@@ -290,20 +366,20 @@ void stellaN5_node::serial_callback()
         if (!odom_pub_)
         {
           odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
-            "odom", rclcpp::QoS(rclcpp::KeepLast(10)));
+            "odom", rclcpp::QoS(rclcpp::KeepLast(1)));
         }
         if (!odom_broadcaster)
         {
-          odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+          odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(*this, rclcpp::QoS(1));
         }
-        left_encoder_prev = MyMotorCommandReadValue.position[channel_1];
-        right_encoder_prev = MyMotorCommandReadValue.position[channel_2];
+        left_encoder_prev = left_raw;
+        right_encoder_prev = right_raw;
         previous_legacy_odom_enabled_ = true;
         RCLCPP_WARN(
             this->get_logger(),
             "Legacy odom enabled. Disable wheel_odometry to avoid duplicate /odom and TF publishers");
       }
-      update_odometry();
+      update_odometry(left_raw, right_raw);
     }
     else
     {
@@ -318,7 +394,8 @@ void stellaN5_node::serial_callback()
   }
 }
 
-void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
+void stellaN5_node::publish_wheel_encoder_state(
+  const rclcpp::Time & stamp, std::int32_t left_raw, std::int32_t right_raw)
 {
   const double counts_per_wheel_revolution =
       Differential_MobileRobot.gear_ratio * MyMotorConfiguration.encoder_ppr[channel_1];
@@ -333,10 +410,6 @@ void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
   }
 
   const double radians_per_count = 2.0 * M_PI / counts_per_wheel_revolution;
-  const auto left_raw = static_cast<std::int32_t>(
-      MyMotorCommandReadValue.position[channel_1]);
-  const auto right_raw = static_cast<std::int32_t>(
-      MyMotorCommandReadValue.position[channel_2]);
   double left_delta = 0.0;
   double right_delta = 0.0;
   if (wheel_encoder_initialized_)
@@ -374,7 +447,7 @@ void stellaN5_node::publish_wheel_encoder_state(const rclcpp::Time & stamp)
   wheel_encoder_pub_->publish(wheel_state);
 }
 
-bool stellaN5_node::update_odometry()
+bool stellaN5_node::update_odometry(std::int32_t left_raw, std::int32_t right_raw)
 {
   const rclcpp::Time now = this->now();
 
@@ -414,8 +487,8 @@ bool stellaN5_node::update_odometry()
   }
 
 
-  delta_left = Limit_i((MyMotorCommandReadValue.position[channel_1] - left_encoder_prev), 0, 15000) * pulse2meter();
-  delta_right = Limit_i((MyMotorCommandReadValue.position[channel_2] - right_encoder_prev), 0, 15000) * pulse2meter();
+  delta_left = Limit_i((left_raw - left_encoder_prev), 0, 15000) * pulse2meter();
+  delta_right = Limit_i((right_raw - right_encoder_prev), 0, 15000) * pulse2meter();
   
   //로봇 기구학 적용및 센서퓨전
   delta_s  = (delta_right + delta_left) / 2.0 ;
@@ -466,14 +539,19 @@ bool stellaN5_node::update_odometry()
   odom.pose.pose.position.z = 0.0;
 
   odom.child_frame_id = "base_footprint";
-  odom.twist.twist.linear.x = goal_linear_velocity_;
-  odom.twist.twist.angular.z = goal_angular_velocity_;
+  {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    const bool stale = cmd_vel_timeout_sec_ > 0.0 && (!cmd_vel_received_ ||
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - last_cmd_vel_time_).count() > cmd_vel_timeout_sec_);
+    odom.twist.twist.linear.x = stale ? 0.0 : pending_linear_velocity_;
+    odom.twist.twist.angular.z = stale ? 0.0 : pending_angular_velocity_;
+  }
 
   odom.header.stamp = now;
   odom_pub_->publish(odom);
 
-  left_encoder_prev = MyMotorCommandReadValue.position[channel_1];
-  right_encoder_prev = MyMotorCommandReadValue.position[channel_2];
+  left_encoder_prev = left_raw;
+  right_encoder_prev = right_raw;
   return true;
 }
 
@@ -482,13 +560,28 @@ int main(int argc, char *argv[])
   rclcpp::init(argc, argv);
 
   char motor_port[] = "/dev/MW";
-  MW_Serial_Connect(motor_port, 115200);
-
-  if(Robot_Setting(::N5)) RUN = true;
-  Robot_Fault_Checking_RESET();
-  
-  rclcpp::spin(std::make_shared<stellaN5_node>());
+  int result = 0;
+  try {
+    // Bound vendor startup too: a missing controller must exit, not spin forever.
+    motor_serial::Deadline startup_deadline{std::chrono::seconds(15)};
+    if (!MW_Serial_Connect(motor_port, 115200) || !Robot_Setting(::N5)) {
+      throw std::runtime_error("Motor controller connection/setup failed");
+    }
+    RUN = true;
+    Robot_Fault_Checking_RESET();
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(rclcpp::get_logger("stella_md_node"), "Motor startup failed: %s", e.what());
+    MW_Serial_DisConnect();
+    rclcpp::shutdown();
+    return 1;
+  }
+  try {
+    rclcpp::spin(std::make_shared<stellaN5_node>());
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(rclcpp::get_logger("stella_md_node"), "Motor node failed: %s", e.what());
+    result = 1;
+  }
 
   rclcpp::shutdown();
-  return 0;
+  return result;
 }

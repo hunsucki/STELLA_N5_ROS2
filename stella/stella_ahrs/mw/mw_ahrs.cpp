@@ -282,7 +282,7 @@ namespace ntrex
       publish_rate_hz = 50;
     }
 
-    rclcpp::Rate rate(publish_rate_hz);
+    rclcpp::WallRate rate(publish_rate_hz);
     int64_t last_raw_stamp = 0;
     int64_t last_orientation_stamp = 0;
     int64_t last_magnetic_stamp = 0;
@@ -478,7 +478,7 @@ namespace ntrex
 
       MW_AHRS_Covariance();
 
-      auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+      auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
 
       imu_data_raw_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", qos);
       imu_data_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("imu/data", qos);
