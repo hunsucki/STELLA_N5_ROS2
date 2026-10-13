@@ -1,7 +1,10 @@
 import math
+import statistics
 
 from docking.control import (
     BackupStationaryYawController, spin_for, straight_entry_heading_budget,
+    remaining_straight_heading_budget,
+    straight_entry_path,
 )
 import time
 from typing import Any, Callable
@@ -41,6 +44,7 @@ class MotionController:
             '/wheel_odometry/yaw_diagnostics')
         node.declare_parameter('wheel_yaw_max_age_sec', 0.50)
         node.declare_parameter('spin_yaw', math.pi)
+        node.declare_parameter('spin_use_lidar_heading', False)
         node.declare_parameter('spin_angular_speed', 0.15)
         node.declare_parameter('spin_min_angular_speed', 0.025)
         node.declare_parameter('spin_slowdown_angle', math.radians(40.0))
@@ -98,8 +102,11 @@ class MotionController:
         node.declare_parameter('backup_heading_resume_stable_cycles', 3)
         node.declare_parameter('use_lidar_heading_during_backup', True)
         node.declare_parameter('backup_lidar_heading_filter_coef', 0.15)
+        # This bounds a correctable measured panel angle, not permitted
+        # reverse tilt. Errors above 3 degrees already stop translation and
+        # use the bounded stationary controller before reverse can resume.
         node.declare_parameter(
-            'backup_lidar_heading_max_error', math.radians(8.0))
+            'backup_lidar_heading_max_error', math.radians(12.0))
         node.declare_parameter(
             'backup_lidar_motion_residual', math.radians(2.0))
         # A small translation-dependent RANSAC bias may disagree with both
@@ -133,6 +140,8 @@ class MotionController:
         node.declare_parameter('backup_min_speed', 0.015)
         node.declare_parameter('backup_blocked_timeout_sec', 1.0)
         node.declare_parameter('backup_plane_reacquire_timeout_sec', 2.0)
+        node.declare_parameter('backup_motion_feedback_recovery_timeout_sec', 2.0)
+        node.declare_parameter('backup_motion_feedback_recovery_total_sec', 4.0)
         node.declare_parameter('control_rate_hz', 20.0)
         node.declare_parameter('motion_timeout_sec', 45.0)
         node.declare_parameter('server_wait_timeout_sec', 10.0)
@@ -225,6 +234,13 @@ class MotionController:
         direction = 1.0 if requested_yaw >= 0.0 else -1.0
         start_yaw = self.current_yaw()
         target_yaw = self.normalize_angle(start_yaw + requested_yaw)
+        nominal_target = target_yaw
+        panel_targets = []
+        panel_sequence = -1
+        panel_locked = False
+        use_panel = bool(self.node.get_parameter('spin_use_lidar_heading').value)
+        done = self._make_absolute_spin_done_cb(
+            target_yaw, tolerance, stable_cycles, direction, stationary_yaw_rate)
 
         self.node.get_logger().info(
             'Spinning to an absolute odom yaw target: '
@@ -234,6 +250,36 @@ class MotionController:
             f'max_speed={max_speed:.3f}rad/s')
 
         last_stationary_source = 'imu'
+
+        def spin_done() -> bool:
+            nonlocal target_yaw, panel_sequence, panel_locked, done
+            # Finish the same turn against the physical rear panel. Only a
+            # bounded, once-only update near the nominal half-turn is allowed.
+            # Ordinary spin timing, speed and stationary checks remain below.
+            if (use_panel and not panel_locked
+                    and abs(self._absolute_yaw_error(
+                        nominal_target, self.current_yaw(), direction)) <= math.radians(12)):
+                snapshot = self.lidar.snapshot()
+                if snapshot is not None and snapshot.sequence != panel_sequence:
+                    panel_sequence = snapshot.sequence
+                    candidate = self._spin_panel_target(snapshot, nominal_target)
+                    if candidate is None:
+                        panel_targets.clear()
+                    else:
+                        panel_targets.append(self.normalize_angle(candidate-nominal_target))
+                        panel_targets[:] = panel_targets[-3:]
+                        if (len(panel_targets) == 3
+                                and max(panel_targets)-min(panel_targets) <= math.radians(1)):
+                            adjustment = statistics.median(panel_targets)
+                            target_yaw = self.normalize_angle(nominal_target+adjustment)
+                            panel_locked = True
+                            done = self._make_absolute_spin_done_cb(
+                                target_yaw, tolerance, stable_cycles, direction, stationary_yaw_rate)
+                            self.node.get_logger().info(
+                                'Spin target confirmed by three rear panel scans: '
+                                f'adjustment={math.degrees(adjustment):+.2f}deg, '
+                                f'target={math.degrees(target_yaw):+.2f}deg')
+            return done()
 
         def spin_command() -> Twist:
             nonlocal last_stationary_source
@@ -258,13 +304,7 @@ class MotionController:
             ))
 
         ok = self._run_until(
-            done_cb=self._make_absolute_spin_done_cb(
-                target_yaw,
-                tolerance,
-                stable_cycles,
-                direction,
-                stationary_yaw_rate,
-            ),
+            done_cb=spin_done,
             cmd_cb=spin_command,
             timeout_sec=float(self.node.get_parameter('motion_timeout_sec').value),
         )
@@ -280,6 +320,7 @@ class MotionController:
                 'Spin step complete: '
                 f'final={math.degrees(final_yaw):.2f}deg, '
                 f'target_error={math.degrees(final_error):.2f}deg, '
+                f'target_source={"rear_panel" if panel_locked else "odom"}, '
                 f'stationary_rate='
                 f'{math.degrees(final_stationary_rate):.2f}deg/s, '
                 f'stationary_source={final_stationary_source}')
@@ -291,6 +332,38 @@ class MotionController:
                 f'imu_age={self.imu_age_sec():.3f}s, '
                 f'stationary_source={final_stationary_source}')
         return ok
+
+    def _spin_panel_target(self, snapshot, nominal_target):
+        """Return an acquisition-time-corrected, strongly supported plane yaw."""
+        if (self.backup_lidar_heading_estimator is None
+                or not self.imu_is_fresh()):
+            return None
+        estimate = self.backup_lidar_heading_estimator(snapshot)
+        if estimate is None:
+            return None
+        error, _, inliers, points, length = estimate
+        if (not all(math.isfinite(v) for v in (error, inliers, points, length))
+                or abs(error) > math.radians(15)
+                or inliers < 12 or points < 12 or inliers > points
+                or inliers/points < .70 or length < .25):
+            return None
+        try:
+            transform = self.node.tf_buffer.lookup_transform(
+                str(self.node.get_parameter('fixed_frame').value),
+                str(self.node.get_parameter('base_frame').value),
+                Time.from_msg(snapshot.scan.header.stamp)).transform
+        except (TransformException, AttributeError):
+            return None
+        q = transform.rotation
+        norm = math.hypot(q.x, q.y, q.z, q.w)
+        if not math.isfinite(norm) or norm < 1e-6:
+            return None
+        x, y, z, w = (v/norm for v in (q.x, q.y, q.z, q.w))
+        scan_yaw = math.atan2(2*(w*z+x*y), 1-2*(y*y+z*z))
+        candidate = self.normalize_angle(scan_yaw+error)
+        if abs(self.normalize_angle(candidate-nominal_target)) > math.radians(8):
+            return None
+        return candidate
 
     def advance_before_spin(self) -> bool:
         if not bool(self.node.get_parameter('use_pre_spin_forward').value):
@@ -462,9 +535,17 @@ class MotionController:
             self.stop_robot()
             self.node.get_logger().error('Invalid measured guide width profile')
             return False
-        if not math.isfinite(handoff_clearance) or not 0 <= handoff_clearance <= .32:
+        # A measured fixed station can verify a longer straight corridor with
+        # the same full-body/remaining-distance budget. Do this before the
+        # near-field aluminum fits drift or leave the LiDAR field of view.
+        max_handoff_clearance = .50 if known_guide_width else .32
+        if (not math.isfinite(handoff_clearance)
+                or not 0 <= handoff_clearance <= max_handoff_clearance):
             self.stop_robot()
-            self.node.get_logger().error('Invalid guide visibility handoff clearance')
+            self.node.get_logger().error(
+                'Invalid guide visibility handoff clearance: '
+                f'maximum={max_handoff_clearance:.2f}m, '
+                f'known_width={known_guide_width:.3f}m')
             return False
         blocked_timeout = float(
             self.node.get_parameter('backup_blocked_timeout_sec').value)
@@ -494,6 +575,7 @@ class MotionController:
             stable_cycles_required, stage_start_sequence)
         current_command = Twist()
         filtered_lidar_heading_error: float | None = None
+        filtered_anchored_heading_error: float | None = None
         lidar_heading_error: float | None = None
         lidar_heading_anchor_error: float | None = None
         lidar_heading_anchor_imu = start_integrated_imu_yaw
@@ -516,9 +598,17 @@ class MotionController:
         last_heading_command_at = time.monotonic()
         blocked_since: float | None = None
         guide_missing_since: float | None = None
+        guide_clearance_diagnostic: str | None = None
         guide_entry_verified = False
         straight_entry_observations = []
         guide_handoff = None
+        handoff_path = None
+        handoff_progress = 0.0
+        handoff_lateral_spent = 0.0
+        handoff_previous_xy = None
+        handoff_previous_heading = 0.0
+        handoff_station_yaw = 0.0
+        handoff_last_clearance = 0.0
         plane_missing_since: float | None = None
         stationary_recovery_errors: list[float] = []
         stationary_recovery_wheel: float | None = None
@@ -530,6 +620,18 @@ class MotionController:
             self.node.get_logger().error('Invalid backup plane reacquisition timeout')
             return False
         last_log_time = 0.0
+        feedback_recovery_timeout = float(self.node.get_parameter(
+            'backup_motion_feedback_recovery_timeout_sec').value)
+        feedback_recovery_total = float(self.node.get_parameter(
+            'backup_motion_feedback_recovery_total_sec').value)
+        if not (math.isfinite(feedback_recovery_timeout)
+                and math.isfinite(feedback_recovery_total)
+                and 0 < feedback_recovery_timeout <= 3.
+                and feedback_recovery_timeout <= feedback_recovery_total <= 6.):
+            self.stop_robot()
+            self.node.get_logger().error('Invalid backup motion feedback recovery budgets')
+            return False
+        feedback_recovery_used = 0.0
 
         transform = getattr(self.lidar, 'transform', None)
         lidar_target_log = ''
@@ -558,12 +660,43 @@ class MotionController:
                 self.node.get_logger().error('LiDAR backup step timed out')
                 return False
 
-            if not self.odom_is_fresh():
+            odom_fresh, wheel_fresh = self.odom_is_fresh(), self.wheel_yaw_is_fresh()
+            if (guide_handoff is not None and (not odom_fresh or not wheel_fresh)
+                    and self.imu_is_fresh()):
+                # A verified straight corridor does not become invalid just
+                # because encoder delivery has a brief gap. Stop immediately;
+                # never continue on stale motion or relatch the heading anchor.
+                recovery_budget = min(feedback_recovery_timeout,
+                                      feedback_recovery_total-feedback_recovery_used,
+                                      timeout_sec-elapsed)
+                recovery_started = time.monotonic()
+                current_command = Twist()
+                self.stop_robot()
+                self.node.get_logger().warning(
+                    'Verified straight backup paused for fresh motion feedback: '
+                    f'odom_fresh={odom_fresh}, wheel_fresh={wheel_fresh}, '
+                    f'wheel_header_age={(self.node.get_clock().now().nanoseconds-self.last_wheel_yaw_stamp_nanoseconds)/1e9:.3f}s, '
+                    f'recovery_budget={recovery_budget:.3f}s')
+                if not self._wait_for_backup_motion_feedback(
+                        recovery_started+max(0., recovery_budget)):
+                    self.stop_robot()
+                    self.node.get_logger().error(
+                        'Verified straight backup motion feedback did not recover while stopped; '
+                        'original heading/travel/time guards retained')
+                    return False
+                feedback_recovery_used += time.monotonic()-recovery_started
+                stability.reset()
+                self.node.get_logger().info(
+                    'Verified straight backup motion feedback recovered while stopped: '
+                    f'waited={time.monotonic()-recovery_started:.3f}s, '
+                    f'total_wait={feedback_recovery_used:.3f}s; original corridor anchor retained')
+                continue
+            if not odom_fresh:
                 self.stop_robot()
                 self.node.get_logger().error(
                     'Odometry became stale during LiDAR backup')
                 return False
-            if not self.wheel_yaw_is_fresh():
+            if not wheel_fresh:
                 self.stop_robot()
                 self.node.get_logger().error(
                     'Wheel-only yaw diagnostics became stale during LiDAR backup')
@@ -574,12 +707,63 @@ class MotionController:
                 anchor_travel, anchor_gyro, anchor_heading, heading_budget, remaining = guide_handoff
                 held_heading = anchor_heading - (
                     self.current_integrated_imu_yaw() - anchor_gyro)
-                if (not self.imu_is_fresh()
+                step = math.hypot(current_x-handoff_previous_xy[0],
+                                  current_y-handoff_previous_xy[1])
+                # A signed path already includes nominal sideways travel from
+                # its initial tilt. Spend only departures from that fixed ray;
+                # odom and gyro independently bound the additional departure.
+                tracking_yaw = handoff_station_yaw
+                previous, current = handoff_previous_heading, held_heading
+                if handoff_path is not None:
+                    tracking_yaw -= anchor_heading
+                    previous -= anchor_heading
+                    current -= anchor_heading
+                    handoff_progress += step
+                side_step = abs(
+                    -(current_x-handoff_previous_xy[0])*math.sin(tracking_yaw)
+                    +(current_y-handoff_previous_xy[1])*math.cos(tracking_yaw))
+                handoff_lateral_spent += max(side_step, step * max(
+                    abs(math.sin(previous)), abs(math.sin(current))))
+                if handoff_path is not None:
+                    # Arc length overstates progress along the initial ray;
+                    # charge that difference as additional position uncertainty.
+                    handoff_lateral_spent += step * max(
+                        0., 1-min(math.cos(previous), math.cos(current)))
+                handoff_previous_xy = (current_x, current_y)
+                handoff_previous_heading = held_heading
+                # The latest rear scan may be slightly older than odometry.
+                # Use the larger remaining distance, retaining its conservative
+                # bound even between scans and across stopped sensor recovery.
+                live_remaining = max(handoff_last_clearance,
+                                     remaining-max(0., traveled-anchor_travel))
+                path_clearance = None
+                if handoff_path is not None:
+                    path_clearance = handoff_path.clearance(
+                        held_heading, handoff_progress, live_remaining,
+                        handoff_lateral_spent)
+                elif known_guide_width:
+                    heading_budget = remaining_straight_heading_budget(
+                        heading_budget, remaining, live_remaining,
+                        handoff_lateral_spent, heading_pause_error)
+                handoff_imu_fresh = self.imu_is_fresh()
+                if (not handoff_imu_fresh
+                        or heading_budget <= 0
+                        or (path_clearance is not None
+                            and path_clearance < guide_side_margin)
                         or abs(held_heading) > heading_budget
                         or traveled - anchor_travel > remaining + .02):
                     self.stop_robot()
                     self.node.get_logger().error(
-                        'Guide visibility handoff lost its bounded straight heading/travel')
+                        'Guide visibility handoff lost its bounded straight heading/travel: '
+                        f'heading={math.degrees(held_heading):+.3f}deg, '
+                        f'budget={math.degrees(heading_budget):.3f}deg, '
+                        f'anchor_heading={math.degrees(anchor_heading):+.3f}deg, '
+                        f'lateral_spent={handoff_lateral_spent:.4f}m, '
+                        f'path_side_clearance={self._format_optional_meters(path_clearance)}, '
+                        f'remaining={live_remaining:.3f}m, '
+                        f'imu_fresh={handoff_imu_fresh}, '
+                        f'travel={traveled-anchor_travel:.3f}m, '
+                        f'travel_limit={remaining+.02:.3f}m')
                     return False
             if traveled >= max_travel:
                 self.stop_robot()
@@ -639,6 +823,7 @@ class MotionController:
                 continue
 
             clearance = min(value for _, value in indexed_clearances)
+            handoff_last_clearance = clearance
             completion_threshold = target_clearance + tolerance
             completion_minimum = max(target_clearance - tolerance, 0.0)
             minimum_beam_span = math.ceil(
@@ -713,8 +898,11 @@ class MotionController:
                     (candidate_error, _, inliers, total_points,
                      line_length) = estimate
                     inlier_ratio = inliers / max(total_points, 1)
+                    heading_in_range = (
+                        math.isfinite(candidate_error)
+                        and abs(candidate_error) <= lidar_heading_max_error)
                     quality_valid = (
-                            abs(candidate_error) <= lidar_heading_max_error
+                            heading_in_range
                             and inlier_ratio >= lidar_heading_min_inlier_ratio
                             and line_length >= lidar_heading_min_line_length)
                     motion_consistent = True
@@ -783,6 +971,7 @@ class MotionController:
                             lidar_heading_anchor_wheel = self.current_wheel_yaw()
                             imu_heading_reference = self.current_integrated_imu_yaw()
                             filtered_lidar_heading_error = candidate_error
+                            filtered_anchored_heading_error = candidate_error
                             lidar_heading_stable_count = 0
                             heading_correction_active = True
                             heading_settled_count = 0
@@ -801,6 +990,7 @@ class MotionController:
                         wheel_guard_filtered_error = None
                         wheel_guard_stable_count = 0
                         lidar_heading_error = candidate_error
+                        previous_filtered_heading_error = filtered_lidar_heading_error
                         (
                             next_filtered_error,
                             sample_accepted,
@@ -811,6 +1001,20 @@ class MotionController:
                             lidar_heading_max_jump,
                         )
                         if sample_accepted:
+                            if lidar_heading_anchor_error is None:
+                                filtered_anchored_heading_error = next_filtered_error
+                            else:
+                                anchored_error = self.normalize_angle(
+                                    lidar_heading_anchor_error
+                                    - (self.current_integrated_imu_yaw()
+                                       - lidar_heading_anchor_imu))
+                                if (filtered_anchored_heading_error is None
+                                        or previous_filtered_heading_error is None):
+                                    filtered_anchored_heading_error = anchored_error
+                                else:
+                                    filtered_anchored_heading_error += (
+                                        lidar_heading_filter_coef*self.normalize_angle(
+                                            anchored_error-filtered_anchored_heading_error))
                             filtered_lidar_heading_error = next_filtered_error
                             lidar_heading_stable_count += 1
                             lidar_heading_status = 'warming_up'
@@ -909,11 +1113,15 @@ class MotionController:
                         lidar_heading_stable_count = 0
                         wheel_guard_filtered_error = None
                         wheel_guard_stable_count = 0
-                        lidar_heading_status = 'quality_rejected'
+                        lidar_heading_status = (
+                            'quality_rejected' if heading_in_range
+                            else 'heading_out_of_range')
                         self.node.get_logger().warning(
                             'Rejected backup plane: '
                             f'error={math.degrees(candidate_error):+.2f}deg, '
-                            f'inliers={inliers}/{total_points}, length={line_length:.3f}m',
+                            f'angle_limit={math.degrees(lidar_heading_max_error):.2f}deg, '
+                            f'inliers={inliers}/{total_points}, length={line_length:.3f}m, '
+                            f'reason={lidar_heading_status}',
                             throttle_duration_sec=1.0)
                 else:
                     filtered_lidar_heading_error = None
@@ -940,7 +1148,13 @@ class MotionController:
 
             guide_center_offset = None
             guide_separation = None
+            guide_side_clearance = None
+            guide_entry_offset = None
             guide_center_heading = 0.0
+            wall_control_heading_error = None
+            wall_control_heading_source = 'unavailable'
+            heading_pause_observed_error = None
+            heading_pause_source = 'unavailable'
             if (
                     use_guide_centering
                     and guide_handoff is None
@@ -949,7 +1163,26 @@ class MotionController:
                 if guide is not None:
                     guide_center_offset = guide.center_offset
                     guide_separation = guide.separation
-                    if (
+                    rear_offset = getattr(guide, 'rear_center_offset', None)
+                    guide_entry_offset = (
+                        rear_offset if known_guide_width and rear_offset is not None
+                        else guide_center_offset)
+                    if not math.isfinite(guide_entry_offset):
+                        self.stop_robot()
+                        self.node.get_logger().error('Invalid guide rear entry offset')
+                        return False
+                    supported_guide_width = (
+                        known_guide_width-known_width_uncertainty
+                        if known_guide_width else guide_separation)
+                    guide_side_clearance = (supported_guide_width / 2.0
+                                            - abs(guide_entry_offset)
+                                            - guide_body_half_width)
+                    if guide_side_clearance < guide_side_margin:
+                        # Unsafe warm-up scans cannot count toward a later
+                        # recovery just because their centers agree closely.
+                        filtered_guide_center_offset = None
+                        guide_stable_count = 0
+                    elif (
                             filtered_guide_center_offset is None
                             or abs(
                                 guide.center_offset
@@ -986,6 +1219,20 @@ class MotionController:
                     filtered_guide_center_offset = None
             else:
                 guide_stable_count = 0
+
+            if use_guide_centering and known_guide_width and guide_handoff is None:
+                # Warm-up samples already passed plane quality/motion checks.
+                # Include them in the same five-scan corridor history instead
+                # of discarding them and steering before collecting five more.
+                if (guide_center_offset is not None
+                        and lidar_heading_status in ('warming_up', 'tracking')
+                        and self.imu_is_fresh() and not heading_correction_active):
+                    straight_entry_observations.append((
+                        guide_center_offset, guide_separation,
+                        lidar_heading_error, self.current_integrated_imu_yaw()))
+                    straight_entry_observations = straight_entry_observations[-5:]
+                else:
+                    straight_entry_observations = []
 
             stationary_yaw_rate_value, stationary_source = (
                 self.current_stationary_yaw_rate())
@@ -1057,57 +1304,88 @@ class MotionController:
             plane_missing_since = None
             if use_guide_centering and guide_handoff is None:
                 if protective_clearance > guide_center_disable_clearance:
+                    if guide_side_clearance is not None:
+                        if guide_side_clearance < guide_side_margin:
+                            # A short run of reflected rail fits is not a terminal
+                            # failure. Recheck unique scans while stopped, within
+                            # the existing guide acquisition budget. Never reverse
+                            # or retain a straight-entry proof from the bad fit.
+                            current_command = Twist()
+                            self.cmd_vel_pub.publish(current_command)
+                            last_heading_command_at = time.monotonic()
+                            straight_entry_observations = []
+                            guide_entry_verified = False
+                            guide_stable_count = 0
+                            filtered_guide_center_offset = None
+                            diagnostic = (
+                                f'nearest_side={guide_side_clearance:.3f}m, '
+                                f'required_margin={guide_side_margin:.3f}m, '
+                                f'center_offset={guide_center_offset:+.3f}m, '
+                                f'rear_entry_offset={guide_entry_offset:+.3f}m, '
+                                f'guide_width={guide_separation:.3f}m, '
+                                f'supported_width={supported_guide_width:.3f}m')
+                            guide_clearance_diagnostic = diagnostic
+                            if guide_missing_since is None:
+                                guide_missing_since = time.monotonic()
+                                self.node.get_logger().warning(
+                                    'Backup paused to recheck guide side clearance: '
+                                    + diagnostic)
+                            if time.monotonic() - guide_missing_since >= reacquire_timeout:
+                                self.stop_robot()
+                                self.node.get_logger().error(
+                                    'Insufficient guide side clearance persists after '
+                                    f'{reacquire_timeout:.2f}s stopped recheck: ' + diagnostic)
+                                return False
+                            spin_for(self.node, sleep_time, self.should_stop)
+                            continue
                     guide_ready = (
                         lidar_heading_control_available
                         and guide_stable_count >= guide_center_stable_cycles)
                     if not guide_ready:
-                        straight_entry_observations = []
+                        if not known_guide_width:
+                            straight_entry_observations = []
                         current_command = Twist()
                         self.cmd_vel_pub.publish(current_command)
+                        last_heading_command_at = time.monotonic()
                         if guide_missing_since is None:
                             guide_missing_since = time.monotonic()
                             self.node.get_logger().warning(
                                 'Backup paused: waiting for two stable guide rails')
                         if time.monotonic() - guide_missing_since >= reacquire_timeout:
                             self.stop_robot()
-                            self.node.get_logger().error(
-                                'Guide rails unavailable or inconsistent while stopped; '
-                                'refusing uncentered entry')
+                            if guide_clearance_diagnostic is not None:
+                                self.node.get_logger().error(
+                                    'Guide side clearance did not recover during '
+                                    f'{reacquire_timeout:.2f}s stopped recheck: '
+                                    + guide_clearance_diagnostic)
+                            else:
+                                self.node.get_logger().error(
+                                    'Guide rails unavailable or inconsistent while stopped; '
+                                    'refusing uncentered entry')
                             return False
                         spin_for(self.node, sleep_time, self.should_stop)
                         continue
                     guide_missing_since = None
-                    lateral_room = (
-                        (known_guide_width-known_width_uncertainty
-                         if known_guide_width else guide_separation) / 2.0
-                        - abs(guide_center_offset)
-                        - guide_body_half_width)
-                    if lateral_room < guide_side_margin:
-                        self.stop_robot()
-                        self.node.get_logger().error(
-                            'Insufficient guide side clearance for reverse entry: '
-                            f'nearest_side={lateral_room:.3f}m, '
-                            f'required_margin={guide_side_margin:.3f}m, '
-                            f'center_offset={guide_center_offset:+.3f}m, '
-                            f'guide_width={guide_separation:.3f}m')
-                        return False
+                    guide_clearance_diagnostic = None
                     guide_entry_verified = (
                         abs(filtered_guide_center_offset) <= guide_center_tolerance
                         and abs(guide_center_offset) <= guide_center_tolerance
                         and abs(filtered_lidar_heading_error) <= heading_tolerance
                         and abs(lidar_heading_error) <= heading_tolerance)
-                    # Keep centered rail history while heading converges.
-                    # Requiring every old heading to pass before recording
-                    # left only three scans before the rails vanished in
-                    # trial 42. The corridor budget checks the CURRENT pose.
-                    if (abs(filtered_guide_center_offset) <= guide_center_tolerance
-                            and abs(guide_center_offset) <= guide_center_tolerance
+                    # Record safe rail observations before aluminum returns
+                    # disappear behind the scanner. At a measured station,
+                    # accept by full-path clearance, not the steering deadband.
+                    # The independent side-clearance check above still applies.
+                    if ((known_guide_width or (
+                            abs(filtered_guide_center_offset) <= guide_center_tolerance
+                            and abs(guide_center_offset) <= guide_center_tolerance))
                             and self.imu_is_fresh() and not heading_correction_active):
                         corridor_gyro = self.current_integrated_imu_yaw()
-                        straight_entry_observations.append((
-                            guide_center_offset, guide_separation,
-                            lidar_heading_error, corridor_gyro))
-                        straight_entry_observations = straight_entry_observations[-5:]
+                        if not known_guide_width:
+                            straight_entry_observations.append((
+                                guide_center_offset, guide_separation,
+                                lidar_heading_error, corridor_gyro))
+                            straight_entry_observations = straight_entry_observations[-5:]
                         corridor_observations = [
                             (center, width, self.normalize_angle(
                                 angle-(corridor_gyro-sample_gyro)))
@@ -1116,15 +1394,39 @@ class MotionController:
                         budget = straight_entry_heading_budget(
                             corridor_observations, clearance,
                             guide_center_tolerance, guide_body_half_width,
-                            guide_side_margin, heading_tolerance,
+                            # At this measured station, straight-path safety
+                            # comes from the full-body side margin. The 1 deg
+                            # yaw convergence target is not that safety limit.
+                            # Preserve the normal pause-error ceiling (3 deg)
+                            # and the old tolerance cap at unmeasured stations.
+                            guide_side_margin, (
+                                heading_pause_error if known_guide_width
+                                else heading_tolerance),
                             float(self.node.get_parameter('backup_rear_reference_x').value),
                             known_width=known_guide_width,
                             known_width_uncertainty=known_width_uncertainty)
+                        candidate_path = None
+                        if (budget is None and known_guide_width
+                                and clearance <= handoff_clearance):
+                            candidate_path = straight_entry_path(
+                                corridor_observations, clearance,
+                                guide_body_half_width, guide_side_margin,
+                                heading_pause_error,
+                                float(self.node.get_parameter('backup_rear_reference_x').value),
+                                known_guide_width, known_width_uncertainty,
+                                lidar_heading_error)
+                            if candidate_path is not None:
+                                budget = heading_pause_error
                         if (budget is not None and clearance <= handoff_clearance
                                 and not heading_correction_active):
+                            handoff_path = candidate_path
                             guide_handoff = (
                                 traveled, self.current_integrated_imu_yaw(),
                                 lidar_heading_error, budget, clearance)
+                            handoff_previous_xy = (current_x, current_y)
+                            handoff_previous_heading = lidar_heading_error
+                            handoff_station_yaw = self.current_yaw()+lidar_heading_error
+                            handoff_last_clearance = clearance
                             guide_center_heading = 0.0
                             heading_correction_active = False
                             # Switch immediately without stopping/reloading the
@@ -1137,7 +1439,9 @@ class MotionController:
                                 f'center={guide_center_offset:+.3f}m, '
                                 f'width={guide_separation:.3f}m, '
                                 f'known_width={known_guide_width:.3f}m, '
+                                f'heading={math.degrees(lidar_heading_error):+.3f}deg, '
                                 f'gyro_heading_limit={math.degrees(budget):.2f}deg; '
+                                f'corridor_check={"signed_rectangle" if handoff_path else "symmetric_bound"}; '
                                 'continuous straight entry with rear distance and IMU guards')
                     else:
                         straight_entry_observations = []
@@ -1174,8 +1478,29 @@ class MotionController:
                     command_speed += (
                         min(command_speed, min_speed) - command_speed) * fraction
                 wall_heading_error = 0.0
+                pause_heading_error = None
                 if lidar_heading_control_available:
                     wall_heading_error = filtered_lidar_heading_error or 0.0
+                    wall_control_heading_source = 'live_lidar'
+                    pause_heading_error = wall_heading_error
+                    heading_pause_source = 'live_lidar'
+                    if (use_guide_centering and known_guide_width
+                            and not heading_correction_active
+                            and lidar_heading_anchor_error is not None
+                            and filtered_anchored_heading_error is not None
+                            and imu_motion_residual is not None
+                            and abs(imu_motion_residual) <= lidar_motion_residual_limit
+                            and self.imu_is_fresh()):
+                        # The stationary plane fixes dock direction; fresh gyro
+                        # measures actual chassis rotation. Trial88's changing
+                        # visible panel added ~0.6deg without that rotation,
+                        # falsely triggering a harmful in-place correction.
+                        # Live plane quality/motion/guide checks remain above.
+                        # Only the in-place correction trigger uses this
+                        # independent rotation estimate. Normal guide steering
+                        # and corridor geometry still use the live plane.
+                        pause_heading_error = filtered_anchored_heading_error
+                        heading_pause_source = 'stationary_lidar_imu'
                     heading_error = wall_heading_error
                 elif heading_source == 'wheel_guard':
                     # The RANSAC plane is stable but its translation-dependent
@@ -1212,12 +1537,16 @@ class MotionController:
                     heading_correction_active = False
                     heading_settled_count = 0
                 was_heading_correction_active = heading_correction_active
+                heading_pause_observed_error = (
+                    correction_error if heading_correction_active
+                    else pause_heading_error)
                 heading_correction_active, heading_settled_count = (
                     self._update_backup_heading_correction(
                         heading_correction_active,
                         heading_settled_count,
                         lidar_heading_control_available,
-                        correction_error if lidar_heading_control_available else 0.0,
+                        (heading_pause_observed_error or 0.0)
+                        if lidar_heading_control_available else 0.0,
                         max(abs(stationary_yaw_rate_value),
                             abs(self.current_odom_yaw_rate())),
                         heading_tolerance,
@@ -1240,6 +1569,7 @@ class MotionController:
                     imu_heading_reference = self.current_integrated_imu_yaw()
                     wheel_heading_reference = self.current_wheel_yaw()
                     lidar_heading_anchor_error = filtered_lidar_heading_error
+                    filtered_anchored_heading_error = filtered_lidar_heading_error
                     lidar_heading_anchor_imu = self.current_integrated_imu_yaw()
                     lidar_heading_anchor_odom = self.current_yaw()
                     lidar_heading_anchor_wheel = self.current_wheel_yaw()
@@ -1251,6 +1581,9 @@ class MotionController:
                 # move this target or cause a reversal during settling.
                 if heading_correction_active:
                     guide_center_heading = 0.0
+                    correction_error = filtered_lidar_heading_error or 0.0
+                    wall_control_heading_source = 'live_lidar'
+                wall_control_heading_error = correction_error
                 heading_error = normalize_angle(
                     correction_error + guide_center_heading)
                 # Centering has its own lateral deadband. The wall's 1-degree
@@ -1327,8 +1660,10 @@ class MotionController:
                 self.node.get_logger().error(
                     'LiDAR backup remains blocked outside the completion '
                     'condition: '
-                    f'center_clearance={clearance:.3f}m, '
-                    f'protective_clearance={protective_clearance:.3f}m, '
+                    f'center_clearance={clearance:.4f}m, '
+                    f'protective_clearance={protective_clearance:.4f}m, '
+                    f'completion_band={completion_minimum:.4f}..{completion_threshold:.4f}m, '
+                    f'panel_points_in_band={sum(completion_minimum <= v <= completion_threshold for _, v in indexed_clearances)}, '
                     f'completion_cluster={completion_cluster}, '
                     f'stable_scans={stability.count}/{stable_cycles_required}, '
                     f'safety_sector=rear+/-'
@@ -1358,6 +1693,12 @@ class MotionController:
                     f'filtered_heading_error='
                     f'{self._format_optional_degrees(
                         filtered_lidar_heading_error)}, '
+                    f'wall_control_error='
+                    f'{self._format_optional_degrees(wall_control_heading_error)}, '
+                    f'wall_control_source={wall_control_heading_source}, '
+                    f'heading_pause_error='
+                    f'{self._format_optional_degrees(heading_pause_observed_error)}, '
+                    f'heading_pause_source={heading_pause_source}, '
                     f'imu_plane_residual='
                     f'{self._format_optional_degrees(imu_motion_residual)}, '
                     f'odom_plane_residual='
@@ -1369,6 +1710,8 @@ class MotionController:
                     f'{lidar_heading_stable_cycles}, '
                     f'guide_center_offset='
                     f'{self._format_optional_meters(guide_center_offset)}, '
+                    f'guide_rear_entry_offset='
+                    f'{self._format_optional_meters(guide_entry_offset)}, '
                     f'filtered_guide_center='
                     f'{self._format_optional_meters(
                         filtered_guide_center_offset)}, '
@@ -1390,6 +1733,51 @@ class MotionController:
             spin_for(self.node, sleep_time, self.should_stop)
 
         self.stop_robot()
+        return False
+
+    def _wait_for_backup_motion_feedback(self, deadline: float) -> bool:
+        """Hold zero until new settled motion and three new LiDAR scans arrive.
+
+        Used only after a corridor has been independently verified. Do not
+        replace its IMU heading/travel anchor or extend the backup deadline.
+        """
+        previous = (self.last_odom_stamp_nanoseconds, self.last_imu_stamp_nanoseconds,
+                    self.last_wheel_yaw_stamp_nanoseconds)
+        scan_sequence = self.lidar.sequence
+        new_scans, settled_samples = 0, 0
+        while rclpy.ok() and not self.should_stop() and time.monotonic() < deadline:
+            self.cmd_vel_pub.publish(Twist())
+            spin_for(self.node, .02, self.should_stop)
+            if time.monotonic() >= deadline:
+                return False
+            # The committed corridor depends on continuous gyro tracking.
+            # Recover absolute encoder/odom delivery, never bridge a lost gyro
+            # interval by pretending its unmeasured rotation was zero.
+            if not self.imu_is_fresh():
+                return False
+            fresh = (self.odom_is_fresh() and self.imu_is_fresh()
+                     and self.wheel_yaw_is_fresh())
+            snapshot = self.lidar.snapshot()
+            if not fresh or snapshot is None:
+                settled_samples = new_scans = 0
+                scan_sequence = self.lidar.sequence
+                continue
+            settled = (self.is_stationary(.005)
+                       and abs(self.current_odom_yaw_rate()) <= math.radians(.5))
+            if not settled:
+                settled_samples = new_scans = 0
+                scan_sequence = snapshot.sequence
+                continue
+            if snapshot.sequence > scan_sequence:
+                scan_sequence = snapshot.sequence
+                new_scans += 1
+            current = (self.last_odom_stamp_nanoseconds, self.last_imu_stamp_nanoseconds,
+                       self.last_wheel_yaw_stamp_nanoseconds)
+            if all(new > old for new, old in zip(current, previous)):
+                previous = current
+                settled_samples += 1
+            if settled_samples >= 5 and new_scans >= 3:
+                return True
         return False
 
     def stop_robot(self) -> None:

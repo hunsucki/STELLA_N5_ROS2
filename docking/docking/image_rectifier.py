@@ -81,16 +81,28 @@ class DockingImageRectifier(Node):
         super().__init__('rectify')
         self.declare_parameter('input_transport', 'auto')
         self.declare_parameter('max_rate_hz', 10.0)
+        self.declare_parameter('input_stall_recovery_attempts', 2)
+        self.declare_parameter('output_reliability', 'best_effort')
         self.transport = str(self.get_parameter('input_transport').value)
         self.max_rate = float(self.get_parameter('max_rate_hz').value)
+        self.input_stall_recovery_attempts = int(
+            self.get_parameter('input_stall_recovery_attempts').value)
         if self.transport not in ('auto', 'raw', 'compressed'):
             raise ValueError('input_transport must be auto, raw or compressed')
         if not math.isfinite(self.max_rate) or self.max_rate <= 0.0:
             raise ValueError('max_rate_hz must be positive and finite')
+        if not 0 <= self.input_stall_recovery_attempts <= 2:
+            raise ValueError('input_stall_recovery_attempts must be between zero and two')
         self.rectifier = ImageRectifier()
-        # Match AprilTag's reliable subscriber. Small images at a bounded rate
-        # avoid a second full-rate RGB stream and permit DDS retransmission.
-        self.image_pub = self.create_publisher(Image, 'image_rect', 5)
+        # Old camera frames are discarded by control anyway. Avoid reliable
+        # image retransmissions under the measured UDP send-buffer overload.
+        reliability = str(self.get_parameter('output_reliability').value)
+        if reliability not in ('reliable', 'best_effort'):
+            raise ValueError('output_reliability must be reliable or best_effort')
+        self.output_reliability = reliability
+        image_qos = qos_profile_sensor_data if reliability == 'best_effort' else 5
+        self.image_pub = self.create_publisher(Image, 'image_rect', image_qos)
+        # Calibration is small; preserve reliable visibility-guard consumers.
         self.info_pub = self.create_publisher(
             CameraInfo, 'camera_info_rect', 5)
         self.image_sub = None
@@ -99,8 +111,11 @@ class DockingImageRectifier(Node):
         self.images_received = self.infos_received = self.pairs_received = 0
         self.outputs = 0
         self.selected_transport = None
+        self.last_image_at = self.last_info_at = self.started_at
+        self.last_input_reconnect_at = self.started_at
+        self.input_reconnects = 0
         self.selection_timer = self.create_timer(0.5, self._select_transport)
-        self.health_timer = self.create_timer(2.0, self._report_health)
+        self.health_timer = self.create_timer(0.5, self._report_health)
 
     def _select_transport(self):
         if self.image_sub is not None:
@@ -114,6 +129,13 @@ class DockingImageRectifier(Node):
             else:
                 return
         self.selected_transport = selected
+        self._connect_inputs()
+        self.get_logger().info(
+            f'Rectifier input={selected} ({self.image_sub.getTopic()}); '
+            f'output=mono8, {self.output_reliability}, <= {self.max_rate:g}Hz')
+
+    def _connect_inputs(self):
+        selected = self.selected_transport
         topic = 'image/compressed' if selected == 'compressed' else 'image'
         message_type = CompressedImage if selected == 'compressed' else Image
         self.image_sub = Subscriber(
@@ -124,23 +146,44 @@ class DockingImageRectifier(Node):
         self.info_sub.registerCallback(self._on_info)
         self.sync = TimeSynchronizer([self.image_sub, self.info_sub], queue_size=10)
         self.sync.registerCallback(self._on_pair)
-        self.get_logger().info(
-            f'Rectifier input={selected} ({self.resolve_topic_name(topic)}); '
-            f'output=mono8, reliable, <= {self.max_rate:g}Hz')
+        self.last_image_at = self.last_info_at = time.monotonic()
 
     def _on_image(self, _):
         self.images_received += 1
+        self.last_image_at = time.monotonic()
 
     def _on_info(self, _):
         self.infos_received += 1
+        self.last_info_at = time.monotonic()
 
     def _report_health(self):
-        if time.monotonic() - self.last_output_at > 1.0:
+        now = time.monotonic()
+        if now - self.last_output_at > 1.0:
             self.get_logger().warning(
                 f'No recent rectified image: transport={self.selected_transport}, '
                 f'images={self.images_received}, camera_info={self.infos_received}, '
                 f'exact_pairs={self.pairs_received}, outputs={self.outputs}; '
-                'check camera delivery and identical acquisition timestamps')
+                'check camera delivery and identical acquisition timestamps',
+                throttle_duration_sec=2.0)
+        # Trial 59 stopped receiving both inputs while a newly created reader
+        # received the same camera normally. Recreate only our readers and
+        # exact-sync queue; never restart the camera or reuse queued old pairs.
+        # A visible-image stream with no tag detections is not an input stall.
+        if (self.image_sub is not None
+                and now-max(self.last_image_at, self.last_info_at) >= 1.0
+                and now-self.last_input_reconnect_at >= 2.0
+                and self.input_reconnects < self.input_stall_recovery_attempts):
+            self.input_reconnects += 1
+            self.last_input_reconnect_at = now
+            self.get_logger().warning(
+                f'Camera image and CameraInfo inputs stalled; reconnecting only '
+                f'rectifier subscribers ({self.input_reconnects}/'
+                f'{self.input_stall_recovery_attempts}); camera remains running')
+            for subscriber in (self.image_sub, self.info_sub):
+                subscriber.callbacks.clear()
+                self.destroy_subscription(subscriber.sub)
+            self.sync = None
+            self._connect_inputs()
 
     def _on_pair(self, image, info):
         self.pairs_received += 1

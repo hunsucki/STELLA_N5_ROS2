@@ -181,6 +181,154 @@ def test_proactive_straight_entry_ignores_degraded_fits_but_keeps_motion_guards(
                    if .04 < state.gap + x < .33)
 
 
+@pytest.mark.parametrize('handoff_clearance,fault', [
+    (.32, None), (.50, None), (.50, 'imu_loss'), (.50, 'yaw_drift'),
+    (.50, 'odom_loss'), (.50, 'wheel_loss'), (.50, 'overrun'),
+])
+def test_long_measured_corridor_commits_before_near_field_fit_degrades(
+        simulation, handoff_clearance, fault):
+    motion, state = simulation
+    state.gap = .48
+    state.offset = .005
+    motion.node.parameters.update(
+        use_lidar_guide_centering=True,
+        backup_guide_center_tolerance=.015,
+        backup_guide_visibility_handoff_clearance=handoff_clearance,
+        backup_guide_known_width=.54)
+    original_guide = motion.backup_lidar_guide_estimator
+    original_heading = motion.backup_lidar_heading_estimator
+    original_odom = motion.odom_is_fresh
+    original_wheel = motion.wheel_yaw_is_fresh
+    bad_fits = []
+
+    def guide(snapshot):
+        if state.gap + state.x < .40:
+            bad_fits.append(state.now)
+            return None
+        return original_guide(snapshot)
+
+    motion.backup_lidar_guide_estimator = guide
+    motion.backup_lidar_heading_estimator = lambda s: (
+        (math.radians(3), 0, 30, 30, .5)
+        if state.gap + state.x < .40 else original_heading(s))
+    motion.imu_is_fresh = lambda: not (
+        fault == 'imu_loss' and state.gap + state.x < .35)
+    motion.current_integrated_imu_yaw = lambda: (
+        math.radians(2) if fault == 'yaw_drift' and state.gap + state.x < .35
+        else state.yaw)
+    motion.odom_is_fresh = lambda: original_odom() and not (
+        fault == 'odom_loss' and state.gap + state.x < .35)
+    motion.wheel_yaw_is_fresh = lambda: original_wheel() and not (
+        fault == 'wheel_loss' and state.gap + state.x < .35)
+    if fault == 'overrun':
+        motion._rear_clearances = lambda _: [
+            (i, .002 if state.gap + state.x < .35 else state.gap + state.x)
+            for i in range(12)]
+
+    assert motion.backup_with_lidar() is (handoff_clearance == .50 and fault is None)
+    assert state.linear == state.angular == 0
+    if handoff_clearance == .50:
+        assert not bad_fits
+        assert any('Guide visibility handoff:' in str(call)
+                   for call in motion.node.get_logger().info.call_args_list)
+    else:
+        assert bad_fits
+
+
+@pytest.mark.parametrize('known_width,clearance', [(0., .50), (.54, .501)])
+def test_long_handoff_requires_measured_profile_and_bounded_distance(
+        simulation, known_width, clearance):
+    motion, state = simulation
+    motion.node.parameters.update(
+        backup_guide_known_width=known_width,
+        backup_guide_visibility_handoff_clearance=clearance)
+    assert not motion.backup_with_lidar()
+    assert all(v == w == 0 for _, _, _, v, w in state.sent)
+
+
+@pytest.mark.parametrize('offset', [-.017, .017])
+def test_measured_entry_remembers_safe_corridor_when_guides_leave_view(simulation, offset):
+    motion, state = simulation
+    state.gap, state.offset = .48, offset
+    motion.node.parameters.update(
+        use_lidar_guide_centering=True,
+        backup_guide_center_tolerance=.015,
+        backup_guide_visibility_handoff_clearance=.50,
+        backup_guide_known_width=.54)
+    guide = motion.backup_lidar_guide_estimator
+    motion.backup_lidar_guide_estimator = lambda snapshot: (
+        None if state.gap+state.x < .45 else guide(snapshot))
+    assert motion.backup_with_lidar()
+    assert any('Guide visibility handoff:' in str(call)
+               for call in motion.node.get_logger().info.call_args_list)
+    # Initial visible-guide correction is permitted; after the rails leave
+    # view the committed entry must continue without steering or reacquisition.
+    assert all(w == 0 for _, x, _, v, w in state.sent
+               if v < 0 and state.gap+x < .45)
+    assert .0145 <= state.gap+state.x <= .0245
+    assert state.linear == state.angular == 0
+
+
+@pytest.mark.parametrize('bad_initial_plane', [False, True])
+def test_verified_warmup_scans_count_before_guide_tips_leave_lidar_view(
+        simulation, bad_initial_plane):
+    motion, state = simulation
+    state.gap, state.offset = .48, .017
+    motion.node.parameters.update(
+        use_lidar_guide_centering=True,
+        backup_guide_center_tolerance=.015,
+        backup_guide_visibility_handoff_clearance=.50,
+        backup_guide_known_width=.54)
+    guide = motion.backup_lidar_guide_estimator
+    # Sequence zero belongs to the preceding stage; exactly five new scans
+    # (1..5) remain visible before the guide leaves the sensor's field of view.
+    motion.backup_lidar_guide_estimator = lambda snapshot: (
+        guide(snapshot) if snapshot.sequence < 6 else None)
+    heading = motion.backup_lidar_heading_estimator
+    if bad_initial_plane:
+        motion.backup_lidar_heading_estimator = lambda snapshot: (
+            None if snapshot.sequence < 3 else heading(snapshot))
+    assert motion.backup_with_lidar() is (not bad_initial_plane)
+    committed = any('Guide visibility handoff:' in str(call)
+                    for call in motion.node.get_logger().info.call_args_list)
+    assert committed is (not bad_initial_plane)
+    assert state.linear == state.angular == 0
+
+
+@pytest.mark.parametrize('legacy_cap,gyro_delta_deg,expected', [
+    (True, .18, False), (False, .18, True), (False, 2., False),
+])
+def test_measured_corridor_distinguishes_small_gyro_change_from_unsafe_heading(
+        simulation, monkeypatch, legacy_cap, gyro_delta_deg, expected):
+    motion, state = simulation
+    state.gap = .48
+    state.offset = .003
+    state.yaw = math.radians(.85)
+    motion.node.parameters.update(
+        use_lidar_guide_centering=True,
+        backup_guide_center_tolerance=.015,
+        backup_guide_visibility_handoff_clearance=.50,
+        backup_guide_known_width=.54)
+    if legacy_cap:
+        from docking import motion as motion_module
+        original = motion_module.straight_entry_heading_budget
+
+        def old_budget(rows, distance, center, half, side, limit, rear, **kwargs):
+            return original(rows, distance, center, half, side,
+                            min(limit, math.radians(1)), rear, **kwargs)
+
+        monkeypatch.setattr(motion_module, 'straight_entry_heading_budget', old_budget)
+    motion.current_integrated_imu_yaw = lambda: (
+        state.yaw + (math.radians(gyro_delta_deg)
+                     if state.gap + state.x < .38 else 0.))
+    assert motion.backup_with_lidar() is expected
+    assert state.linear == state.angular == 0
+    if not expected:
+        message = motion.node.get_logger().error.call_args.args[0]
+        assert 'bounded straight heading/travel' in message
+        assert 'heading=' in message and 'budget=' in message
+
+
 @pytest.mark.parametrize('unsafe_side', [False, True])
 def test_isolated_return_or_unsafe_side_cannot_report_success(simulation, unsafe_side):
     motion, state = simulation
@@ -255,6 +403,121 @@ def test_insufficient_side_clearance_stops_before_entering_guides(simulation, of
     motion, state = simulation
     state.gap, state.offset = .371, offset
     motion.node.parameters['use_lidar_guide_centering'] = True
+    assert not motion.backup_with_lidar()
+    assert all(v == w == 0 for _, _, _, v, w in state.sent)
+    assert 'side clearance' in motion.node.get_logger().error.call_args.args[0]
+
+
+def test_reflected_guide_offset_is_rechecked_then_entry_resumes(simulation):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54)
+    estimator = motion.backup_lidar_guide_estimator
+
+    def reflected(snapshot):
+        # Reproduce the user's 35 mm offset / 577 mm width. It was
+        # terminal after three scans, before any reverse command.
+        if state.now < 10.7:
+            return SimpleNamespace(center_offset=.035, separation=.577)
+        return estimator(snapshot)
+
+    motion.backup_lidar_guide_estimator = reflected
+    assert motion.backup_with_lidar()
+    assert all(v == w == 0 for t, _, _, v, w in state.sent if t < 10.9)
+    assert any(v < 0 for t, _, _, v, _ in state.sent if t >= 10.9)
+    assert any('recheck guide side clearance' in call.args[0]
+               for call in motion.node.get_logger().warning.call_args_list)
+    assert not motion.node.get_logger().error.called
+
+
+@pytest.mark.parametrize('loss_after_bad_fit', [False, True])
+def test_persistent_bad_clearance_has_one_bounded_stopped_recheck(
+        simulation, loss_after_bad_fit):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54,
+                                  backup_plane_reacquire_timeout_sec=3.)
+
+    def guide(snapshot):
+        if loss_after_bad_fit and state.now > 10.7:
+            return None
+        return SimpleNamespace(center_offset=.035, separation=.577)
+
+    motion.backup_lidar_guide_estimator = guide
+    assert not motion.backup_with_lidar()
+    assert 13.2 <= state.now <= 13.5
+    assert all(v == w == 0 for _, _, _, v, w in state.sent)
+    message = motion.node.get_logger().error.call_args.args[0]
+    assert 'side clearance' in message
+    assert 'supported_width=0.530m' in message
+    assert 'center_offset=+0.035m' in message
+
+
+def test_one_clear_scan_amid_bad_clearances_cannot_resume_reverse(simulation):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54)
+    # All centers are within the normal filter's jump tolerance. Stable
+    # center readings alone must not count unsafe side clearances as recovery.
+    motion.backup_lidar_guide_estimator = lambda snapshot: SimpleNamespace(
+        center_offset=.024 if snapshot.sequence % 3 == 0 else .027,
+        separation=.54)
+    assert not motion.backup_with_lidar()
+    assert all(v == w == 0 for _, _, _, v, w in state.sent)
+    assert 'side clearance' in motion.node.get_logger().error.call_args.args[0]
+
+
+@pytest.mark.parametrize('offset', [.026, .030])
+def test_tilted_entry_uses_actual_rear_frame_before_reverse(simulation, offset):
+    motion, state = simulation
+    state.gap, state.offset, state.yaw = .371, offset, math.radians(-2.5)
+    motion.last_odom.pose.pose.orientation.z = math.sin(state.yaw/2)
+    motion.last_odom.pose.pose.orientation.w = math.cos(state.yaw/2)
+    motion.last_wheel_yaw = state.yaw
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54,
+                                  backup_guide_center_tolerance=.015)
+
+    def guide(snapshot):
+        corridor_y = state.offset - state.y
+        return SimpleNamespace(center_offset=corridor_y, separation=.54,
+                               rear_center_offset=corridor_y-.2295*math.sin(-state.yaw))
+
+    motion.backup_lidar_guide_estimator = guide
+    motion.should_stop = lambda: abs(state.x) >= .05
+    # Both offsets fail the old origin-based entry check. Rear clearance
+    # permits initial guided reverse; full-path proof is still required.
+    # End this software trial after 5 cm; this verifies entry, not a full
+    # physical docking run or the unchanged final straight-path criterion.
+    assert not motion.backup_with_lidar()
+    assert any(v < 0 for _, _, _, v, _ in state.sent)
+    assert not motion.node.get_logger().error.called
+    assert state.linear == state.angular == 0
+
+
+def test_invalid_transformed_rear_offset_cannot_start_reverse(simulation):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54)
+    motion.backup_lidar_guide_estimator = lambda _: SimpleNamespace(
+        center_offset=.001, separation=.54, rear_center_offset=math.nan)
+    assert not motion.backup_with_lidar()
+    assert all(v == w == 0 for _, _, _, v, w in state.sent)
+
+
+def test_rear_frame_correction_can_also_reject_a_tilted_entry(simulation):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True,
+                                  backup_guide_known_width=.54)
+    # Opposite tilt moves the rear closer to the rail, even if the old
+    # panel-origin offset looks acceptable. This is not an error discount.
+    motion.backup_lidar_guide_estimator = lambda _: SimpleNamespace(
+        center_offset=.015, separation=.54, rear_center_offset=.027)
     assert not motion.backup_with_lidar()
     assert all(v == w == 0 for _, _, _, v, w in state.sent)
     assert 'side clearance' in motion.node.get_logger().error.call_args.args[0]

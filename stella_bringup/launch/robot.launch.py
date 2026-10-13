@@ -59,6 +59,18 @@ def generate_launch_description():
     cmd_vel_timeout_sec = float(param.get('cmd_vel_timeout_sec', 0.5))
     serial_transaction_timeout_ms = int(param.get('serial_transaction_timeout_ms', 100))
     environment_actions = []
+    # Use independent loopback/Wi-Fi transmit connections for local control.
+    # Preserve explicitly supplied custom DDS settings and isolated test domains.
+    current_dds = os.environ.get('CYCLONEDDS_URI', '')
+    if (param.get('dds_use_loopback', True)
+            and os.environ.get('STELLA_DDS_LOOPBACK', '1') != '0'
+            and os.environ.get('RMW_IMPLEMENTATION') == 'rmw_cyclonedds_cpp'
+            and os.environ.get('ROS_DOMAIN_ID', '0') == '0'
+            and os.environ.get('ROS_AUTOMATIC_DISCOVERY_RANGE') != 'LOCALHOST'
+            and os.environ.get('ROS_LOCALHOST_ONLY', '0') != '1'
+            and current_dds in ('', '/etc/cyclonedds.xml', 'file:///etc/cyclonedds.xml')):
+        dds_profile = os.path.join(package_share_dir, 'param', 'cyclonedds_local_control.xml')
+        environment_actions.append(SetEnvironmentVariable('CYCLONEDDS_URI', 'file://' + dds_profile))
     if param.get('guard_dds_udp_send', True):
         guard_library = os.path.join(
             get_package_prefix('stella_bringup'), 'lib', 'libstella_dds_udp_guard.so')

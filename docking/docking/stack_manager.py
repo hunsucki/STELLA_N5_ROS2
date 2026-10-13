@@ -10,6 +10,8 @@ import uuid
 from rclpy.node import Node
 import yaml
 
+from docking.runtime import guarded_environment
+
 
 class ManagedStack:
     @staticmethod
@@ -17,7 +19,7 @@ class ManagedStack:
         node.declare_parameter('manage_stack', True)
         node.declare_parameter('start_apriltag', True)
         node.declare_parameter('start_bridge', True)
-        node.declare_parameter('start_docking_server', True)
+        node.declare_parameter('start_docking_server', False)
         node.declare_parameter('docking_params_file', default_docking_params)
         node.declare_parameter('stack_startup_delay_sec', 2.0)
 
@@ -39,18 +41,20 @@ class ManagedStack:
         # already own /dock_robot. Every managed run gets its own endpoints.
         self.namespace = (
             f'/stella_docking_{uuid.uuid4().hex[:12]}'
-            if self.owns_docking_server else '')
+            if self.owns_docking_server or (bool(node.get_parameter('manage_stack').value)
+                and bool(node.get_parameter('start_bridge').value)) else '')
         self.server_node_name = (
             f'{self.namespace}/docking_server' if self.owns_docking_server
             else str(node.get_parameter('docking_server_node').value))
-        self.dock_action = self._endpoint('dock_action')
-        self.refinement_pose_topic = self._endpoint('tag_refinement_target_pose_topic')
+        self.dock_action = self._endpoint('dock_action', private=self.owns_docking_server)
+        self.refinement_pose_topic = self._endpoint(
+            'tag_refinement_target_pose_topic', private=self.owns_docking_server)
         self.detected_pose_topic = self._endpoint(
             'dock_pose_topic', private=bool(node.get_parameter('start_bridge').value))
 
     def _endpoint(self, parameter: str, private: bool = True) -> str:
         configured = str(self.node.get_parameter(parameter).value)
-        if self.owns_docking_server and private:
+        if self.namespace and private:
             return f'{self.namespace}/{configured.lstrip("/")}'
         return self.node.resolve_topic_name(configured)
 
@@ -65,6 +69,10 @@ class ManagedStack:
         for selector in ('docking_server', '/docking_server'):
             if selector in configuration:
                 configuration[self.server_node_name] = configuration.pop(selector)
+        # A private front approach must not reset toward the database's fixed
+        # staging pose when a live tag disappears. Own bounded retries stop
+        # and reacquire at the current pose, without a retreat manoeuvre.
+        configuration[self.server_node_name]['ros__parameters']['max_retries'] = 0
         self._params_directory = tempfile.TemporaryDirectory(prefix='stella-docking-')
         private_params = os.path.join(self._params_directory.name, 'docking.yaml')
         with open(private_params, 'w', encoding='utf-8') as stream:
@@ -208,8 +216,10 @@ class ManagedStack:
 
     def _start_process(self, name: str, command: list[str]) -> None:
         self.node.get_logger().info(f'Starting {name}: {" ".join(command)}')
-        env = os.environ.copy()
+        env, guard = guarded_environment()
         env.setdefault('RCUTILS_LOGGING_USE_STDOUT', '1')
+        if guard:
+            self.node.get_logger().info(f'DDS UDP send guard for {name}: {guard}')
         process = subprocess.Popen(command, env=env, start_new_session=True)
         self.processes.append(process)
         if len(command) > 1 and command[1] == 'launch':

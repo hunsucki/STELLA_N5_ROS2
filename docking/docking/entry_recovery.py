@@ -100,14 +100,18 @@ class DockEntryRecovery:
 
     def observations(self):
         pairs = []
-        deadline = time.monotonic() + 1.2
+        deadline = time.monotonic() + 2.0
         sequence = -1
+        seen = 0
+        rejected = 0
+        spreads = None
         while not self.node.should_stop() and time.monotonic() < deadline:
             spin_for(self.node, 0.03, self.node.should_stop)
             scan = self.node.lidar.snapshot()
             if scan is None or scan.sequence == sequence:
                 continue
             sequence = scan.sequence
+            seen += 1
             wall = self.node.lidar_aligner.estimate_error(scan)
             guide = self.node.lidar_aligner.estimate_guide_center(scan)
             if (wall is None or guide is None
@@ -116,14 +120,22 @@ class DockEntryRecovery:
                     or not self.motion.is_stationary(0.005)
                     or abs(self.motion.current_odom_yaw_rate()) > math.radians(0.5)):
                 pairs = []
+                rejected += 1
                 continue
             pairs.append(guide)
+            # Sliding windows preserve four recent valid samples after one
+            # noisy fit, rather than restarting disjoint batches of five.
+            pairs = pairs[-5:]
             if len(pairs) >= 5:
                 offsets = [guide.center_offset for guide in pairs]
                 widths = [guide.separation for guide in pairs]
-                if max(offsets) - min(offsets) <= 0.01 and max(widths) - min(widths) <= 0.02:
+                spreads = (max(offsets)-min(offsets), max(widths)-min(widths))
+                if spreads[0] <= 0.01 and spreads[1] <= 0.02:
                     return statistics.median(offsets), statistics.median(widths)
-                pairs = []
+        self.node.get_logger().warning(
+            'Entry guide verification incomplete while stopped: '
+            f'unique_scans={seen}, rejected_geometry_or_motion={rejected}, '
+            f'recent_valid={len(pairs)}, last_center_width_spread={spreads}')
         return None
 
     def _sensors(self):
@@ -138,7 +150,7 @@ class DockEntryRecovery:
         return sensors if abs(stamps[0] - stamps[1]) <= 0.15 else None
 
     @staticmethod
-    def _visible(x, y, sensors):
+    def _visible(x, y, sensors, diagnostics=None):
         for lidar, snapshot in sensors:
             transform = lidar.transform
             dx, dy = x - transform.x, y - transform.y
@@ -159,7 +171,13 @@ class DockEntryRecovery:
                 return None
 
             center = reading(index)
+            detail = {
+                'frame': getattr(scan.header, 'frame_id', '') if hasattr(scan, 'header') else '',
+                'beam': index, 'distance': round(distance, 4), 'center': center,
+            }
             if center is not None and center < distance + 0.015:
+                if diagnostics is not None:
+                    diagnostics.append({**detail, 'reason': 'near_return_or_occlusion'})
                 continue
             brackets = []
             for direction in (-1, 1):
@@ -175,6 +193,12 @@ class DockEntryRecovery:
             if (len(brackets) == 2 and gap_width <= 0.015
                     and all(value >= distance + 0.03 for _, value in brackets)):
                 return True
+            if diagnostics is not None:
+                reason = ('missing_neighbor_returns' if len(brackets) != 2 else
+                          'angular_gap_too_wide' if gap_width > 0.015 else
+                          'neighbor_return_too_near')
+                diagnostics.append({**detail, 'reason': reason,
+                                    'neighbors': brackets, 'gap_width': round(gap_width, 4)})
         return False
 
     def clear(self, path, escape):
@@ -210,10 +234,13 @@ class DockEntryRecovery:
                     ))
             for u, v in boundary:
                 x, y = px + c * u - s * v, py + s * u + c * v
-                if (rectangle_clearance(x, y, (0, 0, 0)) > MARGIN + 1e-6
-                        and not self._visible(x, y, sensors)):
-                    self.last_path_error = f'unobserved footprint boundary at base x={x:.3f}, y={y:.3f}m'
-                    return False
+                if rectangle_clearance(x, y, (0, 0, 0)) > MARGIN + 1e-6:
+                    diagnostics = []
+                    if not self._visible(x, y, sensors, diagnostics):
+                        self.last_path_error = (
+                            f'unobserved footprint boundary at base x={x:.3f}, y={y:.3f}m; '
+                            f'ray_checks={diagnostics}')
+                        return False
         self.last_path_error = ''
         return True
 
@@ -221,16 +248,40 @@ class DockEntryRecovery:
         self.node.get_logger().error('Entry recovery stopped: ' + message)
         return False
 
+    def _side_room(self, offset, observed_width):
+        """Use the same measured station width policy as reverse entry."""
+        known = float(self.node.get_parameter('backup_guide_known_width').value)
+        uncertainty = float(self.node.get_parameter('backup_guide_known_width_uncertainty').value)
+        half_width = float(self.node.get_parameter('backup_rear_half_width').value)
+        if (not all(math.isfinite(v) for v in
+                    (known, uncertainty, offset, observed_width, half_width))
+                or (known != 0 and not .50 <= known <= .58)
+                or not .005 <= uncertainty <= .02
+                or observed_width <= 0 or half_width <= 0
+                or (known != 0 and not .50 <= observed_width <= .58)):
+            raise ValueError('invalid measured guide width profile or guide observation')
+        supported_width = known - uncertainty if known else observed_width
+        return supported_width, supported_width / 2 - abs(offset) - half_width
+
     def run(self):
         if not all(bool(self.node.get_parameter(name).value) for name in (
                 'use_dock_entry_recovery', 'use_lidar_backup', 'use_lidar_guide_centering')):
             return True
         observed = self.observations()
         if observed is None:
+            self.node.get_logger().info(
+                'Entry recovery: stationary guide pair not verified; original backup acquisition required')
             return True  # Original backup acquisition still must pass.
         offset, width = observed
-        room = width / 2 - abs(offset) - HALF_WIDTH
+        try:
+            supported_width, room = self._side_room(offset, width)
+        except ValueError as exc:
+            return self._fail(str(exc))
         margin = float(self.node.get_parameter('backup_rear_safety_margin').value)
+        self.node.get_logger().info(
+            f'Entry recovery assessment: center={offset:+.3f}m, observed_width={width:.3f}m, '
+            f'supported_width={supported_width:.3f}m, side_room={room:.3f}m, '
+            f'required_margin={margin:.3f}m, reposition_required={room < margin}')
         if room >= margin:
             return True
         plan = reposition_plan(offset)
@@ -251,6 +302,7 @@ class DockEntryRecovery:
             return self._fail(
                 'offset, clearance, footprint or remaining travel is outside bounds: '
                 f'center={offset:+.3f}m, guide_width={width:.3f}m, '
+                f'supported_width={supported_width:.3f}m, '
                 f'side_room={room:.3f}m (min 0.005m for recovery), '
                 f'offset_plan_valid={plan is not None}, rear_clearance={rear_clearance:.3f}m, '
                 f'required_backup={required_travel:.3f}m, allowed_backup={max_travel - 0.01:.3f}m')
@@ -328,9 +380,16 @@ class DockEntryRecovery:
             if observed is None:
                 return self._fail('guide center could not be verified after repositioning')
             after, new_width = observed
+            try:
+                new_supported_width, new_room = self._side_room(after, new_width)
+            except ValueError as exc:
+                return self._fail(str(exc))
             if (abs(after) > abs(offset) - 0.005
-                    or new_width / 2 - abs(after) - HALF_WIDTH < margin):
-                return self._fail('original side clearance or lateral progress was not established')
+                    or new_room < margin):
+                return self._fail(
+                    'original side clearance or lateral progress was not established: '
+                    f'center={after:+.3f}m, observed_width={new_width:.3f}m, '
+                    f'supported_width={new_supported_width:.3f}m, side_room={new_room:.3f}m')
             self.node.get_logger().info(
                 f'Entry recovery complete: center={after:+.3f}m; original backup checks resume')
             return True

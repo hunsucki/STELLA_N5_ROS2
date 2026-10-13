@@ -34,6 +34,9 @@ class LidarPlaneAligner:
     def declare_parameters(node: Node) -> None:
         node.declare_parameter('use_lidar_alignment', True)
         node.declare_parameter('lidar_align_timeout_sec', 18.0)
+        # Stop through a brief odom interruption, then reacquire the plane.
+        # This is a waiting budget, not a relaxed sensor age limit.
+        node.declare_parameter('lidar_align_odom_recovery_timeout_sec', 1.0)
         node.declare_parameter('lidar_align_sector_center', math.nan)
         node.declare_parameter('lidar_align_sector_center_base', math.pi)
         # Fit only the dock's rear-facing panel.  A wider fan also sees the
@@ -116,6 +119,8 @@ class LidarPlaneAligner:
             return False
 
         timeout_sec = float(self.node.get_parameter('lidar_align_timeout_sec').value)
+        odom_recovery_timeout = float(self.node.get_parameter(
+            'lidar_align_odom_recovery_timeout_sec').value)
         tolerance = abs(float(self.node.get_parameter('lidar_align_tolerance').value))
         max_speed = abs(float(self.node.get_parameter('lidar_align_angular_speed').value))
         min_speed = abs(float(
@@ -154,6 +159,7 @@ class LidarPlaneAligner:
         tracking_outlier_count = 0
         tracking_outliers_required = max(int(self.node.get_parameter(
             'lidar_align_tracking_outlier_cycles').value), 1)
+        odom_missing_since: float | None = None
 
         self.node.get_logger().info('Fine-aligning yaw using LiDAR plane...')
 
@@ -165,11 +171,37 @@ class LidarPlaneAligner:
                 self.node.get_logger().error('LiDAR plane alignment timed out')
                 return False
 
-            if not self.motion.odom_is_fresh():
+            odom_wait = (
+                0.0 if odom_missing_since is None
+                else time.monotonic() - odom_missing_since)
+            if (
+                    odom_missing_since is not None
+                    and odom_wait >= odom_recovery_timeout):
                 self.motion.stop_robot()
                 self.node.get_logger().error(
-                    'Odometry became stale during LiDAR alignment')
+                    'Odometry did not recover during LiDAR alignment: '
+                    f'waited={odom_wait:.3f}s; {self._odom_diagnostic()}')
                 return False
+            if not self.motion.odom_is_fresh():
+                if odom_missing_since is None:
+                    odom_missing_since = time.monotonic()
+                    self.node.get_logger().warning(
+                        'Pausing LiDAR alignment for fresh odometry: '
+                        f'recovery_limit={odom_recovery_timeout:.3f}s; '
+                        f'{self._odom_diagnostic()}')
+                    self.motion.stop_robot()
+                    stability.reset()
+                    tracked_error = None
+                    tracked_yaw = None
+                    acquisition_error = None
+                    acquisition_yaw = None
+                    acquisition_count = 0
+                    tracking_outlier_count = 0
+                    current_command = Twist()
+                self.motion.cmd_vel_pub.publish(current_command)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
+                continue
+
             current_yaw = self.motion.current_yaw()
             if self.motion.odom_sequence != previous_odom_sequence:
                 rotation_travel += abs(MotionController.normalize_angle(
@@ -184,6 +216,21 @@ class LidarPlaneAligner:
                     f'budget={math.degrees(rotation_budget):.2f}deg '
                     f'(hard={math.degrees(hard_max_rotation):.2f}deg)')
                 return False
+
+            if odom_missing_since is not None:
+                self.node.get_logger().info(
+                    'Odometry recovered during LiDAR alignment: '
+                    f'waited={odom_wait:.3f}s; {self._odom_diagnostic()}; '
+                    'reacquiring the rear plane from new scans')
+                odom_missing_since = None
+                # Discard scans received while odom was unavailable. Keep the
+                # original deadline and yaw/travel anchors, including rotation
+                # observed across the interruption, before accepting new scans.
+                stability = UniqueScanStability(
+                    stable_cycles_required, self.lidar.sequence)
+                self.motion.cmd_vel_pub.publish(current_command)
+                spin_for(self.node, sleep_time, self.motion.should_stop)
+                continue
 
             snapshot = self.lidar.snapshot()
             if snapshot is None:
@@ -414,6 +461,16 @@ class LidarPlaneAligner:
         self.motion.stop_robot()
         return False
 
+    def _odom_diagnostic(self) -> str:
+        header_age = (
+            self.node.get_clock().now().nanoseconds
+            - self.motion.last_odom_stamp_nanoseconds) / 1e9
+        receipt_age = time.monotonic() - self.motion.last_odom_received_at
+        rejection = getattr(self.motion, 'last_odom_error', '') or 'none'
+        return (
+            f'header_age={header_age:.3f}s, receipt_age={receipt_age:.3f}s, '
+            f'last_rejection={rejection}')
+
     def estimate_error(
             self, snapshot: ScanSnapshot
             ) -> tuple[float, float, int, int, float] | None:
@@ -555,6 +612,13 @@ class LidarPlaneAligner:
                 or not -max_abs_y <= right_y <= -min_abs_y):
             return None
 
+        # The rail fit is in the panel frame. Transform the robot's rear
+        # center into that SAME frame before measuring entry offset. At 3 deg
+        # the old y=0 comparison overstated the offset by about 12 mm.
+        rear_x = reference_x * cos_error
+        rear_y = reference_x * sin_error
+        rear_corridor_y = 0.5 * (left_y + right_y) + 0.5 * (
+            math.tan(left_angle) + math.tan(right_angle)) * (rear_x - reference_x)
         return GuideCenterEstimate(
             center_offset=0.5 * (left_y + right_y),
             separation=separation,
@@ -566,6 +630,7 @@ class LidarPlaneAligner:
             right_length=right_length,
             left_line_angle=left_angle,
             right_line_angle=right_angle,
+            rear_center_offset=rear_corridor_y - rear_y,
         )
 
     def _fit_guide_line(
@@ -652,6 +717,8 @@ class LidarPlaneAligner:
         values = {
             'timeout': float(self.node.get_parameter(
                 'lidar_align_timeout_sec').value),
+            'odom_recovery_timeout': float(self.node.get_parameter(
+                'lidar_align_odom_recovery_timeout_sec').value),
             'center': float(self.node.get_parameter(
                 'lidar_align_sector_center_base').value),
             'width': float(self.node.get_parameter(
@@ -744,6 +811,7 @@ class LidarPlaneAligner:
 
         if (
                 values['timeout'] <= 0.0
+                or not 0.0 <= values['odom_recovery_timeout'] <= values['timeout']
                 or not 0.0 < values['width'] <= 2.0 * math.pi
                 or values['min_range'] < 0.0
                 or values['max_range'] <= values['min_range']

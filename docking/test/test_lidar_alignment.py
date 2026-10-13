@@ -254,6 +254,33 @@ def test_guide_center_rejects_a_single_visible_rail():
         0.0, wall, wall + left) is None
 
 
+@pytest.mark.parametrize('angle_degrees', [-8., -3., 0., 3., 8.])
+@pytest.mark.parametrize('rear_offset', [-.015, .015])
+def test_entry_offset_transforms_robot_rear_into_panel_frame(angle_degrees, rear_offset):
+    from types import SimpleNamespace
+
+    values = {}
+    node = SimpleNamespace(
+        declare_parameter=lambda k, v: values.setdefault(k, v),
+        get_parameter=lambda k: SimpleNamespace(value=values[k]))
+    LidarPlaneAligner.declare_parameters(node)
+    values['backup_rear_reference_x'] = -.2295
+    aligner = LidarPlaneAligner(node, None, None)
+    angle = math.radians(angle_degrees)
+    rear_y = .2295 * math.sin(angle)
+    center_y = rear_offset + rear_y
+    wall = [(-.70, -.30 + .02*i) for i in range(31)]
+    left = [(-.68 + .02*i, center_y + .27) for i in range(27)]
+    right = [(-.68 + .02*i, center_y - .27) for i in range(27)]
+    estimate = aligner._estimate_guide_center_from_points(
+        angle, _rotate_points(wall, angle),
+        _rotate_points(left + right, angle))
+    assert estimate is not None
+    assert estimate.center_offset == pytest.approx(center_y, abs=1e-8)
+    assert estimate.rear_center_offset == pytest.approx(rear_offset, abs=1e-8)
+    assert estimate.separation == pytest.approx(.54, abs=1e-8)
+
+
 @pytest.mark.parametrize('rotation_degrees', [-3.0, 0.0, 3.0])
 @pytest.mark.parametrize('seed', [7, 42, 123])
 def test_recorded_panel_is_not_blended_with_bent_frame(rotation_degrees, seed):

@@ -28,7 +28,9 @@ class MotionlessNode(module.DockTurnBackup):
         assert self.motion.backup_lidar_heading_estimator == self.lidar_aligner.estimate_error
         assert self.tag_centering.lidar.expected_frame() == 'base_scan'
         assert self.tag_centering.lidar.subscription.topic_name == '/scan'
-        self.tag_centering.verify_before_spin = lambda: sys.argv[2] == 'True'
+        assert not hasattr(self, 'dock_client')
+        assert not hasattr(self, 'entry_recovery')
+        self._approach_tag_centerline = lambda: sys.argv[2] == 'True'
         self.motion = SimpleNamespace(
             wait_for_odom=lambda: True, advance_before_spin=lambda: True,
             spin_180=lambda: True, backup=lambda: sys.argv[1] == 'True',
@@ -38,15 +40,11 @@ class MotionlessNode(module.DockTurnBackup):
             self.motion.backup = Mock(side_effect=AssertionError('uncentered robot must not reverse'))
         self.stack.stop_robot = lambda: None
         self.stack.start = lambda: True
-        self.lifecycle.configure_and_activate = lambda stop: True
-        self.lidar_aligner.align = lambda: True
+        self.lidar_aligner.align = Mock(side_effect=AssertionError('no separate rear rotation stage'))
         self.charging.wait_for_existing_charge = lambda: False
         self.charging.verify = Mock(side_effect=AssertionError('test mode must skip charging'))
-        for name in ('_wait_for_dock_server', '_wait_for_base_transform',
-                     '_wait_for_docking_lidar', '_wait_for_detected_dock_pose',
-                     '_dock_near_tag', '_refine_tag_front_pose', '_verify_tag_front_stop_pose'):
+        for name in ('_wait_for_base_transform', '_wait_for_docking_lidar', '_wait_for_detected_dock_pose'):
             setattr(self, name, lambda: True)
-        self._warmup_docking_server_tf_buffer = lambda: None
 
 module.DockTurnBackup = MotionlessNode
 sys.exit(module.main(args=['exit_code_test', '--ros-args', '-p', 'development_test_mode:=true']))

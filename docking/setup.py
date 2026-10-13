@@ -26,7 +26,7 @@ setup(
         'console_scripts': [
             'image_rectifier = docking.image_rectifier:main',
             'apriltag_bridge = docking.apriltag_bridge:main',
-            'dock_turn_backup = docking.dock_turn_backup:main',
+            'dock_turn_backup = docking.runtime:main',
         ],
     },
 )

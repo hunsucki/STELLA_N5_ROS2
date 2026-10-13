@@ -23,6 +23,9 @@ serial_transaction_timeout_ms: 100
 # Bound CycloneDDS UDP send queue waits in bringup child processes on Linux.
 # Reliable delivery remains enabled; saturated UDP datagrams can be retried by DDS.
 guard_dds_udp_send: true
+# Prefer loopback for Pi-local DDS while retaining wlan0 for external ROS nodes.
+# This applies on the next bringup start; custom CYCLONEDDS_URI is preserved.
+dds_use_loopback: true
 imu_sync_period_ms: 5
 imu_publish_rate_hz: 100
 imu_read_rate_hz: 0

@@ -1,5 +1,57 @@
 # Bringup 지연 분석 및 안정화 (2026-10-06)
 
+## 2026-10-12 DDS 반복 오류 출력 제한
+
+`ddsi_udp_conn_write ... retcode -5`는 CycloneDDS의 송신 자원 부족 반환이다.
+기존 UDP guard가 큐 포화의 `EAGAIN`을 `ENOBUFS`로 반환하는 경로에서도
+발생한다. 블로킹 송신으로 복원하면 센서 처리가 다시 밀릴 수 있으므로
+nonblocking 및 실패 반환은 유지한다. `dds_log_throttle.cpp`는 이 한 종류의
+반복 출력을 프로세스당 30초에 한 번 자원 부족 요약 경고로 제한한다.
+다른 UDP 오류, DDS 초기화 오류, 로그 심각도와 긴 메시지는 유지한다.
+네트워크 인터페이스·발견 범위·QoS·watchdog은 변경하지 않았다.
+
+설치된 실제 CycloneDDS 0.10.5 라이브러리에서 1,000개 자원 부족 로그가
+요약 경고 1개로 줄고 별도의 `retcode -3` 오류는 즉시 출력됨을 확인했다.
+동시 출력 4,000개 및 원본 출력 복원 검사, 기존 UDP 실패 반환·Python ROS
+초기화 검사도 통과했다. 읽기 전용 센서 수집은 정상 수신했고 이동·충전
+명령을 발행하지 않았다. 실제 통신 혼잡 자체가 해소됐다는 의미는 아니다.
+
+새 도킹 실행과 그 자식 프로세스는 설치된 보호 라이브러리를 바로 사용한다.
+기존 bringup은 종료하지 않았으며 **다음 bringup 재시작부터** 출력 제한이
+적용된다. 전체 원본 로그가 필요하면 실행 환경에
+`STELLA_DDS_LOG_THROTTLE=0`을 지정한다.
+상세: `/home/user/docking_diagnostics/2026-10-12/user79_analysis.md`.
+
+## 2026-10-08 원본 영상 수신 공백과 로컬 DDS 경로 보완
+
+정지 상태 카메라 발행 함수 계측에서 영상 수신 공백 9.345초 동안 compressed
+영상/CameraInfo 각각 276회 발행이 완료됐다. 영상 발행 함수는 그 구간 최대
+5.94ms였고 `rcl_publish` 반환 오류는 없었다. 따라서 카메라가 태그를 못 보거나
+촬영을 멈춘 현상만으로 설명되지 않는 DDS/UDP 전달 누락이다. 시스템 UDP
+송신 버퍼 오류와 카메라 자체 송신 큐 포화를 함께 확인했다.
+
+`dds_use_loopback: true`를 추가했고 다음 bringup 시작 시 설치된
+`param/cyclonedds_local_control.xml`을 선택한다. lo/wlan0 각각의 DDS 송신
+연결을 사용해 Wi-Fi 송신 큐와 Pi 내부 전달을 분리한다. wlan0와 외부 ROS
+발견을 유지한다. 원래 설정으로 로컬 IP에 보내는 패킷도 Linux의 lo 경로를
+쓸 수 있었으나 DDS의 송신 소켓/버퍼가 외부 통신과 공유됐다는 점이 차이다.
+[사용 버전의 인터페이스별 송신 소켓 생성](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L1714)
+
+기존 기본 `/etc/cyclonedds.xml` 또는 미지정 URI에서 domain 0/CycloneDDS에만
+자동 적용한다. 사용자 지정 URI, 다른 RMW, 격리 domain/LOCALHOST 환경은 보존한다.
+`STELLA_DDS_LOOPBACK=0`으로 bringup/SSH 도킹 모두 이전 DDS 설정을 유지한다.
+bringup YAML `dds_use_loopback: false`는 bringup 측 자동 선택만 비활성화한다.
+기존 UDP guard/센서 주기/QoS/모터 watchdog은 유지한다. `/etc`와 커널 버퍼
+설정은 바꾸지 않았다. SSH 도킹도 같은 설치 프로필을 RMW 초기화 전에 선택한다.
+
+90초 정지 시험 2회에서 원본 영상 최대 수신 공백은 0.088/0.106초였다.
+기존 설정 수신기 호환도 확인했다. 비교 조건이 완전히 같지 않고 이후 기존
+설정도 정상인 구간이 있어 간헐적 문제의 영구 해결을 확정하지 않는다.
+50개 관련 검사와 docking/stella_bringup 빌드는 통과했다. 최종 배포 설정의
+AprilTag 연속 측정은 기존 bringup의 15:59:43 KST SIGINT 종료로 중단됐다.
+노드를 다시 켜 전체 센서/영상/PC navigation 부하를 확인해야 한다.
+자세한 근거: `/home/user/docking_diagnostics/2026-10-08/camera_dds_root_cause.md`.
+
 HOME_TO_DOCK 실패 시각은 `1791261091.718892778`, 모터 watchdog 정지 로그는
 `1791261091.858177865`다. 이 정지 로그는 해당 navigation 실패보다 약 0.139초 늦다.
 따라서 이 로그가 앞선 실패를 일으켰다는 근거는 없다. Jazzy FollowPath의 `102`는

@@ -27,7 +27,12 @@ class ProjectedPoint:
 
 @dataclass(frozen=True)
 class GuideCenterEstimate:
-    """Two-rail dock opening measured in a rear-panel-aligned frame."""
+    """Two-rail opening in the panel frame, whose origin is base_link.
+
+    center_offset is the corridor's y coordinate at the nominal rear x.
+    rear_center_offset measures from the actual rotated rear center instead;
+    it is used for entry clearance at a station with a measured fixed width.
+    """
 
     center_offset: float
     separation: float
@@ -39,6 +44,7 @@ class GuideCenterEstimate:
     right_length: float
     left_line_angle: float
     right_line_angle: float
+    rear_center_offset: float | None = None
 
 
 class UniqueScanStability:

@@ -1,0 +1,10 @@
+{
+  "source": "live_docking_automatic_92.log; near-goal errors before forward runway exhaustion",
+  "samples": [
+    {"elapsed": 19.2, "x": 0.287, "y": -0.048, "heading_deg": 11.67},
+    {"elapsed": 20.3, "x": 0.225, "y": -0.010, "heading_deg": 15.01},
+    {"elapsed": 21.3, "x": 0.224, "y": 0.063, "heading_deg": 2.21},
+    {"elapsed": 22.3, "x": 0.225, "y": 0.098, "heading_deg": -9.42},
+    {"elapsed": 23.3, "x": 0.165, "y": 0.082, "heading_deg": -15.32}
+  ]
+}

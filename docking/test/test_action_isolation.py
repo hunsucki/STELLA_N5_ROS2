@@ -20,6 +20,7 @@ class FakeNode:
             self, str(Path(__file__).parents[1] / 'config' / 'docking.yaml'))
         DockingLifecycleManager.declare_parameters(self)
         DockTurnBackup._declare_docking_parameters(self)
+        self.parameters.update({'start_docking_server': True})
         self.parameters.update(overrides or {})
         self.logger = Mock()
 
@@ -60,7 +61,8 @@ def test_external_server_mode_preserves_configured_endpoints(override):
     assert stack.dock_action == '/other/dock_robot'
     assert stack.server_node_name == '/other/docking_server'
     assert stack.refinement_pose_topic == '/other/dock_pose'
-    assert stack.detected_pose_topic == '/detected_dock_pose'
+    assert stack.detected_pose_topic == (stack.namespace + '/detected_dock_pose'
+                                        if stack.namespace else '/detected_dock_pose')
 
 
 def test_managed_server_can_use_an_external_detector():
@@ -69,13 +71,34 @@ def test_managed_server_can_use_an_external_detector():
     assert stack.refinement_pose_topic.startswith(stack.namespace)
 
 
-def test_namespaced_server_preserves_calibration_and_root_robot_topics():
-    stack = ManagedStack(FakeNode(), Mock(), lambda: False)
+def test_default_approach_starts_only_private_detection_processes(monkeypatch):
+    node = FakeNode({'start_docking_server': False, 'stack_startup_delay_sec': 0.})
+    stack = ManagedStack(node, Mock(), lambda: False)
+    started = []
+    stack._start_process = lambda name, command: started.append((name, command))
+    monkeypatch.setattr('docking.stack_manager.shutil.which', lambda name: '/usr/bin/ros2')
+    assert stack.start()
+    assert [name for name, command in started] == ['apriltag', 'apriltag_bridge']
+    assert not stack.owns_docking_server
+    assert stack.detected_pose_topic.startswith(stack.namespace+'/')
+    assert f'pose_topic:={stack.detected_pose_topic}' in started[1][1]
+
+
+@pytest.mark.parametrize('configured_retries', [0, 1])
+def test_namespaced_server_preserves_calibration_and_root_robot_topics(
+        tmp_path, configured_retries):
+    source = Path(__file__).parents[1] / 'config' / 'docking.yaml'
+    config = yaml.safe_load(source.read_text())
+    config['docking_server']['ros__parameters']['max_retries'] = configured_retries
+    custom = tmp_path / 'docking.yaml'
+    custom.write_text(yaml.safe_dump(config))
+    stack = ManagedStack(FakeNode({'docking_params_file': str(custom)}), Mock(), lambda: False)
     try:
         command = stack._server_command('/usr/bin/ros2')
         path = Path(command[command.index('--params-file') + 1])
         config = yaml.safe_load(path.read_text())
         parameters = config[stack.server_node_name]['ros__parameters']
+        assert parameters['max_retries'] == 0
         assert parameters['simple_charging_dock']['external_detection_translation_x'] == -0.95
         assert parameters['controller_frequency'] == 10.0
         for rule in ['cmd_vel:=/cmd_vel', 'tf:=/tf', 'tf_static:=/tf_static',
@@ -88,39 +111,8 @@ def test_namespaced_server_preserves_calibration_and_root_robot_topics():
     assert not path.exists()
 
 
-@pytest.mark.parametrize('counts,unique', [
-    ((1, 1, 1), True), ((2, 2, 2), False), ((1, 2, 1), False), ((0, 0, 0), False),
-])
-def test_goal_is_not_sent_to_ambiguous_action_services(counts, unique):
-    node = DockTurnBackup.__new__(DockTurnBackup)
-    node.stack = SimpleNamespace(dock_action='/dock_robot')
-    node.count_services = lambda name: dict(zip(
-        ('send_goal', 'get_result', 'cancel_goal'), counts))[name.rsplit('/', 1)[1]]
-    node.get_logger = Mock(return_value=Mock())
-    assert node._dock_server_is_unique() == unique
-    if not unique:
-        client = Mock()
-        assert node._send_and_wait(client, Mock()) is None
-        client.send_goal_async.assert_not_called()
 
 
-def test_unknown_action_result_cancels_accepted_goal_and_explains_failure():
-    node = DockTurnBackup.__new__(DockTurnBackup)
-    node.stack = SimpleNamespace(dock_action='/dock_robot')
-    node._dock_server_is_unique = lambda: True
-    node._wait_for_future = lambda future: True
-    logger = Mock()
-    node.get_logger = lambda: logger
-    client = Mock()
-    goal_handle = client.send_goal_async.return_value.result.return_value
-    goal_handle.accepted = True
-    goal_handle.get_result_async.return_value.result.return_value = SimpleNamespace(
-        status=GoalStatus.STATUS_UNKNOWN)
-    goal_handle.cancel_goal_async.return_value.done.return_value = True
-
-    assert node._send_and_wait(client, Mock()) is None
-    goal_handle.cancel_goal_async.assert_called_once()
-    assert 'STATUS_UNKNOWN' in logger.error.call_args.args[0]
 
 
 def test_lifecycle_targets_selected_server_and_refuses_duplicate_services():

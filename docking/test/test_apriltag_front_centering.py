@@ -5,7 +5,9 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
-from docking.tag_centering import AprilTagCentering, LidarTagCentering, apriltag_normal_yaw
+from docking.tag_centering import AprilTagCentering, apriltag_normal_yaw
+from docking.tag_centering import _FrontLidarParameters
+from docking.lidar_alignment import LidarPlaneAligner
 from geometry_msgs.msg import PoseStamped
 import pytest
 
@@ -27,7 +29,7 @@ def make_centerer(points):
     node = SimpleNamespace(
         declare_parameter=lambda n, v: parameters.setdefault(n, v),
         get_parameter=lambda n: SimpleNamespace(value=parameters[n]))
-    LidarTagCentering.declare_parameters(node)
+    AprilTagCentering.declare_parameters(node)
     centerer = AprilTagCentering.__new__(AprilTagCentering)
     centerer.node = node
     centerer.lidar = SimpleNamespace(project=lambda *args: points)
@@ -71,79 +73,44 @@ def test_changing_lidar_surface_cannot_change_camera_heading_or_center():
     assert not hasattr(centerer, 'fitter')
 
 
-def test_virtual_goal_keeps_the_configured_tag_standoff_despite_old_odom_goal():
-    tag = tag_pose(math.radians(-8.))
-    tag.pose.position.y = -.11
-    centerer, _ = make_centerer([])
-    heading = apriltag_normal_yaw(tag)
-    for old_goal in [(0.,0.),(.2,-.3),(.4,.1)]:
-        x,y,standoff = centerer._goal_and_standoff(*old_goal,tag,heading)
-        assert standoff == .95
-        assert math.hypot(tag.pose.position.x-x, tag.pose.position.y-y) == pytest.approx(.95)
-        assert -math.sin(heading)*x+math.cos(heading)*y == pytest.approx(
-            -math.sin(heading)*tag.pose.position.x+math.cos(heading)*tag.pose.position.y)
+def fused_centerer(points):
+    centerer, parameters = make_centerer(points)
+    LidarPlaneAligner.declare_parameters(centerer.node)
+    parameters['tag_front_use_lidar_panel_heading'] = True
+    centerer.panel_fitter = LidarPlaneAligner(
+        _FrontLidarParameters(centerer.node), None, centerer.lidar)
+    return centerer
 
 
-@pytest.mark.parametrize('with_outlier', [False,True])
-def test_filtered_pose_compensates_real_rotation_without_lag_or_yaw_outliers(
-        monkeypatch, with_outlier):
-    from test_tag_centering import make_live_centerer
-    legacy,node,snapshot = make_live_centerer()
-    state = SimpleNamespace(now=10.,gyro=0.,fresh=True)
-    monkeypatch.setattr('time.monotonic',lambda:state.now)
-    helper = AprilTagCentering.__new__(AprilTagCentering)
-    helper.node,helper.lidar = node,legacy.lidar
-    helper.lidar.project = lambda *args: [SimpleNamespace(x=1.,y=y) for y in [-.04,0.,.04]]
-    node.motion = SimpleNamespace(
-        imu_is_fresh=lambda:state.fresh,current_integrated_imu_yaw=lambda:state.gyro)
-    for index,heading in enumerate([.12,.09,.06,.03,0.]):
-        state.now = 10.+index*.1
-        state.gyro = -heading
-        node.now_ns = int(state.now*1e9)
-        tag = tag_pose(heading+(.15 if with_outlier and index==2 else 0.))
-        tag.header.frame_id = 'base_link'
-        tag.header.stamp = node.get_clock().now().to_msg()
-        tag.pose.position.x = math.cos(heading)*1.1-math.sin(heading)*.01
-        tag.pose.position.y = math.sin(heading)*1.1+math.cos(heading)*.01
-        node.last_dock_pose,node.last_dock_pose_received_at = tag,state.now
-        snapshot.sequence = index+1
-        snapshot.scan.header.stamp = tag.header.stamp
-        longitudinal,lateral,filtered_heading = helper.control_observation(.95)
-        assert longitudinal == pytest.approx(.15)
-        assert lateral == pytest.approx(.01)
-        assert filtered_heading == pytest.approx(heading)
-    for _ in range(20):
-        helper.control_observation(.95)
-    assert len(helper._front_pose_window) == 5
-    # Cached camera samples cannot survive either an old stamp or lost gyro.
-    state.fresh = False
-    assert helper.control_observation(.95) is None
-    state.fresh = True
-    assert helper.control_observation(.95) is not None
-    state.now += .31
-    node.now_ns = int(state.now*1e9)
-    assert helper.control_observation(.95) is None
+@pytest.mark.parametrize('angle', [-12., -4., 0., 4., 12.])
+def test_tag_position_is_retained_while_panel_supplies_normal(angle):
+    normal = math.radians(angle)
+    tag = tag_pose(normal+math.radians(4.5))
+    tag.pose.position.y = .04
+    original_position = (tag.pose.position.x, tag.pose.position.y)
+    points = [SimpleNamespace(x=1.2-math.sin(normal)*u,
+                              y=.04+math.cos(normal)*u)
+              for u in [i*.006 for i in range(-32,33)]]
+    # Background and side rails must not become the normal or tag center.
+    points += [SimpleNamespace(x=1.7,y=i*.01) for i in range(-30,31)]
+    points += [SimpleNamespace(x=.5+i*.02,y=y)
+               for i in range(30) for y in [-.27,.27]]
+    centerer = fused_centerer(points)
+    assert centerer.panel(SimpleNamespace(sequence=1), tag) == pytest.approx(normal)
+    assert (tag.pose.position.x,tag.pose.position.y) == original_position
 
 
-@pytest.mark.parametrize('points', [None, [], [.8,.8], [.25,.8,.8]])
-def test_missing_or_close_front_range_prevents_refinement(points):
-    projected = None if points is None else [SimpleNamespace(x=x, y=0.) for x in points]
-    centerer, _ = make_centerer(projected)
-    assert centerer.panel(None, tag_pose(0.)) is None
-
-
-def test_recorded_trial39_camera_center_is_independent_of_bad_narrow_panel_normal():
-    rows = json.loads((Path(__file__).parent/'fixtures'/'front_apriltag_trial39.json').read_text())
-    laterals = []
-    for row in rows:
-        record = row['tag']
-        tag = PoseStamped()
-        tag.pose.position.x, tag.pose.position.y = record['x'], record['y']
-        q = tag.pose.orientation
-        q.x, q.y, q.z, q.w = record['q']
-        centerer, _ = make_centerer([SimpleNamespace(x=x,y=y) for x,y in row['front_points']])
-        heading = centerer.panel(None, tag)
-        assert heading is not None, centerer.last_panel_diagnostic
-        laterals.append(-math.sin(heading)*record['x'] + math.cos(heading)*record['y'])
-    assert .05 < laterals[0] < .07  # Narrow LiDAR previously said the opposite side.
-    assert abs(laterals[-1]) < .02  # Camera does not reproduce the false ~14 cm error.
+@pytest.mark.parametrize('fault', ['few', 'short', 'background', 'side_rails'])
+def test_missing_or_wrong_front_panel_cannot_silently_use_tag_heading(fault):
+    points = [SimpleNamespace(x=1.2, y=i*.006) for i in range(-32,33)]
+    if fault == 'few':points = points[:3]
+    elif fault == 'short':points = points[25:40]
+    elif fault == 'background':
+        points = [SimpleNamespace(x=1.7,y=p.y) for p in points]
+    else:
+        points = [SimpleNamespace(x=1.05+i*.003,y=.04) for i in range(60)]
+    centerer = fused_centerer(points)
+    assert centerer.panel(SimpleNamespace(sequence=1),tag_pose(0.)) is None
+    assert 'unverified' in centerer.last_panel_diagnostic
+    assert centerer.panel(SimpleNamespace(sequence=1),tag_pose(0.)) is None
+    assert 'unverified' in centerer.last_panel_diagnostic

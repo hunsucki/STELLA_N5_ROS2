@@ -56,7 +56,7 @@ def test_declared_lidar_defaults_match_new_mount_contract():
     assert node.defaults['backup_heading_resume_stable_cycles'] == 3
     assert node.defaults['use_lidar_heading_during_backup'] is True
     assert node.defaults['backup_lidar_heading_filter_coef'] == 0.15
-    assert node.defaults['backup_lidar_heading_max_error'] == math.radians(8.0)
+    assert node.defaults['backup_lidar_heading_max_error'] == math.radians(12.0)
     assert node.defaults['backup_lidar_motion_residual'] == math.radians(2.0)
     assert node.defaults['backup_lidar_wheel_guard_residual'] == math.radians(4.0)
     assert node.defaults['backup_lidar_heading_min_inlier_ratio'] == 0.70
@@ -99,31 +99,14 @@ def test_declared_lidar_defaults_match_new_mount_contract():
     assert node.defaults['lidar_align_acquisition_max_residual'] == (
         math.radians(3.0))
     assert node.defaults['backup_max_travel'] == 0.60
-    assert node.defaults['verify_tag_front_stop_pose'] is False
-    assert node.defaults['use_tag_pose_refinement'] is True
-    assert node.defaults['tag_refinement_target_pose_topic'] == '/dock_pose'
-    assert node.defaults['tag_refinement_target_wait_timeout_sec'] == 1.0
-    assert node.defaults['tag_refinement_longitudinal_tolerance'] == 0.02
-    assert node.defaults['tag_refinement_lateral_tolerance'] == 0.010
-    assert node.defaults['use_lidar_tag_centering'] is False
-    assert node.defaults['use_apriltag_front_centering'] is True
-    assert node.defaults['tag_centering_lidar_topic'] == '/scan'
-    assert node.defaults['tag_centering_lidar_frame'] == 'base_scan'
-    assert node.defaults['tag_refinement_yaw_tolerance'] == math.radians(2.0)
-    assert node.defaults['tag_refinement_timeout_sec'] == 45.0
-    assert node.defaults['tag_refinement_translation_heading_limit'] == (
-        math.radians(8.0))
-    assert node.defaults['tag_refinement_max_initial_distance'] == 0.18
-    assert node.defaults['tag_refinement_max_initial_yaw'] == math.radians(25.0)
-    assert node.defaults['tag_refinement_max_travel'] == 0.18
-    assert node.defaults['tag_refinement_max_yaw_excursion'] == math.radians(30.0)
-    assert node.defaults['tag_refinement_abort_on_failure'] is True
-    assert node.defaults['tag_front_stop_distance'] == 0.80
-    assert node.defaults['tag_front_longitudinal_tolerance'] == 0.04
-    assert node.defaults['tag_front_lateral_tolerance'] == 0.025
-    assert node.defaults['tag_front_pose_max_age_sec'] == 0.30
-    assert node.defaults['tag_front_stable_cycles'] == 5
-    assert node.defaults['tag_front_verify_timeout_sec'] == 3.0
+    assert node.defaults['tag_refinement_longitudinal_tolerance'] == .02
+    assert node.defaults['tag_refinement_lateral_tolerance'] == .025
+    assert node.defaults['tag_refinement_yaw_tolerance'] == math.radians(2)
+    assert node.defaults['tag_centerline_speed'] == .08
+    assert node.defaults['tag_centerline_angular_speed'] == .15
+    assert node.defaults['tag_centerline_max_travel'] == 2.0
+    assert node.defaults['tag_front_observation_recovery_timeout_sec'] == 8.0
+    assert node.defaults['tag_front_pose_max_age_sec'] == .30
     assert node.defaults['lidar_align_max_tracking_residual'] == math.radians(5.0)
     assert node.defaults['lidar_align_tracking_outlier_cycles'] == 2
     assert node.defaults['lidar_align_hard_tracking_residual'] == (
@@ -140,223 +123,20 @@ def test_declared_lidar_defaults_match_new_mount_contract():
     assert node.defaults['total_timeout_sec'] == 180.0
 
 
-def test_tag_front_pose_error_uses_tag_center_in_base_link():
-    longitudinal, lateral = DockTurnBackup._tag_front_pose_errors(
-        tag_x=0.81,
-        tag_y=-0.012,
-        target_distance=0.80,
-    )
-
-    assert longitudinal == pytest.approx(0.01)
-    assert lateral == pytest.approx(-0.012)
-
-
-def test_tag_front_pose_error_rejects_nonfinite_measurement():
-    longitudinal, lateral = DockTurnBackup._tag_front_pose_errors(
-        tag_x=math.nan,
-        tag_y=0.0,
-        target_distance=0.80,
-    )
-
-    assert math.isinf(longitudinal)
-    assert math.isinf(lateral)
-
-
-def test_fixed_refinement_goal_is_resolved_in_robot_frame():
-    longitudinal, lateral, yaw = DockTurnBackup._fixed_goal_errors_in_base(
-        target_x=1.0,
-        target_y=2.0,
-        target_yaw=math.radians(100.0),
-        current_x=1.0,
-        current_y=1.0,
-        current_yaw=math.radians(90.0),
-    )
-
-    assert longitudinal == pytest.approx(1.0)
-    assert lateral == pytest.approx(0.0, abs=1e-9)
-    assert yaw == pytest.approx(math.radians(10.0))
-
-
-def test_fixed_refinement_position_tolerance_does_not_rotate_with_robot():
-    before = DockTurnBackup._fixed_goal_errors_in_target(
-        target_x=1.0,
-        target_y=0.0,
-        target_yaw=0.0,
-        current_x=0.98,
-        current_y=-0.01,
-        current_yaw=math.radians(20.0),
-    )
-    after = DockTurnBackup._fixed_goal_errors_in_target(
-        target_x=1.0,
-        target_y=0.0,
-        target_yaw=0.0,
-        current_x=0.98,
-        current_y=-0.01,
-        current_yaw=0.0,
-    )
-
-    assert before[:2] == pytest.approx(after[:2])
-    assert before[2] == pytest.approx(math.radians(-20.0))
-    assert after[2] == pytest.approx(0.0)
-
-
-def test_refinement_command_turns_before_translating_for_large_bearing():
-    linear, angular = DockTurnBackup._tag_refinement_command(
-        longitudinal=0.10,
-        lateral=0.02,
-        yaw_error=0.0,
-        within_position=False,
-        linear_kp=0.5,
-        angular_k_alpha=1.0,
-        angular_k_beta=-0.3,
-        final_yaw_kp=1.0,
-        max_linear_speed=0.025,
-        max_angular_speed=0.08,
-    )
-
-    assert linear == 0.0
-    assert angular > 0.0
-    assert angular <= 0.08
-
-
-def test_refinement_command_translates_after_point_heading_is_small():
-    linear, angular = DockTurnBackup._tag_refinement_command(
-        longitudinal=0.10,
-        lateral=0.01,
-        yaw_error=math.radians(-20.0),
-        within_position=False,
-        linear_kp=0.5,
-        angular_k_alpha=1.0,
-        angular_k_beta=-0.3,
-        final_yaw_kp=1.0,
-        max_linear_speed=0.025,
-        max_angular_speed=0.08,
-    )
-
-    assert 0.0 < linear < 0.025
-    assert angular > 0.0
-
-
-def test_refinement_command_aligns_before_reversing():
-    linear, angular = DockTurnBackup._tag_refinement_command(
-        longitudinal=-0.10,
-        lateral=0.02,
-        yaw_error=0.0,
-        within_position=False,
-        linear_kp=0.5,
-        angular_k_alpha=1.0,
-        angular_k_beta=-0.3,
-        final_yaw_kp=1.0,
-        max_linear_speed=0.025,
-        max_angular_speed=0.08,
-    )
-
-    assert linear == 0.0
-    assert angular < 0.0
-
-
-def test_refinement_rotates_in_place_only_after_position_is_good():
-    linear, angular = DockTurnBackup._tag_refinement_command(
-        longitudinal=0.01,
-        lateral=0.01,
-        yaw_error=math.radians(3.0),
-        within_position=True,
-        linear_kp=0.5,
-        angular_k_alpha=1.0,
-        angular_k_beta=-0.3,
-        final_yaw_kp=1.0,
-        max_linear_speed=0.025,
-        max_angular_speed=0.08,
-    )
-
-    assert linear == 0.0
-    assert angular == pytest.approx(math.radians(3.0))
-
-
-def test_latest_logged_pose_is_feasible_inside_runtime_yaw_envelope():
-    final_yaw = math.radians(-26.18)
-    target_longitudinal = 0.086
-    target_lateral = 0.121
-    base_longitudinal = (
-        math.cos(final_yaw) * target_longitudinal
-        - math.sin(final_yaw) * target_lateral)
-    base_lateral = (
-        math.sin(final_yaw) * target_longitudinal
-        + math.cos(final_yaw) * target_lateral)
-
-    excursion, bearing = DockTurnBackup._planned_refinement_yaw_excursion(
-        base_longitudinal, base_lateral, final_yaw, math.radians(8.0))
-
-    assert math.degrees(bearing) == pytest.approx(28.40, abs=0.02)
-    assert math.degrees(excursion) == pytest.approx(28.40, abs=0.02)
-    assert excursion < math.radians(30.0)
-
-
-@pytest.mark.parametrize('side', [-1, 1])
-def test_trial28_full_point_turn_exceeds_existing_yaw_budget(side):
-    bearing = side * math.radians(32.84)
-    excursion, actual_bearing = DockTurnBackup._planned_refinement_yaw_excursion(
-        .173 * math.cos(bearing), .173 * math.sin(bearing),
-        -side * math.radians(8.96), math.radians(8))
-    assert actual_bearing == pytest.approx(bearing)
-    assert excursion == pytest.approx(abs(bearing))
-    assert excursion > math.radians(30)
-
-
-def test_positive_point_turn_reduces_positive_target_bearing():
-    target_x = 0.14
-    target_y = 0.06
-    initial = DockTurnBackup._fixed_goal_errors_in_base(
-        target_x, target_y, math.radians(-20.0), 0.0, 0.0, 0.0)
-    after_positive_turn = DockTurnBackup._fixed_goal_errors_in_base(
-        target_x, target_y, math.radians(-20.0),
-        0.0, 0.0, math.radians(5.0))
-    _, _, initial_bearing = DockTurnBackup._point_drive_geometry(*initial[:2])
-    _, _, later_bearing = DockTurnBackup._point_drive_geometry(
-        *after_positive_turn[:2])
-
-    assert initial_bearing > 0.0
-    assert 0.0 < later_bearing < initial_bearing
-    # The final yaw can be in the opposite direction; it is deferred until
-    # after the target position is reached.
-    assert initial[2] < 0.0
-
-
-def test_camera_approach_keeps_room_for_the_spin():
-    config_path = Path(__file__).parents[1] / 'config' / 'docking.yaml'
-    config = yaml.safe_load(config_path.read_text(encoding='utf-8'))
-    parameters = config['docking_server']['ros__parameters']
-
-    assert parameters['max_retries'] == 1
-    assert parameters['simple_charging_dock']['filter_coef'] == 0.1
-    assert parameters['simple_charging_dock']['docking_threshold'] == 0.45
-    assert parameters['controller']['v_linear_max'] == 0.10
-    assert parameters['controller']['v_linear_min'] == 0.05
-
-    helper_parameters = config['dock_turn_backup']['ros__parameters']
-    assert helper_parameters['apriltag_front_standoff'] == pytest.approx(
-        -parameters['simple_charging_dock']['external_detection_translation_x'])
-    assert helper_parameters['use_apriltag_front_centering'] is True
-    assert helper_parameters['use_lidar_tag_centering'] is False
-    assert helper_parameters['use_tag_pose_refinement'] is True
-    assert helper_parameters['use_pre_spin_forward'] is False
-    assert helper_parameters['tag_refinement_abort_on_failure'] is True
-    assert helper_parameters['backup_speed'] == 0.035
-    assert helper_parameters['backup_target_rear_clearance'] == 0.0145
-    assert helper_parameters['backup_clearance_tolerance'] == 0.010
-    assert helper_parameters['backup_lidar_motion_residual'] == pytest.approx(
-        math.radians(2.0))
-    assert helper_parameters['backup_lidar_wheel_guard_residual'] == pytest.approx(
-        math.radians(4.0))
-    assert helper_parameters['backup_lidar_heading_max_error'] == pytest.approx(
-        math.radians(8.0))
-    assert helper_parameters['use_lidar_guide_centering'] is True
-    assert helper_parameters['tag_refinement_longitudinal_tolerance'] == .02
-    assert helper_parameters['tag_refinement_lateral_tolerance'] == .025
-    assert helper_parameters['tag_refinement_max_initial_distance'] >= (
-        parameters['simple_charging_dock']['docking_threshold'] + .03)
-    assert helper_parameters['tag_refinement_max_travel'] >= (
-        parameters['simple_charging_dock']['docking_threshold'])
-    assert helper_parameters['lidar_align_timeout_sec'] == 18.0
-    assert helper_parameters['lidar_align_ransac_threshold'] == .010
-    assert helper_parameters['lidar_align_tracking_outlier_cycles'] == 2
+def test_runtime_uses_one_tag_approach_and_verified_guide_handoff():
+    config = yaml.safe_load((Path(__file__).parents[1]/'config/docking.yaml').read_text())
+    p = config['dock_turn_backup']['ros__parameters']
+    assert p['start_docking_server'] is False
+    assert p['apriltag_front_standoff'] == .95
+    assert p['tag_centerline_speed'] == .08
+    assert p['tag_refinement_lateral_tolerance'] == .012
+    assert p['tag_refinement_yaw_tolerance'] == pytest.approx(math.radians(1))
+    assert p['apriltag_front_lateral_offset'] == -.03
+    assert p['tag_front_use_lidar_panel_heading'] is True
+    assert p['development_test_mode'] is True
+    assert p['use_lidar_guide_centering'] is True
+    assert p['backup_guide_visibility_handoff_clearance'] == .32
+    assert p['backup_speed'] == .035
+    assert p['backup_guide_center_max_heading'] == pytest.approx(math.radians(2.5))
+    assert p['backup_target_rear_clearance'] == .028
+    assert p['backup_clearance_tolerance'] == .006

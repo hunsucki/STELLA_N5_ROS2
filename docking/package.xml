@@ -10,6 +10,7 @@
   <depend>action_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>apriltag_ros</depend>
+  <depend>apriltag_msgs</depend>
   <depend>geometry_msgs</depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>image_geometry</exec_depend>
@@ -30,7 +31,6 @@
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
-  <test_depend>apriltag_msgs</test_depend>
   <test_depend>python3-numpy</test_depend>
   <test_depend>python3-opencv</test_depend>
   <test_depend>python3-yaml</test_depend>

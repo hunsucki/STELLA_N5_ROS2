@@ -1,9 +1,10 @@
+# Optional standalone OpenNav server parameters; dock_turn_backup does not start it.
 docking_server:
   ros__parameters:
     controller_frequency: 10.0
-    # One automatic retreat/re-approach handles a transient lost tag without
-    # requiring the operator to restart the whole sequence.
-    max_retries: 1
+    # Nav2 retries drive backwards to the database staging pose. This helper
+    # uses a live tag-relative approach, so recover while stopped instead.
+    max_retries: 0
     base_frame: base_link
     fixed_frame: odom
 
@@ -30,8 +31,9 @@ docking_server:
       external_detection_timeout: 1.0
       filter_coef: 0.1
 
-      # Hand over while enough forward distance remains for lateral correction.
-      docking_threshold: 0.45
+      # Trial 51 needs earlier handover for the visible tag-centerline approach.
+      # Keep the helper's initial-distance/travel bounds consistent below.
+      docking_threshold: 0.60
 
     controller:
       transform_tolerance: 0.3
@@ -57,70 +59,50 @@ docking_server:
 # this file automatically; command-line `-p` overrides still take precedence.
 dock_turn_backup:
   ros__parameters:
-    # Geometry-only testing: stop after LiDAR docking, without starting charge.
+    # Single approach: live AprilTag centerline -> 180-degree turn -> backup.
+    # The detector and pose bridge are private; no Nav2 docking action runs.
     development_test_mode: true
-    # New bounded precision stage after Nav2 DockRobot.  Set false to restore
-    # the previous successful sequence without any precision motion.
-    use_tag_pose_refinement: true
-    tag_refinement_target_pose_topic: /dock_pose
-    tag_refinement_target_wait_timeout_sec: 1.0
-    tag_refinement_target_max_age_sec: 1.5
-    # Position correction and final yaw settling need separate time budgets.
-    # The September 9 run exhausted 18s while still recovering its heading.
-    tag_refinement_timeout_sec: 45.0
-    # Allow small front residuals; rear LiDAR checks actual guide clearance.
-    tag_refinement_longitudinal_tolerance: 0.02
-    tag_refinement_lateral_tolerance: 0.025
-    # AprilTag supplies both the center and face-normal heading. Front LiDAR
-    # only checks distance/clearance; rear guide control remains independent.
-    use_apriltag_front_centering: true
-    use_lidar_tag_centering: false
-    # Match simple_charging_dock.external_detection_translation_x above.
+    start_docking_server: false
+    tag_centerline_speed: 0.08
+    tag_centerline_angular_speed: 0.15
+    tag_centerline_max_travel: 2.0
+    tag_centerline_timeout_sec: 60.0
+    total_timeout_sec: 180.0
+
+    # Fixed odom calibration from trials89/90; trial94 still showed variation.
+    # Verify physically; this does not relax rear alignment/clearance checks.
+    spin_yaw: 3.071779484  # 176 deg in odom; nominal physical half-turn, verify on robot
+    spin_use_lidar_heading: true  # bounded final target from 3 acquisition-time rear panel scans
+
     apriltag_front_standoff: 0.95
-    # Local steering pivot estimate from stationary tag/IMU rotation in trial 41.
-    # Confirm against the driven-axle position; final success still checks base.
+    # Station-specific trial calibration after panel-heading fusion (trial84).
+    # Trials85..94 repeatedly had less left clearance AFTER the spin. Shift the
+    # front goal 3cm left (negative raw tag offset); verify again on the robot.
+    # This is not a measured camera TF correction or a relaxed rear side guard.
+    apriltag_front_lateral_offset: -0.03
+    # Tag supplies station center; the front panel supplies its normal.
+    # No front side-rail centering or extra approach stage is used.
+    tag_front_use_lidar_panel_heading: true
     apriltag_front_axle_x: 0.10
+    tag_refinement_longitudinal_tolerance: 0.02
+    # Trial85 completed with 19mm lateral error, but the measured post-turn
+    # gaps were only 2cm / 8cm. Leave room for turn and rear-plane uncertainty
+    # BEFORE committing to the spin; keep the rear 2cm side guard unchanged.
+    tag_refinement_lateral_tolerance: 0.012
+    tag_refinement_yaw_tolerance: 0.017453293  # 1 deg
+    # Source loss: hold zero, reacquire three fresh pairs, cumulative wait 8s.
+    tag_front_observation_recovery_timeout_sec: 8.0
+    apriltag_view_camera_info_topic: /apriltag/camera_info_rect
+    apriltag_view_tag_size: 0.154
+    apriltag_view_margin_fraction: 0.05  # soft margin; full-tag cropping guard remains active
+    apriltag_view_prediction_sec: 1.0
     tag_front_body_reference_x: 0.2295
     tag_front_min_lidar_clearance: 0.05
-    # Include deceleration/settling after the Nav2 action before gathering
-    # three distinct stationary observations; finish early as soon as ready.
-    tag_centering_wait_sec: 2.5
-    tag_centering_stable_pairs: 3
-    # Estimated-target change, not permitted guide error.
-    tag_centering_max_shift: 0.15
-    tag_refinement_yaw_tolerance: 0.034906585  # 2 deg
-    tag_refinement_stable_cycles: 5
-    tag_refinement_stationary_linear_speed: 0.005
-    tag_refinement_linear_kp: 0.50
-    tag_refinement_angular_k_alpha: 1.00
-    tag_refinement_angular_k_beta: -0.30
-    tag_refinement_final_yaw_kp: 1.00
-    tag_refinement_max_linear_speed: 0.04
-    tag_refinement_max_angular_speed: 0.08
-    # Rotate toward the target point first. Translation fades to zero at 8 deg,
-    # preventing a wide arc from consuming the yaw/travel safety envelope.
-    tag_refinement_translation_heading_limit: 0.139626340  # 8 deg
-    # Only after stationary yaw stall; capped at the existing 180-degree spin speed.
-    tag_refinement_recovery_max_angular_speed: 0.15
-    # Start local centering earlier to keep the tag in view while correcting
-    # a ~12 cm lateral error. Preserve the 30-degree rotation budget.
-    tag_refinement_max_initial_distance: 0.50
-    # Deprecated axis/yaw gates retained for compatible parameter files.
-    # Runtime feasibility uses radial distance and the planned yaw excursion.
-    tag_refinement_max_initial_longitudinal: 0.18
-    tag_refinement_max_initial_lateral: 0.10
-    tag_refinement_max_initial_yaw: 0.436332313  # 25 deg
-    tag_refinement_max_travel: 0.50
-    tag_refinement_max_yaw_excursion: 0.523598776  # 30 deg
-    tag_refinement_control_rate_hz: 20.0
-    tag_refinement_abort_on_failure: true
-
-    # Covers one Nav2 retry plus bounded refinement, spin, alignment and backup.
-    total_timeout_sec: 180.0
 
     # Rear-plane alignment first acquires a stable surface while stopped.
     # Ignore one soft RANSAC jump; reacquire only when it repeats.
     lidar_align_timeout_sec: 18.0
+    lidar_align_odom_recovery_timeout_sec: 1.0  # Stop, await fresh odom, reacquire new scans.
     # Separate the panel from adjacent bent frame points (stationary scan replay).
     lidar_align_ransac_threshold: 0.010
     lidar_align_max_rotation: 0.314159265  # 18 deg
@@ -134,19 +116,12 @@ dock_turn_backup:
     lidar_align_tracking_outlier_cycles: 2
     lidar_align_hard_tracking_residual: 0.209439510  # 12 deg
 
-    # The former blind one-second forward motion is disabled independently.
-    # Re-enable this flag to reproduce that step without enabling refinement.
-    use_pre_spin_forward: false
-    pre_spin_forward_duration_sec: 1.0
-    pre_spin_forward_speed: 0.03
-    pre_spin_forward_max_distance: 0.05
-
-    # The successful dock measured 0.078 m from the rear LiDAR origin to the
-    # wall.  The LiDAR is 0.0635 m ahead of the rear body reference, so this
-    # is a 0.0145 m body clearance.  A +/-0.010 m tolerance corresponds to a
-    # directly measurable LiDAR-to-wall range of 0.068..0.088 m.
-    backup_target_rear_clearance: 0.0145
-    backup_clearance_tolerance: 0.010
+    # 2026-10-12: user-confirmed wireless-pad contact measured at ~28mm
+    # from the body reference to the LiDAR-visible panel (not the pad face).
+    backup_target_rear_clearance: 0.028
+    # Both user-confirmed contact poses vary by several mm between panel
+    # and the wider protective sector. Keep the stop target; accept +/-6mm.
+    backup_clearance_tolerance: 0.006
     # Back up slowly enough to stop before a guide rail after a rejected scan.
     backup_speed: 0.035
     # Include the optional forward reposition in the bounded return distance.
@@ -168,41 +143,54 @@ dock_turn_backup:
     backup_stationary_heading_min_angular_speed: 0.025
     backup_heading_pause_error: 0.052359878  # 3 deg
     backup_max_yaw_drift: 0.139626340  # 8 deg
-    backup_lidar_heading_max_error: 0.139626340  # 8 deg
+    # Accept a correctable panel tilt after the odom spin. Above the 3 deg
+    # pause threshold, correct in place; this does not allow tilted reverse.
+    # Independent fallback yaw drift stays limited to 8 deg.
+    backup_lidar_heading_max_error: 0.209439510  # 12 deg
     backup_lidar_motion_residual: 0.034906585  # 2 deg
     # Stable disagreement up to 4 deg may use encoder-only straight heading;
     # the suspect LiDAR plane is never used to steer in this guarded mode.
     backup_lidar_wheel_guard_residual: 0.069813170  # 4 deg
     backup_plane_reacquire_timeout_sec: 3.0
+    # Pause only inside a verified straight corridor. Keep the original
+    # heading/travel and whole-backup deadline; never drive on stale state.
+    backup_motion_feedback_recovery_timeout_sec: 2.0
+    backup_motion_feedback_recovery_total_sec: 4.0
 
     # Live replay and physical inspection both confirmed a right-side intrusion.
     # Keep the entry guard; improve centering BEFORE the 180-degree turn.
     use_lidar_guide_centering: true
-    # Commit to straight entry while five near-dock rail/panel observations
-    # still verify the whole remaining corridor, BEFORE near-field fits drift.
-    # Measured width, center and body rotation set the IMU heading budget.
+    # Keep guide feedback during the initial reverse/caster loading. Trial76
+    # committed at 48.5cm before that transient settled; trial73 succeeded
+    # after committing at 31.1cm. No slower speed or extra waiting stage.
+    # Five observations still must verify the whole remaining corridor.
     backup_guide_visibility_handoff_clearance: 0.32
     # User measured THIS fixed station: 54 cm inside, 44 cm robot body.
     # Reserve 1 cm of width uncertainty. Set known width to 0 at other docks.
     # LiDAR still supplies center/heading; no missing rail creates a center.
     backup_guide_known_width: 0.54
     backup_guide_known_width_uncertainty: 0.01
+    # At this measured station, the 15 mm tolerance below is for steering.
+    # Straight handoff uses the remaining full-body corridor clearance instead.
     # Keep side returns as the guide tips pass beside the rear LiDAR.
     # This changes guide fitting only, not the rear panel or collision sectors.
     lidar_guide_sector_width: 3.839724354  # 220 deg, rear +/-110 deg
-    # One forward reposition is allowed only when fresh front/rear scans
-    # establish its swept footprint is clear. Never lower the entry margin.
-    use_dock_entry_recovery: true
     # Measured 2026-10-02: 0.54 m inside guide width, 0.44 m body width.
     # Require two stable rails before entry; allow 4 cm measurement variation.
     lidar_guide_min_separation: 0.50
     lidar_guide_max_separation: 0.58
     backup_guide_center_kp: 1.0
     backup_guide_center_tolerance: 0.015
-    backup_guide_center_max_heading: 0.069813170  # 4 deg
+    # Trial87's effective 2.75deg guide target left only 0.25deg below the
+    # unchanged 3deg stop threshold. Keep 0.5deg of caster/settling headroom.
+    # A 2deg target left too much lateral error in the same bounded replay.
+    backup_guide_center_max_heading: 0.043633231  # 2.5 deg
 
 # ManagedStack passes this same file to the bridge.
 apriltag_to_pose_bridge:
   ros__parameters:
+    # Trial 71: avoid the planar PnP branch switches measured while stationary.
+    pose_source: homography
+    tag_size: 0.154
     transform_max_age_sec: 0.50
     transform_future_tolerance_sec: 0.05

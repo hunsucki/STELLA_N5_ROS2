@@ -84,7 +84,7 @@ def test_output_calibration_includes_binning_and_roi_adjustment():
 
 
 @pytest.mark.parametrize('compressed', [False, True])
-def test_node_outputs_bounded_rate_reliable_pipeline_mono_with_original_stamp(monkeypatch, compressed):
+def test_node_outputs_bounded_rate_mono_with_original_stamp(monkeypatch, compressed):
     from types import SimpleNamespace
     from unittest.mock import Mock
     import time

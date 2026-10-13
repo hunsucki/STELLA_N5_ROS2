@@ -18,7 +18,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_library(stella_dds_udp_guard SHARED src/dds_udp_guard.cpp)
+  add_library(stella_dds_udp_guard SHARED src/dds_udp_guard.cpp src/dds_log_throttle.cpp)
   target_link_libraries(stella_dds_udp_guard dl)
   install(TARGETS stella_dds_udp_guard LIBRARY DESTINATION lib)
   if(BUILD_TESTING)

@@ -80,6 +80,75 @@ def test_two_lidars_do_not_infer_free_space_from_invalid_returns():
 from test_backup_entry_completion import simulation
 
 
+@pytest.mark.parametrize('seed', [7, 42, 123])
+def test_trial47_recorded_guide_jitter_acquires_a_sliding_stationary_window(monkeypatch, seed):
+    import json
+    import random
+    from pathlib import Path
+    from unittest.mock import Mock
+    from docking.lidar_alignment import LidarPlaneAligner
+    from docking.lidar_geometry import PlanarTransform, project_scan_to_base, yaw_from_quaternion
+    import yaml
+    data = json.loads((Path(__file__).parent/'fixtures'/'entry_acquisition_trial47.json').read_text())
+    state = SimpleNamespace(now=10.)
+    monkeypatch.setattr('time.monotonic', lambda: state.now)
+    monkeypatch.setattr('docking.entry_recovery.spin_for',
+                        lambda node, dt, stop: setattr(state, 'now', state.now+dt))
+    parameters = {'backup_rear_reference_x': -.2295}
+    node = SimpleNamespace(declare_parameter=lambda n,v: parameters.setdefault(n,v),
+        get_parameter=lambda n: SimpleNamespace(value=parameters[n]),
+        should_stop=lambda: False, get_logger=lambda: Mock())
+    LidarPlaneAligner.declare_parameters(node)
+    parameters.update(yaml.safe_load((Path(__file__).parents[1]/'config'/'docking.yaml').read_text())
+                      ['dock_turn_backup']['ros__parameters'])
+    m = data['transform']
+    transform = PlanarTransform(m['x'],m['y'],yaw_from_quaternion(*m['q']))
+
+    def snapshot():
+        index = int((state.now-10.)/.1)
+        if index >= len(data['scans']):
+            return None
+        return SimpleNamespace(sequence=index, row=data['scans'][index])
+
+    def project(scan, center, width, minimum, maximum):
+        r = scan.row
+        return project_scan_to_base([v if v is not None else math.inf for v in r['ranges']],
+            r['angle_min'],r['angle_increment'],r['range_min'],r['range_max'],
+            transform,center,width,minimum,maximum)
+
+    node.lidar = SimpleNamespace(snapshot=snapshot, project=project)
+    motion = SimpleNamespace(is_stationary=lambda _: True, current_odom_yaw_rate=lambda: 0.)
+    node.lidar_aligner = LidarPlaneAligner(node,motion,node.lidar)
+    recovery = DockEntryRecovery.__new__(DockEntryRecovery)
+    recovery.node,recovery.motion = node,motion
+    rng = random.getstate()
+    try:
+        random.seed(seed)
+        result = recovery.observations()
+    finally:
+        random.setstate(rng)
+    assert result is not None
+    offset,width = result
+    assert -.046 < offset < -.026
+    assert .50 <= width <= .58
+    assert state.now <= 12.01
+
+
+def test_repeated_single_scan_cannot_verify_entry_pair(monkeypatch):
+    from unittest.mock import Mock
+    state = SimpleNamespace(now=10.)
+    monkeypatch.setattr('time.monotonic',lambda:state.now)
+    monkeypatch.setattr('docking.entry_recovery.spin_for',
+                        lambda node,dt,stop:setattr(state,'now',state.now+dt))
+    recovery = DockEntryRecovery.__new__(DockEntryRecovery)
+    recovery.motion = SimpleNamespace(is_stationary=lambda _:True,current_odom_yaw_rate=lambda:0.)
+    recovery.node = SimpleNamespace(should_stop=lambda:False,get_logger=lambda:Mock(),
+        lidar=SimpleNamespace(snapshot=lambda:SimpleNamespace(sequence=1)),
+        lidar_aligner=SimpleNamespace(estimate_error=lambda _:(0.,0.,100,100,.5),
+            estimate_guide_center=lambda _:SimpleNamespace(center_offset=-.038,separation=.54)))
+    assert recovery.observations() is None
+
+
 @pytest.mark.parametrize('offset', [-.033,.033])
 def test_complete_reposition_loop_establishes_margin_before_allowing_backup(simulation,offset):
     motion,state=simulation
@@ -196,3 +265,61 @@ def test_sufficient_original_margin_skips_repositioning(simulation):
     recovery.observations=lambda:(.005,.54)
     assert recovery.run()
     assert not state.sent
+
+
+@pytest.mark.parametrize('offset', [-.020, .020])
+def test_measured_width_prevents_unnecessary_recovery_from_narrow_rail_fit(simulation, offset):
+    motion, state = simulation
+    motion.node.parameters.update(use_lidar_guide_centering=True, use_dock_entry_recovery=True,
+                                  backup_guide_known_width=.54,
+                                  backup_guide_known_width_uncertainty=.01)
+    recovery = DockEntryRecovery.__new__(DockEntryRecovery)
+    recovery.node, recovery.motion = motion.node, motion
+    recovery.observations = lambda: (offset, .50)
+    recovery.clear = lambda *args: pytest.fail('sufficient calibrated margin must skip recovery')
+    assert recovery.run()
+    assert not state.sent
+    assert 'reposition_required=False' in motion.node.get_logger().info.call_args.args[0]
+
+
+@pytest.mark.parametrize('known_width', [0., .54])
+def test_real_margin_shortfall_still_requires_a_verified_escape_path(simulation, known_width):
+    motion, state = simulation
+    state.gap = .371
+    motion.node.parameters.update(use_lidar_guide_centering=True, use_dock_entry_recovery=True,
+                                  backup_guide_known_width=known_width)
+    motion.node.lidar = motion.lidar
+    recovery = DockEntryRecovery.__new__(DockEntryRecovery)
+    recovery.node, recovery.motion = motion.node, motion
+    recovery.observations = lambda: (.033, .54)
+    recovery.clear = lambda *args: False
+    assert not recovery.run()
+    assert not state.sent
+    assert 'reposition_required=True' in motion.node.get_logger().info.call_args.args[0]
+
+
+@pytest.mark.parametrize('known,uncertainty,offset,width', [
+    (.49, .01, .02, .54), (.54, .001, .02, .54),
+    (math.nan, .01, .02, .54), (.54, .01, math.nan, .54),
+    (.54, .01, .02, .49), (.54, .01, .02, math.inf),
+])
+def test_invalid_calibration_or_observation_cannot_skip_entry_checks(
+        simulation, known, uncertainty, offset, width):
+    motion, state = simulation
+    motion.node.parameters.update(use_lidar_guide_centering=True, use_dock_entry_recovery=True,
+                                  backup_guide_known_width=known,
+                                  backup_guide_known_width_uncertainty=uncertainty)
+    recovery = DockEntryRecovery.__new__(DockEntryRecovery)
+    recovery.node, recovery.motion = motion.node, motion
+    recovery.observations = lambda: (offset, width)
+    assert not recovery.run()
+    assert not state.sent
+
+
+def test_visibility_failure_reports_missing_neighbors_without_assuming_free_space():
+    values = [math.inf] * 720
+    values[0] = 2.
+    diagnostics = []
+    assert not DockEntryRecovery._visible(.6, 0, [sensor(values)], diagnostics)
+    assert diagnostics[0]['reason'] == 'missing_neighbor_returns'
+    assert diagnostics[0]['center'] == 2.

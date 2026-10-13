@@ -2,6 +2,7 @@
 
 import math
 import time
+from dataclasses import dataclass
 
 import rclpy
 
@@ -17,47 +18,6 @@ def front_axle_goal_errors(longitudinal, lateral, heading, axle_x):
             lateral + axle_x*math.sin(heading))
 
 
-class CenterlineLatch:
-    """Confirm a front control stage without changing its success tolerance."""
-
-    def __init__(self, tolerance, entering_tolerance=None):
-        self.tolerance = tolerance
-        self.entering_tolerance = (tolerance if entering_tolerance is None
-                                   else entering_tolerance)
-        self.centered = False
-        self.pending = False
-        self.last_sequence = None
-        self.count = 0
-
-    def reset(self):
-        self.centered = self.pending = False
-        self.last_sequence = None
-        self.count = 0
-
-    def update(self, sequence, lateral, heading_settled, settled_lateral=None):
-        settled_lateral = lateral if settled_lateral is None else settled_lateral
-        if not all(math.isfinite(v) for v in (lateral, settled_lateral)):
-            self.reset()
-            return False
-        inside = abs(lateral) <= self.entering_tolerance
-        settled_inside = abs(settled_lateral) <= self.tolerance
-        if sequence != self.last_sequence:
-            self.last_sequence = sequence
-            if not self.centered:
-                self.count = self.count+1 if inside else 0
-                if self.count >= 3:
-                    self.centered, self.count = True, 0
-            else:
-                # Finish yaw across small boundary noise. Once yaw settles,
-                # the original tolerance must pass again before straight drive.
-                outside = (abs(lateral) > self.tolerance+.01
-                           or (heading_settled and not settled_inside))
-                self.count = self.count+1 if outside else 0
-                if self.count >= 3:
-                    self.centered, self.count = False, 0
-        self.pending = ((not self.centered and inside)
-                        or (self.centered and heading_settled and not settled_inside))
-        return self.centered
 
 
 def straight_entry_heading_budget(observations, distance, center_limit,
@@ -68,7 +28,7 @@ def straight_entry_heading_budget(observations, distance, center_limit,
 
     A nonzero known_width is an explicitly measured, fixed station profile;
     otherwise use the observed rail width. Reserve 3 mm for lateral error
-    and bound rotation of the whole 459 mm body, not just its center point.
+    and include the body's front and rear corners, not just its center point.
     """
     if len(observations) != 5:
         return None
@@ -97,11 +57,9 @@ def straight_entry_heading_budget(observations, distance, center_limit,
     supported_width = (known_width-known_width_uncertainty if known_width
                        else sorted(widths)[1]-.003)
     side_room = supported_width/2 - half_width - side_margin - lateral
-    # A calibrated guide may accept small final residuals provided the whole
-    # remaining path stays inside its physical side margin. The 15 mm center
-    # gate still applies to all five observed entry positions.
-    if known_width and max(abs(c) for c in centers) > center_limit:
-        return None
+    # At a measured station, the full remaining corridor is the acceptance
+    # criterion. The steering deadband is not a second physical clearance
+    # limit: a 16 mm residual can still fit safely in a 54 cm guide.
     if side_room <= 0 or (not known_width and center_room <= 0):
         return None
     sine_budget = min(1., side_room/(distance+.459))
@@ -114,6 +72,101 @@ def straight_entry_heading_budget(observations, distance, center_limit,
     return budget
 
 
+def remaining_straight_heading_budget(initial_budget, initial_distance,
+                                      remaining_distance, lateral_spent,
+                                      heading_limit):
+    """Spend the original corridor clearance on travel and remaining body sweep.
+
+    Only for an explicitly measured station width. Absolute lateral travel
+    cannot be reclaimed by steering back; reserve the entire body length for
+    the current heading even after most of the straight path is complete.
+    """
+    if (not all(math.isfinite(v) for v in (
+            initial_budget, initial_distance, remaining_distance,
+            lateral_spent, heading_limit))
+            or not 0 < initial_budget <= heading_limit < math.pi/2
+            or initial_distance <= 0 or remaining_distance < 0
+            or lateral_spent < 0):
+        return 0.0
+    room = math.sin(initial_budget)*(initial_distance+.459)-lateral_spent
+    return min(heading_limit, math.asin(min(
+        1., max(0., room)/(remaining_distance+.459))))
+
+
+@dataclass(frozen=True)
+class StraightEntryPath:
+    """Signed rectangle sweep in the measured guide frame, in metres/radians.
+
+    The old symmetric bound adds lateral offset and yaw even when reversing
+    moves the body toward the center. Keep their signs and check both front
+    and rear corners, now and at the end of the remaining straight path.
+    """
+    observations: tuple
+    anchor_heading: float
+    supported_width: float
+    half_width: float
+    side_margin: float
+    heading_limit: float
+
+    def clearance(self, heading, progress, remaining, deviation=0.):
+        if (not all(math.isfinite(v) for v in (heading, progress, remaining, deviation))
+                or progress < 0 or remaining < 0 or deviation < 0
+                or abs(heading) > self.heading_limit):
+            return -math.inf
+        worst = 0.
+        for center, _, observed_heading in self.observations:
+            # Preserve the five scans' heading uncertainty and a further 0.1deg
+            # reserve. Evaluate the full angular interval analytically below.
+            low = heading + observed_heading-self.anchor_heading-math.radians(.1)
+            high = low + math.radians(.2)
+            for future in (0., remaining):
+                for x in (-.2295, .2295):
+                    a, b = future-x, self.half_width
+                    offset = progress*math.sin(observed_heading)-center
+                    angles = [low, high]
+                    for sign in (-1, 1):
+                        critical = math.atan2(a, sign*b)
+                        angles.extend(t for k in (-1, 0, 1)
+                                      if low <= (t := critical+k*math.pi) <= high)
+                    for angle in angles:
+                        for sign in (-1, 1):
+                            worst = max(worst, abs(
+                                offset+a*math.sin(angle)+sign*b*math.cos(angle)))
+        return (self.supported_width/2-worst-.003-deviation
+                - progress*math.sin(math.radians(.1)))
+
+
+def straight_entry_path(observations, distance, half_width, side_margin,
+                        heading_limit, rear_reference_x, known_width,
+                        known_width_uncertainty, anchor_heading):
+    """Verify five measured samples before allowing a signed straight sweep."""
+    if len(observations) != 5:
+        return None
+    values = [distance, half_width, side_margin, heading_limit, rear_reference_x,
+              known_width, known_width_uncertainty, anchor_heading,
+              *(v for row in observations for v in row)]
+    if (not all(math.isfinite(v) for v in values) or distance <= 0
+            or abs(rear_reference_x+.2295) > .001
+            or abs(half_width-.22) > .001
+            or not .50 <= known_width <= .58
+            or not .005 <= known_width_uncertainty <= .02
+            or not 0 < side_margin < known_width/2-half_width
+            or not 0 < heading_limit <= math.radians(3.000001)):
+        return None
+    centers, widths, headings = zip(*observations)
+    if (min(widths) < .50 or max(widths) > .58
+            or max(widths)-min(widths) > .02
+            or max(centers)-min(centers) > .015
+            or max(headings)-min(headings) > math.radians(.75)
+            or max(abs(h) for h in headings) > heading_limit):
+        return None
+    path = StraightEntryPath(tuple(observations), anchor_heading,
+                             known_width-known_width_uncertainty,
+                             half_width, side_margin, heading_limit)
+    # Leave 2mm beyond the runtime stop threshold for the zero-steering handoff.
+    return path if path.clearance(anchor_heading, 0., distance) >= side_margin+.002 else None
+
+
 def spin_for(node, duration, should_stop=lambda: False):
     """Service callbacks for a full period, even when the executor is busy."""
     deadline = time.monotonic() + max(duration, 0.0)
@@ -124,76 +177,6 @@ def spin_for(node, duration, should_stop=lambda: False):
         rclpy.spin_once(node, timeout_sec=min(remaining, 0.05))
 
 
-class PrecisionYawController:
-    """Increase rotation command only when both motion sensors report no rotation.
-
-    Never infer a stalled chassis from a frozen fused heading alone. Encoder
-    or gyro motion with no heading progress requires stopping, not a stronger command.
-    An optional nominal minimum avoids ineffective low-speed final commands;
-    it does not bypass the no-progress guard or acceleration limit. The caller
-    stops the command inside its heading tolerance.
-    """
-
-    def __init__(self, normal_limit=0.08, recovery_limit=0.15, minimum_speed=0.0):
-        if not (math.isfinite(normal_limit) and math.isfinite(recovery_limit)
-                and 0.0 < normal_limit <= recovery_limit <= 0.15):
-            raise ValueError('Precision yaw limits must satisfy 0 < normal <= recovery <= 0.15')
-        if not math.isfinite(minimum_speed) or not 0 <= minimum_speed <= normal_limit:
-            raise ValueError('Precision yaw minimum must satisfy 0 <= minimum <= normal')
-        self.normal_limit = normal_limit
-        self.recovery_limit = recovery_limit
-        self.minimum_speed = minimum_speed
-        self.reset()
-
-    def reset(self):
-        self.anchor_error = None
-        self.progress_at = None
-        self.recovery_floor = 0.0
-        self.command = 0.0
-        self.previous_time = None
-        self.fault = None
-
-    def update(self, error, gyro_rate, wheel_rate, now, kp=1.0, allow_recovery=True):
-        if self.fault:
-            return 0.0
-        if not all(math.isfinite(v) for v in (error, gyro_rate, wheel_rate, now, kp)):
-            self.fault = 'non-finite yaw feedback'
-            return 0.0
-        if self.anchor_error is None:
-            self.anchor_error, self.progress_at = error, now
-        # Translation can coast briefly into the yaw phase. Measure recovery
-        # from that peak error, without granting more time for wrong-way motion.
-        if abs(error) > abs(self.anchor_error):
-            self.anchor_error = error
-        # Count actual error reduction, rather than small alternating jitter.
-        if abs(error) < abs(self.anchor_error) - math.radians(0.5):
-            self.anchor_error, self.progress_at = error, now
-        stalled_for = now - self.progress_at
-        stationary = max(abs(gyro_rate), abs(wheel_rate)) <= math.radians(0.5)
-        if stalled_for >= 1.0:
-            if not stationary:
-                if stalled_for >= 2.0:
-                    self.fault = 'heading is not converging despite measured rotation'
-                    return 0.0
-            else:
-                if not allow_recovery:
-                    if stalled_for >= 2.0:
-                        self.fault = 'cannot recover yaw stall without fresh independent gyro'
-                    return 0.0
-                self.recovery_floor = min(
-                    self.recovery_limit, self.normal_limit + 0.04 * (stalled_for - 1.0))
-                if stalled_for >= 4.0:
-                    self.fault = 'no yaw progress after bounded stationary recovery'
-                    return 0.0
-        requested = math.copysign(
-            max(min(abs(kp * error), self.normal_limit),
-                self.minimum_speed if error != 0.0 else 0.0,
-                self.recovery_floor), error)
-        # Bound acceleration, including direction changes near the goal.
-        dt = 0.05 if self.previous_time is None else min(max(now - self.previous_time, 0.0), 0.1)
-        self.command += max(min(requested - self.command, 0.3 * dt), -0.3 * dt)
-        self.previous_time = now
-        return self.command
 
 
 class BackupStationaryYawController:
