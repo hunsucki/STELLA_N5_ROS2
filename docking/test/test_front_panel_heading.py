@@ -151,3 +151,31 @@ def test_runtime_turn_point_leaves_margin_before_spin(
     assert abs(state.yaw) <= math.radians(1)
     assert state.now-10 < 30
     assert state.linear == state.angular == 0
+
+
+@pytest.mark.parametrize('seed', [7, 42, 123])
+def test_trial13_visible_tag_angle_cannot_veto_verified_panel_heading(seed):
+    # Real failure: paper normal ~32deg, independently fitted panel ~29deg.
+    # Keep the panel's 30deg bound and the real scan/view/distance geometry.
+    data = json.loads((Path(__file__).parent/'fixtures/front_panel_trial13.json').read_text())
+    t = data['transform']
+    transform = PlanarTransform(t['x'], t['y'], yaw_from_quaternion(*t['q']))
+    row = data['scans'][0]
+    centerer = fused_centerer([])
+    centerer.lidar.project = lambda snapshot, center, width, lo, hi: project_scan_to_base(
+        [value if value is not None else math.inf for value in row['ranges']],
+        row['angle_min'], row['angle_increment'], row['range_min'], row['range_max'],
+        transform, center, width, lo, hi)
+    tag = PoseStamped()
+    tag.pose.position.x, tag.pose.position.y = row['tag']['x'], row['tag']['y']
+    q = tag.pose.orientation
+    q.x, q.y, q.z, q.w = row['tag']['q']
+    assert abs(apriltag_normal_yaw(tag)) > math.radians(30)
+    before = random.getstate()
+    try:
+        random.seed(seed)
+        normal = centerer.panel(S(sequence=1), tag)
+        assert normal is not None, centerer.last_panel_diagnostic
+        assert math.radians(-30) < normal < math.radians(-28)
+    finally:
+        random.setstate(before)

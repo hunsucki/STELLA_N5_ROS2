@@ -1,481 +1,471 @@
 #!/usr/bin/env python3
-"""
-통합 배터리 노드.
+"""Battery monitoring and acknowledged, measurement-gated SK120 charging."""
 
-[ 도킹 감지 방식 ]
-  poll_interval(기본 5s)마다 SK120 Modbus 통신을 시도한다.
-  응답이 오면 → 도킹 감지 → /sk120/available: BatteryState(CHARGING) 발행
-  연속 FAIL_THRESHOLD회 실패 → 도킹 해제 → 충전 자동 중지
+import math
+import time
 
-[ 상태 흐름 ]
-  IDLE ──(SK120 응답)──► AVAILABLE ──(/sk120/cmd_output: true)──► CHARGING
-    ▲                        │                                        │
-    └────(연속 N회 실패)──────┘◄──────────(연속 N회 실패 or cmd false)──┘
-
-[ 전류 부호 관례 (ROS BatteryState) ]
-  충전 중 : current > 0  (SK120 실측값)
-  방전 중 : current < 0  (INA219 값 반전 – INA219는 방전=양수로 측정)
-
-[ 램프업 중단 로직 ]
-  실제 충전 전류가 확인된 전류만 _ramp_limit에 저장 → 재충전 시 그 전류까지만 올림
-  실제 도킹 해제(SK120 전원 꺼짐)가 감지될 때만 _ramp_limit 초기화
-
-[ 토픽 ]
-  Subscribe
-    /sk120/cmd_output  (Bool)   : 충전 시작(true) / 중지(false)
-
-  Publish
-    /battery_state     (BatteryState) : 배터리 상태 (항상)
-    /sk120/available   (BatteryState) : SK120 연결 가능 여부
-    /sk120/output_on   (Bool)         : 충전 출력 ON/OFF
-    /sk120/current_set (Float32)      : 현재 설정 전류 [A]
-    /sk120/current_out (Float32)      : SK120 실측 전류 [A]
-    /sk120/voltage_out (Float32)      : SK120 실측 전압 [V]
-"""
-
+from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from smbus2 import SMBus
 from std_msgs.msg import Bool, Float32
 
+from .monitor import StellaN5Monitor
 from .sk120_driver import SK120Driver
 
 
-class StellaN5Monitor:
-    def __init__(self, bus_num=1, addr=0x40):
-        self.bus = SMBus(bus_num)
-        self.addr = addr
-        self.shunt_resistor = 0.01
-
-        self.MAX_V = 25.2
-        self.MIN_V = 17.5
-        self.CAPACITY_AH = 13.0
-
-    def read_voltage(self):
-        raw = self.bus.read_word_data(self.addr, 0x02)
-        raw = ((raw << 8) & 0xFF00) | (raw >> 8)
-        return raw * 0.00125
-
-    def read_current(self):
-        raw = self.bus.read_word_data(self.addr, 0x01)
-        if raw > 32767:
-            raw -= 65536
-        return (raw * 0.0000025) / self.shunt_resistor
-
-    def get_soc(self, voltage):
-        soc = (voltage - self.MIN_V) / (self.MAX_V - self.MIN_V) * 100
-        return max(0.0, min(100.0, round(soc, 1)))
-
-    def close(self):
-        self.bus.close()
-
-
 class BatteryNode(Node):
+    """Keep charger commands, observed output, and measured current distinct."""
 
-    FAIL_THRESHOLD = 3        # 연속 통신 실패 허용 횟수
-    LOW_CURRENT_THRESHOLD = 0.05   # A – 이하면 "충전 전류 없음"으로 판단
-    LOW_CURRENT_MAX_COUNT = 3      # 연속 N회 → 직전 정상 전류로 백오프
-    GOOD_CURRENT_MIN_COUNT = 2     # 같은 설정 전류에서 연속 N회 정상 → 안전 전류로 확정
+    FAIL_THRESHOLD = 3
+    LOW_CURRENT_THRESHOLD = 0.05
+    LOW_CURRENT_MAX_COUNT = 3
+    GOOD_CURRENT_MIN_COUNT = 2
 
     def __init__(self):
         super().__init__('battery_node')
-
-        # ── 파라미터 ────────────────────────────────────────────────────
-        self.declare_parameter('port',            '/dev/SK120')
-        self.declare_parameter('baudrate',        115200)
-        self.declare_parameter('slave_id',        1)
-        self.declare_parameter('voltage_set',     25.2)
-        self.declare_parameter('start_current',   0.7)
-        self.declare_parameter('target_current',  1.8)
-        self.declare_parameter('ramp_step',       0.1)
-        self.declare_parameter('ramp_interval',   5.0)
-        self.declare_parameter('current_offset',  0.0)
-        self.declare_parameter('status_interval', 2.0)
-        self.declare_parameter('poll_interval',   5.0)
-
-        self._port = self.get_parameter('port').value
-        self._baudrate = self.get_parameter('baudrate').value
-        self._slave_id = self.get_parameter('slave_id').value
-        self._v_set = self.get_parameter('voltage_set').value
-        self._i_start = self.get_parameter('start_current').value
-        self._i_target = self.get_parameter('target_current').value
-        self._ramp_step = self.get_parameter('ramp_step').value
-        self._ramp_interval = self.get_parameter('ramp_interval').value
-        self._i_offset = self.get_parameter('current_offset').value
-        status_interval = self.get_parameter('status_interval').value
-        poll_interval = self.get_parameter('poll_interval').value
-
+        defaults = {
+            'port': '/dev/SK120', 'baudrate': 115200, 'slave_id': 1,
+            'voltage_set': 25.2, 'start_current': 0.1, 'target_current': 1.8,
+            'ramp_step': 0.1, 'ramp_interval': 5.0, 'current_offset': 0.0,
+            'status_interval': 2.0, 'poll_interval': 5.0,
+            'settle_interval': 5.0, 'sensor_type': 'auto',
+            'shunt_resistor': 0.01,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+        p = {name: self.get_parameter(name).value for name in defaults}
+        self._validate_parameters(p)
+        self._configuration_parameters = set(defaults)
+        self.add_on_set_parameters_callback(self._reject_live_config_changes)
+        self._port, self._baudrate, self._slave_id = p['port'], p['baudrate'], p['slave_id']
+        self._v_set = p['voltage_set']
+        self._i_start, self._i_target = p['start_current'], p['target_current']
+        self._i_offset = p['current_offset']
         self._i_start_raw = round(self._i_start + self._i_offset, 3)
         self._i_target_raw = round(self._i_target + self._i_offset, 3)
-
-        # ── INA219 ───────────────────────────────────────────────────────
-        self._monitor = StellaN5Monitor()
-
-        # ── SK120 ────────────────────────────────────────────────────────
-        self._sk120: SK120Driver | None = None
-
-        # ── 내부 상태 ────────────────────────────────────────────────────
+        self._ramp_step, self._ramp_interval = p['ramp_step'], p['ramp_interval']
+        self._settle_interval = p['settle_interval']
+        self._status_interval = p['status_interval']
+        self._monitor_options = {'sensor_type': p['sensor_type'],
+                                 'shunt_resistor': p['shunt_resistor']}
+        self._monitor = None
+        self._sk120 = None
         self._sk120_ready = False
-        self._charging = False
+        self._charging = False  # Requested session, not evidence of battery charging.
         self._ramp_active = False
+        self._fault_latched = False
+        self._shutting_down = False
+        self._output_on = None  # None means no fresh readback.
         self._current_set = self._i_start_raw
-        self._sk120_current = 0.0
-        self._sk120_voltage = 0.0
+        self._sk120_current = float('nan')
+        self._sk120_voltage = float('nan')
+        self._last_status_at = 0.0
+        self._changed_at = 0.0
         self._fail_count = 0
-
-        # 램프업 중단 상한 (None = 제한 없음 / 값 있음 = 이번 세션 최대 전류)
-        self._ramp_limit: float | None = None
-        # 이번 충전에서 실제 적용할 목표 전류
+        self._write_fail_count = 0
+        self._ramp_limit = None
         self._i_target_eff = self._i_target_raw
-        # 실측 전류가 흐른 마지막 설정 전류
-        self._last_good_current_set: float | None = None
-        self._good_current_candidate: float | None = None
+        self._last_good_current_set = None
+        self._good_current_candidate = None
         self._good_current_count = 0
-
-        # 충전 전류 감지 카운터
         self._low_current_count = 0
-
-        # ── 퍼블리셔 ─────────────────────────────────────────────────────
-        self._pub_battery = self.create_publisher(BatteryState, '/battery_state',     10)
-        self._pub_available = self.create_publisher(BatteryState, '/sk120/available',   10)
-        self._pub_on = self.create_publisher(Bool,         '/sk120/output_on',   10)
-        self._pub_iset = self.create_publisher(Float32,      '/sk120/current_set', 10)
-        self._pub_iout = self.create_publisher(Float32,      '/sk120/current_out', 10)
-        self._pub_vout = self.create_publisher(Float32,      '/sk120/voltage_out', 10)
-
-        # ── 서브스크라이버 ───────────────────────────────────────────────
+        self._pub_battery = self.create_publisher(BatteryState, '/battery_state', 10)
+        self._pub_available = self.create_publisher(BatteryState, '/sk120/available', 10)
+        self._pub_on = self.create_publisher(Bool, '/sk120/output_on', 10)
+        self._pub_iset = self.create_publisher(Float32, '/sk120/current_set', 10)
+        self._pub_iout = self.create_publisher(Float32, '/sk120/current_out', 10)
+        self._pub_vout = self.create_publisher(Float32, '/sk120/voltage_out', 10)
+        self._pub_vin = self.create_publisher(Float32, '/sk120/voltage_in', 10)
+        self._pub_power = self.create_publisher(Float32, '/sk120/power_out', 10)
         self.create_subscription(Bool, '/sk120/cmd_output', self._cb_cmd, 10)
-
-        # ── 타이머 ───────────────────────────────────────────────────────
-        self.create_timer(poll_interval,       self._cb_poll)
-        self.create_timer(status_interval,     self._cb_status)
-        self.create_timer(self._ramp_interval, self._cb_ramp)
-
+        self.create_timer(p['poll_interval'], self._cb_poll)
+        self.create_timer(p['status_interval'], self._cb_status)
+        self.create_timer(min(0.5, self._ramp_interval), self._cb_ramp)
         self.get_logger().info(
-            f'배터리 노드 시작 | 폴링: {poll_interval}s | '
-            f'충전: {self._i_start}A → {self._i_target}A'
-        )
+            f'배터리 노드 시작 | 충전 설정 {self._i_start}A → {self._i_target}A | '
+            '실측 확인 후 램프업')
 
-    # ──────────────────────────────────────────────────────────────────
-    # SK120 폴링
-    # ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _validate_parameters(p):
+        numeric = ('voltage_set', 'start_current', 'target_current', 'ramp_step',
+                   'ramp_interval', 'current_offset', 'status_interval',
+                   'poll_interval', 'settle_interval', 'shunt_resistor')
+        if any(not math.isfinite(p[k]) for k in numeric):
+            raise ValueError('Battery parameters must be finite')
+        if not 0 < p['voltage_set'] <= 25.2:
+            raise ValueError('6S charging voltage must be in (0, 25.2] V')
+        if not 0 < p['start_current'] <= p['target_current'] <= 1.8:
+            raise ValueError('Require 0 < start_current <= target_current <= 1.8 A')
+        if not 0 <= p['current_offset'] or p['target_current'] + p['current_offset'] > 1.8:
+            raise ValueError('Offset-adjusted current must not exceed 1.8 A')
+        if any(p[k] <= 0 for k in ('ramp_step', 'ramp_interval', 'status_interval',
+                                   'poll_interval', 'shunt_resistor')):
+            raise ValueError('Intervals, ramp step and shunt resistance must be positive')
+        if p['settle_interval'] < 0 or p['sensor_type'] not in ('auto', 'ina226', 'ina219'):
+            raise ValueError('Invalid settle interval or sensor type')
+        if not 1 <= p['slave_id'] <= 247 or p['baudrate'] <= 0:
+            raise ValueError('Invalid Modbus address or baudrate')
+
+    def _reject_live_config_changes(self, parameters):
+        if any(p.name in self._configuration_parameters for p in parameters):
+            return SetParametersResult(
+                successful=False, reason='Battery configuration requires node restart')
+        return SetParametersResult(successful=True)
+
+    def _read_status(self):
+        try:
+            return self._sk120.get_status()
+        except Exception as exc:
+            self.get_logger().warn(f'SK120 읽기 오류: {exc}')
+            return None
+
+    def _write(self, method, value):
+        try:
+            return self._sk120 is not None and bool(getattr(self._sk120, method)(value))
+        except Exception as exc:
+            self.get_logger().error(f'SK120 {method} 오류: {exc}')
+            return False
+
     def _cb_poll(self):
-        if self._charging:
-            return  # 충전 중에는 _cb_status가 담당
-
-        ok = self._try_read_sk120()
-
-        if ok:
-            self._fail_count = 0
-            if not self._sk120_ready:
-                self._sk120_ready = True
-                self._publish_sk120_available()
-                self.get_logger().info(
-                    '[충전 모듈 감지] 도킹 확인 -> /sk120/cmd_output: true 로 충전 시작 가능'
-                )
-        else:
-            self._fail_count += 1
-            if self._sk120_ready and self._fail_count >= self.FAIL_THRESHOLD:
-                self.get_logger().warn(
-                    f'[충전 모듈 응답 없음] {self.FAIL_THRESHOLD}회 연속 실패 → 도킹 해제'
-                )
-                self._on_undocked()
-
-    def _try_read_sk120(self) -> bool:
+        if self._sk120_ready:
+            return
         if self._sk120 is None:
             try:
                 self._sk120 = SK120Driver(
                     self._port, baudrate=self._baudrate, slave_id=self._slave_id)
             except Exception:
-                return False
-        try:
-            return self._sk120.get_status() is not None
-        except Exception:
-            return False
+                return
+        status = self._read_status()
+        if status is None:
+            self._close_sk120()  # Reopen after unplug/replug or serial errors.
+            return
+        # A restarted node never adopts an output left ON by an earlier process.
+        if status.output_on:
+            self._write('set_output', False)
+            status = self._read_status()
+            if status is None or status.output_on:
+                self.get_logger().error('SK120 초기 출력 OFF 확인 실패')
+                return
+        self._sk120_ready = True
+        self._fail_count = 0
+        self._accept_status(status)
+        self._publish_sk120_available()
+        self.get_logger().info('[충전 모듈 감지] 통신 및 출력 OFF 확인')
 
-    def _on_undocked(self):
-        """실제 도킹 해제 _ramp_limit 초기화 포함."""
-        self._stop_charging(reset_ramp_limit=True)
+    def _close_sk120(self):
         if self._sk120 is not None:
             try:
                 self._sk120.close()
             except Exception:
                 pass
-            self._sk120 = None
+        self._sk120 = None
+
+    def _on_undocked(self):
+        # Communication loss alone cannot prove physical undocking. Preserve limit.
+        self._fault_latched = True
+        self._stop_charging()
+        self._close_sk120()
         self._sk120_ready = False
-        self._fail_count = 0
-        self._low_current_count = 0
+        self._output_on = None
+        self._invalidate_status()
         self._publish_sk120_available()
 
-    def _make_sk120_available_msg(self) -> BatteryState:
-        """Nav2 docking이 읽을 수 있는 SK120 충전 가능 상태 메시지."""
+    def _publish_sk120_available(self):
         msg = BatteryState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'sk120'
-        msg.voltage = 0.0
-        msg.temperature = 0.0
-        msg.current = 0.0
-        msg.charge = 0.0
-        msg.capacity = 0.0
-        msg.design_capacity = 0.0
-        msg.percentage = 1.0 if self._sk120_ready else 0.0
-        msg.power_supply_status = (
-            BatteryState.POWER_SUPPLY_STATUS_CHARGING
-            if self._sk120_ready
-            else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
-        )
-        msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
-        msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
         msg.present = self._sk120_ready
-        return msg
+        msg.percentage = 1.0 if self._sk120_ready else 0.0
+        # Legacy docking contact signal; this topic is NOT a charging measurement.
+        msg.power_supply_status = (
+            BatteryState.POWER_SUPPLY_STATUS_CHARGING if self._sk120_ready
+            else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING)
+        self._pub_available.publish(msg)
 
-    def _publish_sk120_available(self):
-        self._pub_available.publish(self._make_sk120_available_msg())
+    def _cb_cmd(self, msg):
+        if not msg.data:
+            if self._stop_charging():
+                self._fault_latched = False
+            return
+        if self._fault_latched:
+            return  # Repeated ON commands must not bypass a protective stop.
+        if not self._sk120_ready:
+            self.get_logger().warn('[충전 명령 무시] SK120 미연결')
+        elif not self._charging:
+            self._start_charging()
 
-    # ──────────────────────────────────────────────────────────────────
-    # 충전 시작/중지 명령
-    # ──────────────────────────────────────────────────────────────────
-    def _cb_cmd(self, msg: Bool):
-        if msg.data:
-            if not self._sk120_ready:
-                self.get_logger().warn('[충전 명령 무시] SK120 미연결')
-                return
-            if not self._charging:
-                self._start_charging()
-        else:
-            if self._charging:
-                self._stop_charging(reset_ramp_limit=False)
+    def _configure_output(self, current):
+        # Never change voltage/current while a previous output may still be active.
+        if not self._write('set_output', False):
+            return False
+        status = self._read_status()
+        if status is None or status.output_on:
+            return False
+        for method, value in (('set_voltage', self._v_set), ('set_current', current)):
+            if not self._write(method, value):
+                return False
+        status = self._read_status()
+        if (status is None or status.output_on
+                or abs(status.current_set - current) > 0.002
+                or abs(status.voltage_set - self._v_set) > 0.02):
+            return False
+        if not self._write('set_output', True):
+            return False
+        status = self._read_status()
+        if (status is None or not status.output_on
+                or abs(status.current_set - current) > 0.002
+                or abs(status.voltage_set - self._v_set) > 0.02):
+            return False
+        self._current_set = current
+        self._accept_status(status)
+        self._changed_at = time.monotonic()
+        self._low_current_count = 0
+        self._good_current_count = 0
+        self._good_current_candidate = None
+        self._write_fail_count = 0
+        self.get_logger().info(
+            f'[SK120 출력 확인] 입력 {status.voltage_in:.2f}V, '
+            f'출력 {status.voltage_out:.2f}V / {status.current_out:.3f}A / '
+            f'{status.power_out:.2f}W')
+        return True
 
     def _start_charging(self):
-        # 이번 세션 목표 전류: 이전 중단 전류가 있으면 그 값까지만
-        if self._ramp_limit is not None:
-            self._i_target_eff = self._ramp_limit
-            self.get_logger().info(
-                f'[충전 시작] 이전 중단 전류 {round(self._ramp_limit - self._i_offset, 3)}A 적용'
-            )
-        else:
-            self._i_target_eff = self._i_target_raw
-
-        self._sk120.set_voltage(self._v_set)
-        self._sk120.set_current(self._i_start_raw)
-        self._sk120.set_output(True)
-        self._current_set = self._i_start_raw
+        # Require a readable battery voltage before enabling the charger.
+        try:
+            voltage = self._monitor.read_voltage()
+            if not math.isfinite(voltage) or not 17.5 <= voltage <= 25.2:
+                raise ValueError(f'Battery voltage outside charge range: {voltage}')
+        except Exception as exc:
+            self.get_logger().error(f'[충전 시작 거부] 배터리 계측 오류: {exc}')
+            return
+        self._i_target_eff = min(self._i_target_raw, self._ramp_limit or self._i_target_raw)
+        if not self._configure_output(min(self._i_start_raw, self._i_target_eff)):
+            self.get_logger().error('[충전 시작 실패] 설정/출력 readback 불일치')
+            self._fault_latched = True
+            self._stop_charging()
+            return
         self._charging = True
-        self._ramp_active = True
+        self._ramp_active = self._current_set < self._i_target_eff
         self._fail_count = 0
-        self._low_current_count = 0
         self._last_good_current_set = None
-        self._good_current_candidate = None
-        self._good_current_count = 0
         self.get_logger().info(
-            f'[충전 시작] 초기 {self._i_start}A -> 목표 '
-            f'{round(self._i_target_eff - self._i_offset, 3)}A'
-        )
+            f'[충전 시작] 설정 {self._current_set:.3f}A → {self._i_target_eff:.3f}A')
 
-    def _stop_charging(self, reset_ramp_limit: bool = False):
-        if self._charging and self._sk120 is not None:
-            try:
-                self._sk120.set_output(False)
-            except Exception:
-                pass
+    def _stop_charging(self, reset_ramp_limit=False):
         self._charging = False
         self._ramp_active = False
-        self._sk120_current = 0.0
-        self._sk120_voltage = 0.0
         self._low_current_count = 0
-        self._last_good_current_set = None
-        self._good_current_candidate = None
         self._good_current_count = 0
+        self._good_current_candidate = None
+        self._last_good_current_set = None
         if reset_ramp_limit:
             self._ramp_limit = None
-        self.get_logger().info(
-            f'[충전 중지] 다음 재충전 상한: '
-            f'{round(self._ramp_limit - self._i_offset, 3) if self._ramp_limit else "없음(초기화)"}A'
-        )
-
-    # ──────────────────────────────────────────────────────────────────
-    # 전류 램프업
-    # ──────────────────────────────────────────────────────────────────
-    def _cb_ramp(self):
-        if not self._charging or not self._ramp_active or self._sk120 is None:
-            return
-
-        if self._current_set < self._i_target_eff:
-            next_i = min(self._current_set + self._ramp_step, self._i_target_eff)
-            if self._sk120.set_current(next_i):
-                self._current_set = next_i
-                real_i = round(self._current_set - self._i_offset, 3)
-                self.get_logger().info(
-                    f'[램프업] {real_i}A (SK120: {self._current_set}A)'
-                )
-                if self._current_set >= self._i_target_eff:
-                    self._ramp_active = False
-                    self.get_logger().info(
-                        f'[램프업 완료] 목표 {round(self._i_target_eff - self._i_offset, 3)}A 도달'
-                    )
-            else:
-                self._fail_count += 1
-                if self._fail_count >= self.FAIL_THRESHOLD:
-                    self.get_logger().error('[램프업] 통신 실패 반복 -> 충전 중지')
-                    self._on_undocked()
-
-    # ──────────────────────────────────────────────────────────────────
-    # 상태 발행
-    # ──────────────────────────────────────────────────────────────────
-    def _cb_status(self):
-        self._publish_sk120_available()
-
-        # INA219 읽기 (항상)
-        try:
-            ina_voltage = self._monitor.read_voltage()
-            ina_current = self._monitor.read_current()
-            soc = self._monitor.get_soc(ina_voltage)
-        except Exception as e:
-            self.get_logger().error(f'INA219 읽기 오류: {e}')
-            return
-
-        # SK120 읽기 (충전 중일 때)
-        if self._charging and self._sk120 is not None:
-            sk_status = self._sk120.get_status()
-            if sk_status is not None:
-                self._sk120_current = sk_status.current_out
-                self._sk120_voltage = sk_status.voltage_out
-                self._fail_count = 0
-                self._pub_iout.publish(Float32(data=sk_status.current_out))
-                self._pub_vout.publish(Float32(data=sk_status.voltage_out))
-                self._pub_iset.publish(Float32(data=sk_status.current_set))
-
-                # ── 실제 충전 전류 감지 체크 ────────────────────────────
-                if sk_status.current_out < self.LOW_CURRENT_THRESHOLD:
-                    self._low_current_count += 1
-                    if self._low_current_count >= self.LOW_CURRENT_MAX_COUNT:
-                        self._handle_low_charge_current(sk_status.current_out)
-                else:
-                    self._low_current_count = 0
-                    self._remember_good_current(sk_status.current_set)
-
-            else:
-                self._fail_count += 1
-                self.get_logger().warn(
-                    f'[SK120 읽기 실패] {self._fail_count}/{self.FAIL_THRESHOLD}회'
-                )
-                if self._fail_count >= self.FAIL_THRESHOLD:
-                    self.get_logger().error('[SK120 연결 끊김] 충전 자동 중지')
-                    self._on_undocked()
-                    return
-
-            self._pub_on.publish(Bool(data=self._charging))
+        if self._sk120 is None:
+            return False
+        acknowledged = self._write('set_output', False)
+        status = self._read_status()
+        if status is not None:
+            self._accept_status(status)
         else:
-            self._pub_on.publish(Bool(data=False))
+            self._invalidate_status()
+        confirmed = acknowledged and status is not None and not status.output_on
+        if not confirmed:
+            self.get_logger().error('[충전 중지] 출력 OFF 미확인; 통신 복구 후 재시도')
+        return confirmed
 
-        # ── /battery_state 구성 ──────────────────────────────────────
+    def _cb_ramp(self):
+        now = time.monotonic()
+        if (not self._charging or not self._ramp_active
+                or self._output_on is not True or self._fail_count
+                or now - self._last_status_at > self._status_interval * 1.5
+                or now - self._changed_at < max(self._ramp_interval, self._settle_interval)
+                or self._good_current_count < self.GOOD_CURRENT_MIN_COUNT
+                or self._low_current_count):
+            return
+        next_i = round(min(self._current_set + self._ramp_step, self._i_target_eff), 3)
+        if not self._write('set_current', next_i):
+            self._write_fail_count += 1
+            if self._write_fail_count >= self.FAIL_THRESHOLD:
+                self._fault_latched = True
+                self._stop_charging()
+            return
+        self._write_fail_count = 0
+        self._current_set = next_i
+        self._changed_at = now
+        self._good_current_count = 0
+        self._good_current_candidate = None
+        self._low_current_count = 0
+        self._ramp_active = next_i < self._i_target_eff
+        self.get_logger().info(f'[램프업] 설정 {next_i:.3f}A (실측값과 구분)')
+
+    def _invalidate_status(self):
+        self._last_status_at = 0.0
+        self._output_on = None
+        self._sk120_current = float('nan')
+        self._sk120_voltage = float('nan')
+        self._good_current_count = 0
+        self._good_current_candidate = None
+        self._low_current_count = 0
+        if self._shutting_down:
+            return
+        self._pub_iout.publish(Float32(data=float('nan')))
+        self._pub_vout.publish(Float32(data=float('nan')))
+        self._pub_iset.publish(Float32(data=float('nan')))
+        self._pub_vin.publish(Float32(data=float('nan')))
+        self._pub_power.publish(Float32(data=float('nan')))
+
+    def _accept_status(self, status):
+        if time.monotonic() - self._last_status_at > self._status_interval * 1.5:
+            self._good_current_count = 0
+            self._good_current_candidate = None
+            self._low_current_count = 0
+        self._last_status_at = time.monotonic()
+        self._output_on = status.output_on
+        self._sk120_current = status.current_out
+        self._sk120_voltage = status.voltage_out
+        if self._shutting_down:
+            return
+        self._pub_on.publish(Bool(data=status.output_on))
+        self._pub_iout.publish(Float32(data=status.current_out))
+        self._pub_vout.publish(Float32(data=status.voltage_out))
+        self._pub_iset.publish(Float32(data=status.current_set))
+        self._pub_vin.publish(Float32(data=status.voltage_in))
+        self._pub_power.publish(Float32(data=status.power_out))
+
+    def _cb_status(self):
+        # Charger protection must run even if I2C fails.
+        if self._sk120_ready:
+            status = self._read_status()
+            if status is None:
+                self._fail_count += 1
+                self._invalidate_status()
+                if self._fail_count >= self.FAIL_THRESHOLD:
+                    self.get_logger().error('[SK120 통신 상실] 충전 중지, 상한 유지')
+                    self._on_undocked()
+            else:
+                self._fail_count = 0
+                self._accept_status(status)
+                if not self._charging and status.output_on:
+                    self._stop_charging()  # Retry an unconfirmed OFF command.
+                elif self._charging:
+                    if not status.output_on:
+                        self.get_logger().warn('[충전 중단] SK120 실측 출력 OFF')
+                        self._fault_latched = True
+                        self._stop_charging()
+                    elif (abs(status.current_set - self._current_set) > 0.002
+                          or abs(status.voltage_set - self._v_set) > 0.02):
+                        self.get_logger().error('[충전 중단] 설정 readback 불일치')
+                        self._fault_latched = True
+                        self._stop_charging()
+                    elif time.monotonic() - self._changed_at >= self._settle_interval:
+                        if status.current_out < self.LOW_CURRENT_THRESHOLD:
+                            self._low_current_count += 1
+                            self._good_current_count = 0
+                            self._good_current_candidate = None
+                            if self._low_current_count >= self.LOW_CURRENT_MAX_COUNT:
+                                self.get_logger().warn(
+                                    f'[SK120 저전류 계측] 입력 {status.voltage_in:.2f}V, '
+                                    f'출력 {status.voltage_out:.2f}V / '
+                                    f'{status.current_out:.3f}A / {status.power_out:.2f}W')
+                                self._handle_low_charge_current(status.current_out)
+                        else:
+                            self._low_current_count = 0
+                            self._remember_good_current(status.current_set)
+        self._publish_sk120_available()
+        voltage = current = float('nan')
+        try:
+            if self._monitor is None:
+                self._monitor = StellaN5Monitor(**self._monitor_options)
+                self.get_logger().info(f'배터리 센서: {self._monitor.sensor_type}')
+            voltage = self._monitor.read_voltage()
+            current = self._monitor.read_current()
+        except Exception as exc:
+            voltage = current = float('nan')
+            self.get_logger().error(f'배터리 센서 읽기 오류: {exc}')
+            if self._charging:
+                self._fault_latched = True
+                self._stop_charging()
+            if self._monitor is not None:
+                try:
+                    self._monitor.close()
+                except OSError:
+                    pass
+                self._monitor = None
+        if self._charging and (not math.isfinite(voltage) or voltage > 25.2 or voltage < 17.5):
+            self.get_logger().error(f'[충전 중단] 배터리 전압 범위 초과: {voltage}')
+            self._fault_latched = True
+            self._stop_charging()
         msg = BatteryState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'battery'
-        msg.capacity = float(self._monitor.CAPACITY_AH)
-        msg.design_capacity = float(self._monitor.CAPACITY_AH)
-        msg.percentage = float(soc / 100.0)
-        msg.present = True
+        msg.voltage = float(voltage)  # Charger terminal voltage is a different circuit.
+        msg.temperature = msg.charge = float('nan')
+        msg.capacity = msg.design_capacity = StellaN5Monitor.CAPACITY_AH
+        msg.percentage = (self._monitor.get_soc(voltage) / 100.
+                          if self._monitor and math.isfinite(voltage) else float('nan'))
+        msg.present = math.isfinite(voltage)
         msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_LIPO
-        msg.power_supply_health = (
-            BatteryState.POWER_SUPPLY_HEALTH_DEAD
-            if ina_voltage < self._monitor.MIN_V
-            else BatteryState.POWER_SUPPLY_HEALTH_GOOD
-        )
-
+        msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
         if self._charging:
-            # 전압: INA219와 SK120 평균 (더 안정적인 배터리 전압 추정)
-            msg.voltage = float((ina_voltage + self._sk120_voltage) / 2.0)
-            # 전류: SK120 실측값 (양수 = 충전)
+            # Compatibility proxy: SK120 output current, NOT proven net battery current.
             msg.current = float(self._sk120_current)
-            msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_CHARGING
+            msg.power_supply_status = (
+                BatteryState.POWER_SUPPLY_STATUS_CHARGING
+                if self._output_on and self._sk120_current >= self.LOW_CURRENT_THRESHOLD
+                else BatteryState.POWER_SUPPLY_STATUS_NOT_CHARGING)
+            if self._output_on is None:
+                msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
         else:
-            # 전압: INA219 직접 측정값
-            msg.voltage = float(ina_voltage)
-            # 전류: INA219 반전 (배터리에 직결하지 않아 방전전류가 양수로 측정됨)
-            msg.current = -float(ina_current)
+            msg.current = -float(current)
             msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
-
+            if (self._output_on is True or not msg.present
+                    or self._output_on is None and self._fault_latched):
+                msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
         self._pub_battery.publish(msg)
-        self.get_logger().debug(
-            f'[배터리] {msg.voltage:.2f}V  {msg.current:+.3f}A  SoC={soc:.1f}%  '
-            f'{"[충전중]" if self._charging else "[방전중]"}'
-        )
 
-    def _remember_good_current(self, current_set: float):
-        """실제 전류가 흐른 설정값만 다음 램프업 상한으로 설정."""
-        good_current = min(round(current_set, 3), round(self._current_set, 3))
-        if good_current <= 0.0:
+    def _remember_good_current(self, current_set):
+        if abs(current_set - self._current_set) > 0.002:
             return
-
-        if (
-            self._good_current_candidate is None
-            or abs(good_current - self._good_current_candidate) > 0.001
-        ):
-            self._good_current_candidate = good_current
-            self._good_current_count = 1
-        else:
-            self._good_current_count += 1
-
+        if self._good_current_candidate != current_set:
+            self._good_current_candidate = current_set
+            self._good_current_count = 0
+        self._good_current_count += 1
         if self._good_current_count >= self.GOOD_CURRENT_MIN_COUNT:
-            self._last_good_current_set = good_current
-            self._ramp_limit = good_current
+            self._last_good_current_set = current_set
+            self._ramp_limit = current_set
 
-    def _handle_low_charge_current(self, measured_current: float):
-        """무선 커플링이 깨진 경우 직전 정상 전류까지만 충전하도록 백오프."""
+    def _handle_low_charge_current(self, measured_current):
         fallback = self._last_good_current_set
-        if fallback is None:
-            fallback = max(self._i_start_raw, self._current_set - self._ramp_step)
-        fallback = round(min(fallback, self._current_set), 3)
-
-        if fallback >= self._current_set - 0.001:
+        if fallback is None or fallback >= self._current_set - 0.001:
             self.get_logger().warn(
-                f'[충전 전류 없음] {measured_current:.3f}A – 직전 정상 전류에서도 '
-                '전류가 없어 충전 중지'
-            )
-            self._stop_charging(reset_ramp_limit=False)
+                f'[저전류 보호] 실측 {measured_current:.3f}A, 복구 가능한 하위 전류 없음 → OFF')
+            self._fault_latched = True
+            self._stop_charging()
             return
-
         self._ramp_limit = fallback
         self._i_target_eff = fallback
-        self._ramp_active = True
-        self._low_current_count = 0
-        self._good_current_candidate = None
-        self._good_current_count = 0
-
-        real_fallback = round(fallback - self._i_offset, 3)
-        real_current = round(self._current_set - self._i_offset, 3)
-        real_restart = round(self._i_start_raw - self._i_offset, 3)
         self.get_logger().warn(
-            f'[충전 전류 없음] {measured_current:.3f}A – {real_current}A에서 '
-            f'커플링 불량 감지, {real_restart}A부터 재시작해 '
-            f'{real_fallback}A까지만 램프업'
-        )
+            f'[저전류 복구] 실측 {measured_current:.3f}A → 설정 상한 {fallback:.3f}A; '
+            '원인은 전류만으로 확정할 수 없음')
+        if not self._configure_output(min(self._i_start_raw, fallback)):
+            self._fault_latched = True
+            self._stop_charging()
+        else:
+            self._ramp_active = self._current_set < fallback
 
-        try:
-            self._sk120.set_output(False)
-            self._sk120.set_voltage(self._v_set)
-            if self._sk120.set_current(self._i_start_raw):
-                self._current_set = self._i_start_raw
-            self._sk120.set_output(True)
-        except Exception as e:
-            self.get_logger().error(f'[충전 복구 실패] SK120 제어 오류: {e}')
-            self._stop_charging(reset_ramp_limit=False)
-
-    # ──────────────────────────────────────────────────────────────────
     def destroy_node(self):
-        self._stop_charging(reset_ramp_limit=True)
-        if self._sk120 is not None:
-            try:
-                self._sk120.close()
-            except Exception:
-                pass
+        self._shutting_down = True
         try:
-            self._monitor.close()
+            self._stop_charging()
         finally:
-            super().destroy_node()
+            self._close_sk120()
+            try:
+                if self._monitor is not None:
+                    self._monitor.close()
+            finally:
+                super().destroy_node()
 
 
 def main(args=None):

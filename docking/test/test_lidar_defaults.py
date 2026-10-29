@@ -129,6 +129,7 @@ def test_runtime_uses_one_tag_approach_and_verified_guide_handoff():
     assert p['start_docking_server'] is False
     assert p['apriltag_front_standoff'] == .95
     assert p['tag_centerline_speed'] == .08
+    assert p['tag_centerline_angular_speed'] == .15
     assert p['tag_refinement_lateral_tolerance'] == .012
     assert p['tag_refinement_yaw_tolerance'] == pytest.approx(math.radians(1))
     assert p['apriltag_front_lateral_offset'] == -.03
@@ -138,5 +139,5 @@ def test_runtime_uses_one_tag_approach_and_verified_guide_handoff():
     assert p['backup_guide_visibility_handoff_clearance'] == .32
     assert p['backup_speed'] == .035
     assert p['backup_guide_center_max_heading'] == pytest.approx(math.radians(2.5))
-    assert p['backup_target_rear_clearance'] == .028
+    assert p['backup_target_rear_clearance'] == .018
     assert p['backup_clearance_tolerance'] == .006

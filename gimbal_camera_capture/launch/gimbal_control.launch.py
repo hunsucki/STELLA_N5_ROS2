@@ -51,7 +51,7 @@ def generate_launch_description():
         DeclareLaunchArgument('right_initial_yaw_deg', default_value='-90.0'),
         DeclareLaunchArgument(
             'right_initial_pitch_deg',
-            default_value='-20.0',
+            default_value='20.0',
         ),
         DeclareLaunchArgument(
             'result_topic',

@@ -63,6 +63,7 @@ dock_turn_backup:
     # The detector and pose bridge are private; no Nav2 docking action runs.
     development_test_mode: true
     start_docking_server: false
+    # 2026-10-27: restore the physically successful trial96 front profile.
     tag_centerline_speed: 0.08
     tag_centerline_angular_speed: 0.15
     tag_centerline_max_travel: 2.0
@@ -74,6 +75,7 @@ dock_turn_backup:
     spin_yaw: 3.071779484  # 176 deg in odom; nominal physical half-turn, verify on robot
     spin_use_lidar_heading: true  # bounded final target from 3 acquisition-time rear panel scans
 
+    # Historical turn distance; front body/visibility guards remain active.
     apriltag_front_standoff: 0.95
     # Station-specific trial calibration after panel-heading fusion (trial84).
     # Trials85..94 repeatedly had less left clearance AFTER the spin. Shift the
@@ -116,11 +118,13 @@ dock_turn_backup:
     lidar_align_tracking_outlier_cycles: 2
     lidar_align_hard_tracking_residual: 0.209439510  # 12 deg
 
-    # 2026-10-12: user-confirmed wireless-pad contact measured at ~28mm
-    # from the body reference to the LiDAR-visible panel (not the pad face).
-    backup_target_rear_clearance: 0.028
+    # 2026-10-16: reduce the previous 28mm target by 10mm, as requested.
+    # Trial02 reached physical contact at ~16mm; the 8mm goal was too close.
+    # Body-reference distance to the LiDAR-visible panel (not the pad face).
+    # Physical clearance and charging improvement need a new docking trial.
+    backup_target_rear_clearance: 0.018
     # Both user-confirmed contact poses vary by several mm between panel
-    # and the wider protective sector. Keep the stop target; accept +/-6mm.
+    # and the wider protective sector. Keep the existing +/-6mm tolerance.
     backup_clearance_tolerance: 0.006
     # Back up slowly enough to stop before a guide rail after a rejected scan.
     backup_speed: 0.035

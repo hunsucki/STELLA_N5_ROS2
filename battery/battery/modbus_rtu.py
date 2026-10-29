@@ -52,7 +52,7 @@ class ModbusRTU:
     """
 
     def __init__(self, port: str, baudrate: int = 9600,
-                 slave_id: int = 1, timeout: float = 1.0):
+                 slave_id: int = 1, timeout: float = 0.25):
         self.slave_id = slave_id
         self._ser = serial.Serial(
             port=port,
@@ -61,6 +61,8 @@ class ModbusRTU:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=timeout,
+            write_timeout=timeout,
+            exclusive=True,
         )
         # Let the line settle
         time.sleep(0.1)
@@ -104,7 +106,8 @@ class ModbusRTU:
             return None
         if not _check_crc(response):
             return None
-        if response[1] != 0x03:
+        if (response[0] != self.slave_id or response[1] != 0x03
+                or response[2] != count * 2):
             return None
 
         values = []
@@ -130,6 +133,4 @@ class ModbusRTU:
             return False
         if not _check_crc(response):
             return False
-        if response[1] != 0x06:
-            return False
-        return True
+        return response == frame

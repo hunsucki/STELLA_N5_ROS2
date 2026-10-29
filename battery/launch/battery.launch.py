@@ -17,6 +17,9 @@ def generate_launch_description():
         DeclareLaunchArgument('current_offset',  default_value='0.0'),
         DeclareLaunchArgument('status_interval', default_value='2.0'),
         DeclareLaunchArgument('poll_interval',   default_value='5.0'),
+        DeclareLaunchArgument('settle_interval', default_value='5.0'),
+        DeclareLaunchArgument('sensor_type',     default_value='auto'),
+        DeclareLaunchArgument('shunt_resistor',  default_value='0.01'),
 
         Node(
             package='battery',
@@ -35,6 +38,9 @@ def generate_launch_description():
                 'current_offset':  LaunchConfiguration('current_offset'),
                 'status_interval': LaunchConfiguration('status_interval'),
                 'poll_interval':   LaunchConfiguration('poll_interval'),
+                'settle_interval': LaunchConfiguration('settle_interval'),
+                'sensor_type':     LaunchConfiguration('sensor_type'),
+                'shunt_resistor':  LaunchConfiguration('shunt_resistor'),
             }],
         ),
     ])

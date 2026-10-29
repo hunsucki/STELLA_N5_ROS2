@@ -13,6 +13,7 @@ Register map (from XY-SK120 documentation):
 """
 
 from dataclasses import dataclass
+import math
 
 from .modbus_rtu import ModbusRTU
 
@@ -66,11 +67,15 @@ class SK120Driver:
     # ------------------------------------------------------------------
     def set_voltage(self, volts: float) -> bool:
         """Set target voltage (V)."""
+        if not math.isfinite(volts) or not 0 <= volts <= 25.2:
+            raise ValueError('Charging voltage outside [0, 25.2] V')
         raw = round(volts * 100)
         return self._bus.write_register(REG_V_SET, raw)
 
     def set_current(self, amps: float) -> bool:
         """Set target current (A)."""
+        if not math.isfinite(amps) or not 0 <= amps <= 1.8:
+            raise ValueError('Charging current outside [0, 1.8] A')
         raw = round(amps * 1000)
         return self._bus.write_register(REG_I_SET, raw)
 
@@ -87,7 +92,7 @@ class SK120Driver:
         if regs is None:
             return None
         onoff_raw = self._bus.read_register(REG_ONOFF)
-        if onoff_raw is None:
+        if onoff_raw not in (0, 1):
             return None
         return SK120Status(
             voltage_set=regs[0] / 100.0,

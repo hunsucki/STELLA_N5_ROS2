@@ -62,7 +62,7 @@ class GimbalControlNode(Node):
         self.declare_parameter('left_initial_yaw_deg', -90.0)
         self.declare_parameter('left_initial_pitch_deg', 20.0)
         self.declare_parameter('right_initial_yaw_deg', 90.0)
-        self.declare_parameter('right_initial_pitch_deg', -20.0)
+        self.declare_parameter('right_initial_pitch_deg', 20.0)
         self.declare_parameter('result_topic', '/gimbal/control/result')
 
         self._timeout = max(

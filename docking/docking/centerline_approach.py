@@ -28,11 +28,16 @@ class TagCenterlineApproach:
         self.pair = (-1, -1)
         self.sequence = 0
         self.target = None
+        self.last_verified_at = None
+        self.panel_recovery_ready = False
+        self.reorientation_anchor = None
+        self.reorientation_used = False
         self.reason = 'waiting for three distinct tag/scan pairs'
 
     def observation(self, standoff):
         """Filter the remembered station in odom at each camera acquisition time."""
         node, motion = self.node, self.node.motion
+        self.panel_recovery_ready = False
         scan = self.centerer.lidar.snapshot()
         if scan is None:
             self.reason = 'tag or front scan missing/stale, or wrong tag frame'
@@ -78,6 +83,7 @@ class TagCenterlineApproach:
             return None
         normal = self.centerer.panel(scan, tag)
         if normal is None:
+            self.panel_recovery_ready = getattr(self.centerer, 'panel_recovery_ready', False)
             self.reason = getattr(self.centerer, 'last_panel_diagnostic', 'invalid front geometry')
             self.observations.clear()
             return None
@@ -143,6 +149,7 @@ class TagCenterlineApproach:
             px, py, yaw = self.station
             c, s = math.cos(yaw), math.sin(yaw)
             self.target = (px-standoff*c+offset*s, py-standoff*s-offset*c, yaw)
+            self.last_verified_at = time.monotonic()
         if self.target is None:
             return None
         tx, ty, yaw = self.target
@@ -151,6 +158,44 @@ class TagCenterlineApproach:
         result = (c*(tx-x)+s*(ty-y), -s*(tx-x)+c*(ty-y),
                   normalize_angle(yaw-motion.current_yaw()))
         return result if all(math.isfinite(v) for v in result) else None
+
+    def reorientation_command(self, now, standoff, axle_x, angular_speed, stationary):
+        """One short zero-linear turn to reacquire a recently verified panel."""
+        node, motion = self.node, self.node.motion
+        tag = node.last_dock_pose
+        clearance = getattr(self.centerer, 'last_front_clearance', math.nan)
+        if (not self.panel_recovery_ready or self.station is None
+                or self.last_verified_at is None or now-self.last_verified_at > 3.
+                or not node._pose_is_fresh(tag, node.last_dock_pose_received_at, .30)
+                or tag.header.frame_id.lstrip('/') != str(node.get_parameter('base_frame').value).lstrip('/')
+                or not math.isfinite(clearance) or clearance < .25
+                or not math.isfinite(tag.pose.position.x) or tag.pose.position.x < standoff+.25):
+            return 0.
+        heading = normalize_angle(self.station[2]-motion.current_yaw())
+        if not math.isfinite(heading):
+            return 0.
+        if self.reorientation_anchor is None:
+            if self.reorientation_used or not stationary or abs(heading) < math.radians(20):
+                return 0.
+            self.reorientation_anchor = (now, motion.current_yaw(),
+                motion.current_integrated_imu_yaw(), motion.current_wheel_yaw())
+            self.reorientation_used = True
+            node.get_logger().warning('Reacquiring front panel: bounded remembered-heading turn; linear speed zero')
+        started, odom, imu, wheel = self.reorientation_anchor
+        changes = [normalize_angle(current-anchor) for current, anchor in zip(
+            (motion.current_yaw(), motion.current_integrated_imu_yaw(), motion.current_wheel_yaw()),
+            (odom, imu, wheel))]
+        if (now-started > 3. or not all(math.isfinite(v) for v in changes)
+                or max(abs(v) for v in changes) > math.radians(15)
+                or max(abs(normalize_angle(changes[0]-v)) for v in changes[1:]) > math.radians(3)
+                or abs(heading) <= math.radians(15)):
+            return 0.
+        limit = min(.10, angular_speed)
+        turn = math.copysign(min(limit, max(.025, .8*(abs(heading)-math.radians(15)))), heading)
+        limited = self.centerer.view_guard.limit(tag, 0., turn, axle_x, max_angular_speed=limit)
+        if limited is None or limited[0] != 0. or limited[1]*heading <= 0.:
+            return 0.
+        return limited[1]
 
     @staticmethod
     def command(errors, axle_x, speed, angular_speed, position_tolerance, yaw_tolerance):
@@ -290,7 +335,6 @@ class TagCenterlineApproach:
                 stationary = (motion.is_stationary(.005)
                               and abs(motion.current_odom_yaw_rate()) <= math.radians(.5))
                 if errors is None or waiting_since is not None:
-                    motion.cmd_vel_pub.publish(motion.twist())
                     stable = 0
                     if waiting_since is None:
                         waiting_since = now
@@ -305,7 +349,12 @@ class TagCenterlineApproach:
                         motion.last_odom_stamp_nanoseconds, motion.last_imu_stamp_nanoseconds,
                         motion.last_wheel_yaw_stamp_nanoseconds), motion_stamps))
                     if errors is None or not stationary or not new_motion:
+                        turn = (self.reorientation_command(now, standoff, axle_x, angular_speed, stationary)
+                                if errors is None and fresh and new_motion else 0.)
+                        motion.cmd_vel_pub.publish(motion.twist(angular_z=turn))
                         continue
+                    motion.cmd_vel_pub.publish(motion.twist())
+                    self.reorientation_anchor = None
                     waited += now-waiting_since
                     waiting_since = None
                     progress_at = now

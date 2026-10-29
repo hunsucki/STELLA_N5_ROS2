@@ -368,7 +368,14 @@ ros2 launch gimbal_camera_capture gimbal_control.launch.py
 ```
 
 기본 시작 위치는 Left yaw `-90.0°`, pitch `20.0°`, Right yaw `-90.0°`,
-pitch `-20.0°`다. 노드는 5초 대기,
+pitch `20.0°`다. 현재 로봇 장착 방향에서는 두 카메라 모두 아래를 본다.
+`robot.launch.py`는 `camera_capture.launch.py`의 시작 각도를 사용하고,
+제어 단독 실행은 `gimbal_control.launch.py`의 시작 각도를 사용한다.
+launch에서 전달하는 파라미터가 `control_node.py`의 `declare_parameter`
+기본값보다 우선하므로 시작 각도를 바꿀 때는 해당 launch 인자를 수정해야 한다.
+초기 각도는 노드 시작 시 적용되므로 파일 수정이나 파라미터 변경만으로
+이미 실행 중인 카메라가 움직이지는 않는다.
+노드는 5초 대기,
 중앙 복귀, 2초 안정화, 절대각 이동 순서로 실행한다. 중앙 복귀와 절대각 명령은
 SIYI ACK를 확인하며, 기본 0.5초 간격으로 최대 4회 시도한다. ACK가 없는
 카메라는 `/gimbal/control/result`에 `success: false`로 기록된다.
@@ -535,7 +542,7 @@ ros2 param get /gimbal_camera_capture camera_2_url
 | `left_initial_yaw_deg` | `-90.0` | Left 시작 yaw 절대각 |
 | `left_initial_pitch_deg` | `20.0` | Left 시작 pitch 절대각 |
 | `right_initial_yaw_deg` | `-90.0` | Right 시작 yaw 절대각 |
-| `right_initial_pitch_deg` | `-20.0` | Right 시작 pitch 절대각 |
+| `right_initial_pitch_deg` | `20.0` | Right 시작 pitch 절대각 |
 | `result_topic` | `/gimbal/control/result` | 제어 결과 JSON 토픽 |
 
 카메라 설치 방향 때문에 움직임이 반대라면 해당 축의 direction만 `-1`로

@@ -114,3 +114,34 @@ def test_missing_or_wrong_front_panel_cannot_silently_use_tag_heading(fault):
     assert 'unverified' in centerer.last_panel_diagnostic
     assert centerer.panel(SimpleNamespace(sequence=1),tag_pose(0.)) is None
     assert 'unverified' in centerer.last_panel_diagnostic
+
+
+@pytest.mark.parametrize('use_panel', [False, True])
+@pytest.mark.parametrize('side', [-1, 1])
+def test_tag_angle_limit_uses_the_selected_heading_source(use_panel, side):
+    panel_angle = side*math.radians(29)
+    tag = tag_pose(side*math.radians(32))
+    points = [SimpleNamespace(x=1.2-math.sin(panel_angle)*u,
+                              y=math.cos(panel_angle)*u)
+              for u in [i*.006 for i in range(-32, 33)]]
+    if use_panel:
+        centerer = fused_centerer(points)
+        assert centerer.panel(SimpleNamespace(sequence=1), tag) == pytest.approx(panel_angle)
+    else:
+        centerer, _ = make_centerer(points)
+        assert centerer.panel(None, tag) is None
+
+
+@pytest.mark.parametrize('fault', ['panel_angle', 'bearing', 'missing_points'])
+def test_panel_mode_still_rejects_unverified_or_out_of_view_geometry(fault):
+    angle = math.radians(32 if fault == 'panel_angle' else 29)
+    tag = tag_pose(math.radians(32))
+    if fault == 'bearing':
+        tag.pose.position.y = tag.pose.position.x*math.tan(math.radians(31))
+    points = [SimpleNamespace(x=tag.pose.position.x-math.sin(angle)*u,
+                              y=tag.pose.position.y+math.cos(angle)*u)
+              for u in [i*.006 for i in range(-32, 33)]]
+    if fault == 'missing_points':
+        points = []
+    centerer = fused_centerer(points)
+    assert centerer.panel(SimpleNamespace(sequence=1), tag) is None

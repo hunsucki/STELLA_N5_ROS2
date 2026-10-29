@@ -1,293 +1,139 @@
 # battery
 
-STELLA N5 로봇의 배터리 모니터링 및 XY-SK120 무선 충전 제어 통합 패키지.
+STELLA N5의 배터리 전압·션트 전류 측정과 XY-SK120 충전 출력을 제어한다.
+`stella_bringup/launch/robot.launch.py`에서 포함하며, `launch_battery`로 실행 여부를 제어한다.
 
-INA219(I2C) 센서로 배터리 상태를 항상 발행하면서, 로봇이 무선 충전 패드에 도킹하면 SK120 모듈을 자동 감지하여 전류 램프업 충전을 수행한다.
+## 센서 및 계측 범위
 
----
+2026-10-16 실물 I2C 확인 결과 주소 `0x40`의 센서는 **INA226**이다.
+제조사 ID `0x5449`, 칩 ID `0x2260`을 확인했다. 기존 문서의 INA219 표기는 잘못됐다.
+`auto`는 INA226 ID를 확인하며, 실제 INA219 장치를 쓰면 `sensor_type:=ina219`를 명시한다.
 
-## 하드웨어 구성
+- INA226: 버스 전압 1.25mV/bit, 부호 있는 션트 전압 2.5µV/bit.
+- INA219: 버스 전압 `(register >> 3) × 4mV`, 션트 전압 10µV/bit.
+- SMBus의 바이트 순서를 변환한 다음 전류의 16비트 부호를 처리한다.
+- 전류 = 션트 전압 / `shunt_resistor` (기본 **0.01Ω**, 실물 저항값 검증 필요).
+- INA 전압과 충전기 단자 전압은 서로 다른 측정점이므로 평균 내지 않는다.
 
-```
-[배터리 (6S LiPo, 13Ah)]
-        │
-        ├─── INA219 (I2C, 0x40) ─── Raspberry Pi (항상 연결)
-        │     shunt: 10mΩ
-        │
-        └─── 부하 (모터, 센서 등)
+기준: [TI INA226 데이터시트](https://www.ti.com/lit/ds/symlink/ina226.pdf),
+[TI INA219 데이터시트](https://www.ti.com/lit/ds/symlink/ina219.pdf).
 
-[무선 충전 TX 코일]
-        │
-        └─── XY-SK120 충전 모듈 ─── USB-TTL (pl2303) ─── /dev/SK120
-              Modbus RTU, 115200bps
+**배터리 순충전 전류를 검증한 구성은 아니다.** 기존 연결 설명상 INA는 부하 측에 있으며,
+충전 중 `/battery_state.current`는 기존 도킹 검증기 호환을 위해 SK120 출력 전류를 사용한다.
+SK120 전류에는 배터리 외 부하로 흐르는 전류가 포함될 수 있다. 배선과 션트 저항을 실측하기 전에는
+이 값을 배터리 순전류·충전량으로 적분하면 안 된다. 방전 중에는 INA 전류의 부호를 반전한다.
+`percentage`도 기존 17.5~25.2V 선형 추정으로, 정확한 6S LiPo 잔량이나 완충 판정이 아니다.
+노드에는 셀별 전압·온도·BMS 정보가 없으므로 팩 보호나 완충 제어를 대신하지 않는다.
 
-[무선 충전 RX 코일] ─── [배터리]
-```
+## 충전 동작
 
-### SK120 배선
+1. SK120 Modbus에 연결하고 기존 출력이 OFF인지 확인한다. 이전 프로세스의 ON 상태를 인계하지 않는다.
+2. ON 명령을 받으면 배터리 전압을 읽고, OFF → 전압/전류 설정 → ON 순서로 명령한다.
+   명령 응답과 출력·설정 레지스터 readback을 확인한 경우에만 세션을 시작한다.
+3. 각 설정 변경 후 `settle_interval`을 기다리고, 같은 설정에서 실제 전류 ≥0.05A를
+   연속 2회 읽었으며 `ramp_interval`도 경과했을 때만 다음 단계로 올린다.
+   기본 주기에서는 한 단계에 보통 8~10초가 걸린다. 목표값은 상한이며 실측 전류를 보장하지 않는다.
+4. 안정화 대기 후 실제 전류 <0.05A가 3회 연속이면 마지막으로 확인된 하위 설정까지만 복구한다.
+   복구 가능한 하위 단계가 없거나 그 단계에서도 전류가 사라지면 OFF한다.
+   이 조건만으로 무선 커플링 불량, 입력 전원 문제, 완충 근접 상태를 구분할 수 없다.
+5. 통신 실패 시 오래된 충전값을 무효화하고 램프업을 멈춘다. 연속 3회 실패하면 OFF를 시도하고
+   포트를 닫아 재연결한다. 통신 장애만으로 물리적 도킹 해제를 단정하거나 전류 상한을 초기화하지 않는다.
+6. I2C 오류에도 SK120 보호 처리는 먼저 수행한다. 센서 오류·전압 범위 이탈·설정 불일치·실측 출력 OFF는
+   충전 세션을 중단한다. OFF 확인 실패는 로그에 남기고 다음 상태 확인에서 재시도한다.
+7. 보호 정지 후 반복 ON으로 자동 재시작하지 않는다. 명시적인 OFF와 출력 OFF 확인 후에만 다시 ON할 수 있다.
+   확인된 전류 상한은 프로세스 생존 기간 유지되며 노드 재시작 시 초기화된다.
 
-| SK120 핀 | USB-TTL 핀 | 비고 |
-|----------|-----------|------|
-| TX       | RXD       | 교차 연결 |
-| RX       | TXD       | 교차 연결 |
-| GND      | GND       | ⚠ GND 루프 주의 (아래 참고) |
-
-> **GND 루프 주의**: USB-TTL GND를 SK120 출력 GND와 공유하면 충전 전류 일부가 TTL선으로 우회하여 SK120이 실제보다 낮은 전류를 인식한다. 이 경우 `current_offset` 파라미터로 보정하거나 USB 아이솔레이터를 사용한다.
-
----
-
-## 패키지 구조
-
-```
-battery/
-├── battery/
-│   ├── battery_status.py   # 통합 노드 (INA219 + SK120 제어)
-│   ├── modbus_rtu.py       # Modbus RTU 통신 (pyserial 기반)
-│   └── sk120_driver.py     # XY-SK120 레지스터 드라이버
-├── launch/
-│   └── battery.launch.py   # 독립 실행용 launch 파일
-├── resource/
-│   └── battery
-├── package.xml
-├── setup.py
-└── README.md
-```
-
-> `robot.launch.py` (stella_bringup)에도 포함되어 있어 별도 실행 없이 로봇 전체 launch 시 자동으로 함께 시작된다.
-> 자동 실행 여부는 `stella_bringup/param/robot_launch_param.yaml`의 `launch_battery`로 제어한다.
-
----
-
-## 동작 흐름
-
-### 상태 전이
-
-```
-[노드 시작]
-    │
-    ▼
- ┌──────────────────────────────────────────────────────────┐
- │  IDLE / 방전 중                                           │
- │  • INA219로 배터리 전압·전류 측정                         │
- │  • /battery_state 발행 (status=DISCHARGING)              │
- │  • 5초마다 SK120 Modbus 연결 시도                        │
- └───────────────────────┬──────────────────────────────────┘
-                         │ SK120 응답 수신
-                         ▼
- ┌──────────────────────────────────────────────────────────┐
- │  AVAILABLE / 도킹 감지됨                                  │
- │  • /sk120/available 발행 (BatteryState status=CHARGING)   │
- │  • INA219 계속 동작 중                                   │
- │  • 충전 명령 대기                                        │
- └───────────────────────┬──────────────────────────────────┘
-                         │ /sk120/cmd_output: true
-                         ▼
- ┌──────────────────────────────────────────────────────────┐
- │  CHARGING / 충전 중                                       │
- │  • SK120 출력 ON                                         │
- │  • 전류 램프업: start_current → target_current           │
- │  • /battery_state 발행 (status=CHARGING)                 │
- │    - voltage: (INA219 + SK120) / 2                      │
- │    - current: SK120 실측값 (양수)                        │
- │  • 충전 전류 감지 체크 (무선 코일 이탈 경고)             │
- └──────────────────────────────────────────────────────────┘
-```
-
-### 충전 종료 조건
-
-| 조건 | 처리 | `_ramp_limit` |
-|------|------|--------------|
-| `/sk120/cmd_output: false` | 충전 중지 | **유지** |
-| SK120 통신 3회 연속 실패 | 충전 중지 + 연결 해제 | **유지** |
-| 도킹 해제 (SK120 전원 꺼짐) | 충전 중지 + 연결 해제 | **초기화** |
-
-### 램프업 중단 보호 로직
-
-무선 충전 특성상 초기 고전류 인가 시 코일이 커플링을 거부할 수 있다. 램프업 중 충전이 중단되면 그 시점의 전류를 `_ramp_limit`에 저장하고, 재충전 시 그 전류까지만 올린다. 로봇이 실제로 도킹 해제(SK120 전원 오프)된 경우에만 초기화된다.
-
-```
-예시:
-  1회 충전: 0.7A → 1.2A 에서 중단
-            _ramp_limit = 1.2A
-
-  2회 충전: 0.7A → 1.2A (이번 세션 상한)
-            _ramp_limit = 1.2A 유지
-
-  도킹 해제 후 재도킹:
-            _ramp_limit = None (초기화)
-
-  3회 충전: 0.7A → 1.8A (전체 램프업 재시작)
-```
-
----
+`/sk120/available`은 기존 Nav2 호환 **통신 가능 신호**이다. 충전기 응답만으로 실제 도킹·입력 전원·충전을
+증명하지 않는다. `/sk120/output_on`은 출력 레지스터 관측값이며 실측 전류와 별도로 확인한다.
 
 ## 토픽
 
-### Subscribe
+| 방향 | 토픽 | 타입 | 의미 |
+| --- | --- | --- | --- |
+| 구독 | `/sk120/cmd_output` | `std_msgs/Bool` | true: 시작, false: 정지 및 확인된 보호 정지 해제 |
+| 발행 | `/battery_state` | `sensor_msgs/BatteryState` | INA 전압, 선형 SoC 추정, 아래 상태와 전류 |
+| 발행 | `/sk120/available` | `sensor_msgs/BatteryState` | present 및 CHARGING=통신 가능, DISCHARGING=미연결 (호환 신호) |
+| 발행 | `/sk120/output_on` | `std_msgs/Bool` | 최근 확인된 출력 레지스터; 읽기 실패 중에는 발행하지 않음 |
+| 발행 | `/sk120/current_set` | `std_msgs/Float32` | 실제 읽은 설정 전류 [A] |
+| 발행 | `/sk120/current_out` | `std_msgs/Float32` | 충전기 실측 출력 전류 [A] |
+| 발행 | `/sk120/voltage_out` | `std_msgs/Float32` | 충전기 실측 출력 전압 [V] |
+| 발행 | `/sk120/voltage_in` | `std_msgs/Float32` | 충전기 실측 입력 전압 [V] |
+| 발행 | `/sk120/power_out` | `std_msgs/Float32` | 충전기 실측 출력 전력 [W] |
 
-| 토픽 | 타입 | 설명 |
-|------|------|------|
-| `/sk120/cmd_output` | `std_msgs/Bool` | `true`: 충전 시작 / `false`: 충전 중지 |
+상태 및 출력 계측은 OFF 상태에서도 계속 갱신한다. 통신 실패 시 전류·전압·설정 토픽은 NaN으로 무효화한다.
+`output_on`은 Bool에 unknown 값이 없으므로 수신자는 마지막 수신 시각도 확인해야 한다.
 
-### Publish
+`/battery_state.power_supply_status`:
 
-| 토픽 | 타입 | 설명 |
-|------|------|------|
-| `/battery_state` | `sensor_msgs/BatteryState` | 배터리 전체 상태 (항상 발행) |
-| `/sk120/available` | `sensor_msgs/BatteryState` | SK120 연결 가능 여부 (도킹 여부). 연결 가능하면 `power_supply_status=CHARGING`, 불가능하면 `DISCHARGING` |
-| `/sk120/output_on` | `std_msgs/Bool` | SK120 출력 ON/OFF 상태 |
-| `/sk120/current_set` | `std_msgs/Float32` | 현재 설정 전류 \[A\] |
-| `/sk120/current_out` | `std_msgs/Float32` | SK120 실측 충전 전류 \[A\] |
-| `/sk120/voltage_out` | `std_msgs/Float32` | SK120 실측 출력 전압 \[V\] |
+- `CHARGING`: 요청 세션 + 최신 출력 ON + SK120 실측 전류 ≥0.05A. 배터리 순전류 검증은 별도다.
+- `NOT_CHARGING`: 세션은 있으나 실측 전류가 기준 미만이다.
+- `DISCHARGING`: 충전 요청 세션이 없고 INA가 정상이다.
+- `UNKNOWN`: 센서 오류, 충전 중 통신 오류, 정지 요청에도 출력 ON이 관측되는 경우.
 
-### `/battery_state` 필드 설명
-
-| 필드 | 방전 중 | 충전 중 |
-|------|---------|---------|
-| `voltage` | INA219 측정값 | (INA219 + SK120) / 2 평균 |
-| `current` | INA219 값 **음수** (방전=음수) | SK120 실측값 **양수** |
-| `percentage` | SoC 0.0 ~ 1.0 | SoC 0.0 ~ 1.0 |
-| `power_supply_status` | `DISCHARGING (2)` | `CHARGING (1)` |
-
-> **전류 부호**: ROS `BatteryState` 관례에 따라 충전=양수, 방전=음수. INA219 shunt는 방전 방향이 양수로 측정되므로 방전 시 부호를 반전하여 발행한다.
-
-### `/sk120/available` 필드 설명
-
-Nav2 docking에서 충전 상태로 인식할 수 있도록 `sensor_msgs/BatteryState` 형식으로 발행한다. 실제 배터리 계측값은 `/battery_state`를 사용하고, `/sk120/available`의 나머지 값들은 더미값으로 채운다.
-
-| SK120 상태 | `power_supply_status` | `present` | `percentage` |
-|------------|------------------------|-----------|--------------|
-| 연결 가능 | `CHARGING (1)` | `true` | `1.0` |
-| 연결 불가 | `DISCHARGING (2)` | `false` | `0.0` |
-
----
+미계측 `temperature`, `charge`와 계측 실패 값은 NaN, `power_supply_health`는 UNKNOWN이다.
+단순히 전압이 정상이라는 이유로 팩 건강 상태를 GOOD으로 단정하지 않는다.
 
 ## 파라미터
 
-| 파라미터 | 기본값 | 설명 |
-|---------|--------|------|
+| 파라미터 | 기본값 | 의미 |
+| --- | --- | --- |
 | `port` | `/dev/SK120` | SK120 시리얼 포트 |
-| `baudrate` | `115200` | 통신 속도 |
-| `slave_id` | `1` | Modbus 슬레이브 ID |
-| `voltage_set` | `25.2` V | SK120 출력 전압 설정 |
-| `start_current` | `0.7` A | 램프업 시작 전류 (실제값) |
-| `target_current` | `1.8` A | 램프업 목표 전류 (실제값) |
-| `ramp_step` | `0.1` A | 램프업 1스텝 증가량 |
-| `ramp_interval` | `5.0` s | 램프업 스텝 주기 |
-| `current_offset` | `0.0` A | GND 루프 보정값 (SK120 설정값 = 실제값 + offset) |
-| `status_interval` | `2.0` s | `/battery_state` 발행 주기 |
-| `poll_interval` | `5.0` s | SK120 도킹 감지 폴링 주기 |
+| `baudrate` | `115200` | 8N1 Modbus RTU |
+| `slave_id` | `1` | Modbus 주소 |
+| `voltage_set` | `25.2` | 출력 전압 [V], 최대 25.2 |
+| `start_current` | `0.1` | 시작 전류 설정 [A] |
+| `target_current` | `1.8` | 전류 설정 상한 [A] |
+| `ramp_step` | `0.1` | 단계 증가량 [A] |
+| `ramp_interval` | `5.0` | 단계 간 최소 간격 [s] |
+| `settle_interval` | `5.0` | 설정 변경 후 안정화 대기 [s] |
+| `current_offset` | `0.0` | 설정에 더할 보정 [A], 실측값에는 적용하지 않음 |
+| `status_interval` | `2.0` | 배터리·출력 계측 주기 [s] |
+| `poll_interval` | `5.0` | 미연결 상태 재시도 주기 [s] |
+| `sensor_type` | `auto` | auto / ina226 / ina219 |
+| `shunt_resistor` | `0.01` | 실제 션트 저항 [Ω] |
 
-> `current_offset`: USB-TTL GND 연결 시 발생하는 GND 루프로 SK120이 실제보다 낮은 전류를 인식하는 경우 보정. 예) 실제 1.6A 목표인데 1.3A로 제한될 경우 `current_offset:=0.3` 설정.
+시작 ≤ 목표이며, 보정을 포함한 설정 전류는 최대 1.8A이다. NaN·음수·잘못된 주기는 시작 시 거부한다.
+파라미터는 시작 시 읽으므로 변경하려면 노드를 재시작한다. 실행 중 설정 변경 요청은 거부한다.
+GND 우회 배선 문제를 전류 보정만으로 해결했다고 판단하지 않는다.
 
----
-
-## 실행
-
-### robot.launch.py와 함께 (권장)
-
-```bash
-source ~/colcon_ws/install/setup.bash
-ros2 launch stella_bringup robot.launch.py
-```
-
-battery 노드가 자동으로 포함된다.
-
-자동 실행을 끄려면 `stella_bringup/param/robot_launch_param.yaml`에서:
-
-```yaml
-launch_battery: false
-```
-
-### 단독 실행
+## 실행 및 점검
 
 ```bash
 source ~/colcon_ws/install/setup.bash
 ros2 launch battery battery.launch.py
-```
+# 실제 INA219로 교체한 경우:
+# ros2 launch battery battery.launch.py sensor_type:=ina219
 
-파라미터 변경 시:
-
-```bash
-ros2 launch battery battery.launch.py \
-  voltage_set:=25.2 \
-  start_current:=0.7 \
-  target_current:=1.8 \
-  current_offset:=0.3
-```
-
----
-
-## 충전 제어
-
-### 충전 시작
-
-도킹 후 `/sk120/available`의 `power_supply_status: 1` (`CHARGING`) 확인 뒤:
-
-```bash
-ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool "data: true"
-```
-
-### 충전 중지
-
-```bash
-ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool "data: false"
-```
-
-### 상태 모니터링
-
-```bash
-# 배터리 전체 상태
+ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool '{data: true}'
 ros2 topic echo /battery_state
-
-# 충전 전류 실시간 확인
 ros2 topic echo /sk120/current_out
-
-# 도킹 여부 확인
-ros2 topic echo /sk120/available
+ros2 topic pub --once /sk120/cmd_output std_msgs/msg/Bool '{data: false}'
 ```
 
----
-
-## 진단 스크립트
-
-아래 스크립트는 현재 `battery` 패키지에 포함된 파일이 아니라, 별도로 둔 현장 진단용 스크립트를 사용하는 예시다.
-
-SK120 연결 문제 발생 시 포트와 보드레이트를 자동 탐색:
-
-```bash
-python3 ~/sk120_diag.py
-```
-
-SK120 충전 시작 단계별 테스트:
-
-```bash
-python3 ~/sk120_charge_test.py
-```
-
----
-
-## 빌드
+같은 포트를 여는 배터리 노드는 하나만 실행한다. pyserial 독점 잠금으로 중복 소유를 방지한다.
+Modbus 응답의 CRC뿐 아니라 슬레이브 주소·바이트 수·쓰기 전체 echo를 검증하며,
+읽기·쓰기 제한 시간은 각각 0.25초이다. 장치가 실제로 응답하지 않으면 OFF를 보장할 수 없고,
+SIGKILL·호스트 전원 상실 시에도 소프트웨어 종료 정리가 실행되지 않는다.
 
 ```bash
 cd ~/colcon_ws
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select battery
-source install/setup.bash
+colcon build --symlink-install --packages-select battery
+# 운영 로봇과 분리한 DDS 도메인에서 모의장치 회귀 테스트
+ROS_DOMAIN_ID=68 colcon test --packages-select battery --return-code-on-test-failure
+colcon test-result --test-result-base build/battery --verbose
 ```
 
----
+## SK120 레지스터
 
-## SK120 Modbus 레지스터 참고
+| 이름 | 주소 | 단위 |
+| --- | --- | --- |
+| V_SET | 0x0000 | 0.01V |
+| I_SET | 0x0001 | 0.001A |
+| VOUT | 0x0002 | 0.01V |
+| IOUT | 0x0003 | 0.001A |
+| POWER | 0x0004 | 0.01W |
+| UIN | 0x0005 | 0.01V |
+| ONOFF | 0x0012 | 0/1 |
 
-| 레지스터 | 주소 | 단위 | 설명 |
-|---------|------|------|------|
-| `REG_V_SET` | `0x0000` | 0.01 V | 출력 전압 설정 |
-| `REG_I_SET` | `0x0001` | 0.001 A | 출력 전류 설정 |
-| `REG_VOUT` | `0x0002` | 0.01 V | 출력 전압 실측 |
-| `REG_IOUT` | `0x0003` | 0.001 A | 출력 전류 실측 |
-| `REG_POWER` | `0x0004` | 0.01 W | 출력 전력 실측 |
-| `REG_UIN` | `0x0005` | 0.01 V | 입력 전압 실측 |
-| `REG_ONOFF` | `0x0012` | 0/1 | 출력 ON/OFF |
-
-통신: Modbus RTU, 115200bps, 8N1, 슬레이브 ID 1
+기존 실물 시험과 이번 점검 기록은 `~/docking_diagnostics/2026-10-16/`에 보관한다.

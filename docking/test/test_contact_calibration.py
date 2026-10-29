@@ -11,9 +11,18 @@ from test_backup_entry_completion import simulation
 ROOT = Path(__file__).parents[1]
 
 
+def recorded_contact_profile():
+    # user79/user80 were captured at the former 28mm contact target.
+    # A later station retune must not reinterpret those fixed sensor samples.
+    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    profile.update(backup_target_rear_clearance=.028,
+                   backup_clearance_tolerance=.006)
+    return profile
+
+
 def test_measured_contact_was_outside_old_goal_and_has_stable_new_support():
     rows = json.loads((ROOT/'test/fixtures/contact_user79.json').read_text())['rows']
-    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    profile = recorded_contact_profile()
     target, tolerance = (profile[k] for k in ('backup_target_rear_clearance', 'backup_clearance_tolerance'))
     counts = []
     for goal, tol in [(.0145, .010), (target, tolerance)]:
@@ -31,9 +40,9 @@ def test_measured_contact_was_outside_old_goal_and_has_stable_new_support():
         target+tolerance, 5, minimum=target-tolerance, minimum_beam_span=6)
 
 
-def test_current_contact_completes_while_stopped_without_more_reverse(simulation):
+def test_recorded_contact_completes_while_stopped_without_more_reverse(simulation):
     motion, state = simulation
-    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    profile = recorded_contact_profile()
     motion.node.parameters.update(profile)
     state.gap = .028
     rows = json.loads((ROOT/'test/fixtures/contact_user79.json').read_text())['rows']
@@ -56,7 +65,7 @@ def test_second_contact_has_no_supported_cluster_with_three_mm_tolerance():
 def test_second_contact_replays_blocked_deadlock_without_extra_motion(
         simulation, old_tolerance, expected):
     motion, state = simulation
-    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    profile = recorded_contact_profile()
     motion.node.parameters.update(profile)
     # Isolate the final distance decision; the real run had already verified
     # guides and committed to straight entry before reaching this position.
@@ -76,7 +85,7 @@ def test_second_contact_replays_blocked_deadlock_without_extra_motion(
 @pytest.mark.parametrize('fault', ['far_panel', 'single_return', 'unsafe_side', 'overrun'])
 def test_contact_tolerance_does_not_accept_unsupported_or_unsafe_contact(simulation, fault):
     motion, state = simulation
-    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    profile = recorded_contact_profile()
     motion.node.parameters.update(profile)
     motion._rear_safety_clearances = lambda _: [(0, .027)]
     if fault == 'unsafe_side':
@@ -91,3 +100,17 @@ def test_contact_tolerance_does_not_accept_unsupported_or_unsafe_contact(simulat
     assert not motion.backup_with_lidar()
     assert state.linear == state.angular == 0
     assert all(v == w == 0 for _, _, _, v, w in state.sent)
+
+
+def test_current_profile_completes_at_its_own_distance_without_historical_samples(simulation):
+    motion, state = simulation
+    profile = yaml.safe_load((ROOT/'config/docking.yaml').read_text())['dock_turn_backup']['ros__parameters']
+    motion.node.parameters.update(profile)
+    motion.node.parameters['use_lidar_guide_centering'] = False
+    state.gap = .040
+    assert motion.backup_with_lidar(), motion.node.get_logger().error.call_args
+    target = profile['backup_target_rear_clearance']
+    tolerance = profile['backup_clearance_tolerance']
+    assert target-tolerance <= state.gap+state.x <= target+tolerance
+    assert any(v < 0 for _, _, _, v, _ in state.sent)
+    assert state.linear == state.angular == 0

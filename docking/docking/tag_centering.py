@@ -79,15 +79,17 @@ class AprilTagCentering:
 
 
     def panel(self, snapshot, tag):
+        self.panel_recovery_ready = False
         if self.lateral_offset() is None:
             self.last_panel_diagnostic = 'Invalid AprilTag front lateral offset (limit +/-0.04m)'
             return None
         heading = apriltag_normal_yaw(tag)
         bearing = math.atan2(tag.pose.position.y, tag.pose.position.x)
+        use_panel_heading = bool(self.node.get_parameter('tag_front_use_lidar_panel_heading').value)
         if (heading is None or not math.isfinite(bearing)
                 or tag.pose.position.x <= 0
                 or abs(bearing) > math.radians(30)
-                or abs(heading) > math.radians(30)):
+                or (not use_panel_heading and abs(heading) > math.radians(30))):
             self.last_panel_diagnostic = (
                 f'AprilTag face normal or forward view is invalid: heading={heading}, '
                 f'bearing={math.degrees(bearing):.2f}deg, tag_x={tag.pose.position.x:.3f}m')
@@ -111,8 +113,14 @@ class AprilTagCentering:
             f'front LiDAR clearance={clearance:.3f}m (minimum {margin:.3f}m)')
         if not math.isfinite(clearance) or clearance < margin:
             return None
-        if bool(self.node.get_parameter('tag_front_use_lidar_panel_heading').value):
-            return self._panel_heading(snapshot, tag, heading, bearing)
+        # In panel mode the paper normal only bounds the point search. The
+        # verified panel normal below supplies the heading and its 30deg limit.
+        if use_panel_heading:
+            normal = self._panel_heading(snapshot, tag, heading, bearing)
+            # Only a failed fit AFTER valid tag/view/front-clearance checks
+            # permits a short remembered-heading reorientation.
+            self.panel_recovery_ready = normal is None
+            return normal
         return heading
 
     def _panel_heading(self, snapshot, tag, tag_heading, bearing):
