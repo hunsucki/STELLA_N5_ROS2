@@ -40,7 +40,10 @@ def add_feedback_fault(motion, state, monkeypatch, sensor, duration,
         imu.header.stamp = motion.node.get_clock().now().to_msg()
         motion._imu_callback(imu)
         if yaw_drift and state.dropouts and state.now-state.dropouts[0] > duration:
-            state.yaw = .05  # Restored motion must not erase this real heading change.
+            # Exceed the unchanged 3deg ceiling. A smaller late change may
+            # fit the measured rectangle; recovery must never reset the anchor
+            # and erase an unsafe change.
+            state.yaw = .06
         return result
     monkeypatch.setattr(rclpy, 'spin_once', spin)
 

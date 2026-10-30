@@ -131,7 +131,7 @@ def test_verified_guide_visibility_handoff(simulation, fault):
                    if state.gap + x < .195 and v < 0)
 
 
-@pytest.mark.parametrize('fault', [None, 'imu_loss', 'yaw_drift', 'overrun', 'odom_loss', 'wheel_loss'])
+@pytest.mark.parametrize('fault', [None, 'imu_loss', 'yaw_drift', 'small_yaw', 'overrun', 'odom_loss', 'wheel_loss'])
 @pytest.mark.parametrize('known_width', [0., .54])
 def test_proactive_straight_entry_ignores_degraded_fits_but_keeps_motion_guards(
         simulation, fault, known_width):
@@ -161,7 +161,9 @@ def test_proactive_straight_entry_ignores_degraded_fits_but_keeps_motion_guards(
     motion.backup_lidar_guide_estimator = guide
     motion.imu_is_fresh = lambda: not (fault == 'imu_loss' and state.gap + state.x < .20)
     motion.current_integrated_imu_yaw = lambda: (
-        math.radians(2) if fault == 'yaw_drift' and state.gap + state.x < .20 else state.yaw)
+        math.radians(3.5 if fault == 'yaw_drift' else 2)
+        if fault in ('yaw_drift', 'small_yaw') and state.gap + state.x < .20
+        else state.yaw)
     motion.odom_is_fresh = lambda: original_odom_fresh() and not (
         fault == 'odom_loss' and state.gap + state.x < .20)
     motion.wheel_yaw_is_fresh = lambda: original_wheel_fresh() and not (
@@ -170,10 +172,13 @@ def test_proactive_straight_entry_ignores_degraded_fits_but_keeps_motion_guards(
         motion._rear_clearances = lambda _: [
             (i, .002 if state.gap + state.x < .20 else state.gap + state.x)
             for i in range(12)]
-    assert motion.backup_with_lidar() is (fault is None)
+    # A late 2deg change fits this measured corridor; an unmeasured station
+    # still uses its symmetric bound. 3.5deg always exceeds the unchanged cap.
+    expected = fault is None or (fault == 'small_yaw' and known_width > 0)
+    assert motion.backup_with_lidar() is expected
     assert not calls_after_commit
     assert state.linear == state.angular == 0
-    if fault is None:
+    if expected:
         assert state.gap + state.x <= .0245
         # No pause to switch strategies; remain in continuous reverse until
         # normal distance completion asks for stationary confirmation.
@@ -318,6 +323,9 @@ def test_measured_corridor_distinguishes_small_gyro_change_from_unsafe_heading(
                             min(limit, math.radians(1)), rear, **kwargs)
 
         monkeypatch.setattr(motion_module, 'straight_entry_heading_budget', old_budget)
+        # This historical comparison predates the near-bound path check.
+        # Keep it symmetric-only so it still exercises that old 1deg cap.
+        monkeypatch.setattr(motion_module, 'straight_entry_path', lambda *args: None)
     motion.current_integrated_imu_yaw = lambda: (
         state.yaw + (math.radians(gyro_delta_deg)
                      if state.gap + state.x < .38 else 0.))

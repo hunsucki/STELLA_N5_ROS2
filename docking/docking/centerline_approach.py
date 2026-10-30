@@ -197,6 +197,25 @@ class TagCenterlineApproach:
             return 0.
         return limited[1]
 
+    def limit_panel_turn(self, errors, linear, angular, axle_x):
+        """Keep far-field lateral approach inside the panel's observed view."""
+        if (not bool(self.node.get_parameter('tag_front_use_lidar_panel_heading').value)
+                or len(self.observations) < 3
+                or front_axle_goal_errors(*errors, axle_x)[0] <= .35):
+            return linear, angular
+        # Use recent acquisition-time normals in odom, not the slower goal
+        # filter. Only limit turns AWAY from the panel normal; retain forward
+        # motion so lateral error can decrease without crossing the 30deg fit
+        # limit. A 27deg working limit reserves margin for motion latency.
+        reference = self.observations[-1][3]
+        measured = reference+statistics.median(
+            normalize_angle(p[3]-reference) for p in self.observations)
+        heading = normalize_angle(measured-self.node.motion.current_yaw())
+        if angular*heading < 0.:
+            away_limit = max(0., (math.radians(27)-abs(heading))/.3)
+            angular = math.copysign(min(abs(angular), away_limit), angular)
+        return linear, angular
+
     @staticmethod
     def command(errors, axle_x, speed, angular_speed, position_tolerance, yaw_tolerance):
         x, y, heading = errors
@@ -374,6 +393,7 @@ class TagCenterlineApproach:
                     break
                 linear, angular = self.command(errors, axle_x, speed, angular_speed,
                                                position_tolerance, yaw_tolerance)
+                linear, angular = self.limit_panel_turn(errors, linear, angular, axle_x)
                 limited = self.centerer.view_guard.limit(node.last_dock_pose, linear, angular,
                                                         axle_x, max_angular_speed=angular_speed)
                 if limited is None:

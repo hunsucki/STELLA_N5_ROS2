@@ -1406,8 +1406,12 @@ class MotionController:
                             known_width=known_guide_width,
                             known_width_uncertainty=known_width_uncertainty)
                         candidate_path = None
-                        if (budget is None and known_guide_width
-                                and clearance <= handoff_clearance):
+                        # Use the same signed full-body corridor throughout a
+                        # measured-width handoff. Initial symmetric heading
+                        # headroom cannot predict which later IMU sample will
+                        # exhaust that bound, even while the body still fits.
+                        # Keep the symmetric fallback if this path is invalid.
+                        if known_guide_width and clearance <= handoff_clearance:
                             candidate_path = straight_entry_path(
                                 corridor_observations, clearance,
                                 guide_body_half_width, guide_side_margin,
