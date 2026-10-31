@@ -444,6 +444,19 @@ class MotionController:
         return ok
 
     def backup_with_lidar(self) -> bool:
+        if self.lidar.snapshot() is None:
+            # A stopped stage transition can race the first delivered scan
+            # after a system-wide pause. Wait for new settled feedback rather
+            # than increasing any sensor age limit or moving on stale data.
+            self.stop_robot()
+            recovery = float(self.node.get_parameter(
+                'backup_motion_feedback_recovery_timeout_sec').value)
+            if (not math.isfinite(recovery) or not 0 < recovery <= 2.5
+                    or not self._wait_for_backup_motion_feedback(
+                        time.monotonic()+recovery, preserve_gyro=False)):
+                self.node.get_logger().error(
+                    'Fresh settled feedback did not recover before LiDAR backup')
+                return False
         if not self.validate_lidar_configuration():
             return False
 
@@ -606,6 +619,7 @@ class MotionController:
         handoff_progress = 0.0
         handoff_lateral_spent = 0.0
         handoff_previous_xy = None
+        handoff_origin_xy = None
         handoff_previous_heading = 0.0
         handoff_station_yaw = 0.0
         handoff_last_clearance = 0.0
@@ -709,26 +723,34 @@ class MotionController:
                     self.current_integrated_imu_yaw() - anchor_gyro)
                 step = math.hypot(current_x-handoff_previous_xy[0],
                                   current_y-handoff_previous_xy[1])
-                # A signed path already includes nominal sideways travel from
-                # its initial tilt. Spend only departures from that fixed ray;
-                # odom and gyro independently bound the additional departure.
                 tracking_yaw = handoff_station_yaw
                 previous, current = handoff_previous_heading, held_heading
+                displacement = None
                 if handoff_path is not None:
                     tracking_yaw -= anchor_heading
                     previous -= anchor_heading
                     current -= anchor_heading
                     handoff_progress += step
-                side_step = abs(
+                side_step = (
                     -(current_x-handoff_previous_xy[0])*math.sin(tracking_yaw)
                     +(current_y-handoff_previous_xy[1])*math.cos(tracking_yaw))
-                handoff_lateral_spent += max(side_step, step * max(
-                    abs(math.sin(previous)), abs(math.sin(current))))
                 if handoff_path is not None:
-                    # Arc length overstates progress along the initial ray;
-                    # charge that difference as additional position uncertainty.
-                    handoff_lateral_spent += step * max(
-                        0., 1-min(math.cos(previous), math.cos(current)))
+                    # Keep observed position signed, but never reclaim its
+                    # uncertainty. Charge disagreement with gyro travel and
+                    # within-step turning as additional uncertainty.
+                    predicted_side = step*.5*(math.sin(previous)+math.sin(current))
+                    handoff_lateral_spent += (
+                        abs(side_step-predicted_side)
+                        + step*.5*abs(math.sin(current)-math.sin(previous))
+                        + step*max(0., 1-min(math.cos(previous), math.cos(current))))
+                    dx = current_x-handoff_origin_xy[0]
+                    dy = current_y-handoff_origin_xy[1]
+                    displacement = (
+                        -dx*math.cos(tracking_yaw)-dy*math.sin(tracking_yaw),
+                        -dx*math.sin(tracking_yaw)+dy*math.cos(tracking_yaw))
+                else:
+                    handoff_lateral_spent += max(abs(side_step), step*max(
+                        abs(math.sin(previous)), abs(math.sin(current))))
                 handoff_previous_xy = (current_x, current_y)
                 handoff_previous_heading = held_heading
                 # The latest rear scan may be slightly older than odometry.
@@ -740,7 +762,7 @@ class MotionController:
                 if handoff_path is not None:
                     path_clearance = handoff_path.clearance(
                         held_heading, handoff_progress, live_remaining,
-                        handoff_lateral_spent)
+                        handoff_lateral_spent, displacement=displacement)
                 elif known_guide_width:
                     heading_budget = remaining_straight_heading_budget(
                         heading_budget, remaining, live_remaining,
@@ -1317,13 +1339,21 @@ class MotionController:
                             guide_entry_verified = False
                             guide_stable_count = 0
                             filtered_guide_center_offset = None
+                            left_angle = getattr(guide, 'left_line_angle', None)
+                            right_angle = getattr(guide, 'right_line_angle', None)
+                            rail_angle_difference = (
+                                abs(left_angle-right_angle)
+                                if left_angle is not None and right_angle is not None
+                                else None)
                             diagnostic = (
                                 f'nearest_side={guide_side_clearance:.3f}m, '
                                 f'required_margin={guide_side_margin:.3f}m, '
                                 f'center_offset={guide_center_offset:+.3f}m, '
                                 f'rear_entry_offset={guide_entry_offset:+.3f}m, '
                                 f'guide_width={guide_separation:.3f}m, '
-                                f'supported_width={supported_guide_width:.3f}m')
+                                f'supported_width={supported_guide_width:.3f}m, '
+                                f'rail_angle_difference={self._format_optional_degrees(rail_angle_difference)}, '
+                                f'known_width_error={self._format_optional_meters(guide_separation-known_guide_width) if known_guide_width else "unavailable"}')
                             guide_clearance_diagnostic = diagnostic
                             if guide_missing_since is None:
                                 guide_missing_since = time.monotonic()
@@ -1428,6 +1458,7 @@ class MotionController:
                                 traveled, self.current_integrated_imu_yaw(),
                                 lidar_heading_error, budget, clearance)
                             handoff_previous_xy = (current_x, current_y)
+                            handoff_origin_xy = (current_x, current_y)
                             handoff_previous_heading = lidar_heading_error
                             handoff_station_yaw = self.current_yaw()+lidar_heading_error
                             handoff_last_clearance = clearance
@@ -1739,11 +1770,12 @@ class MotionController:
         self.stop_robot()
         return False
 
-    def _wait_for_backup_motion_feedback(self, deadline: float) -> bool:
+    def _wait_for_backup_motion_feedback(self, deadline: float, *, preserve_gyro=True) -> bool:
         """Hold zero until new settled motion and three new LiDAR scans arrive.
 
-        Used only after a corridor has been independently verified. Do not
-        replace its IMU heading/travel anchor or extend the backup deadline.
+        During committed entry, preserve continuous gyro tracking and the
+        original deadline/anchor. Before entry there is no corridor anchor;
+        preserve_gyro=False permits recovery while remaining stopped.
         """
         previous = (self.last_odom_stamp_nanoseconds, self.last_imu_stamp_nanoseconds,
                     self.last_wheel_yaw_stamp_nanoseconds)
@@ -1757,7 +1789,7 @@ class MotionController:
             # The committed corridor depends on continuous gyro tracking.
             # Recover absolute encoder/odom delivery, never bridge a lost gyro
             # interval by pretending its unmeasured rotation was zero.
-            if not self.imu_is_fresh():
+            if preserve_gyro and not self.imu_is_fresh():
                 return False
             fresh = (self.odom_is_fresh() and self.imu_is_fresh()
                      and self.wheel_yaw_is_fresh())

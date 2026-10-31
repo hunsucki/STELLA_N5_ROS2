@@ -108,10 +108,15 @@ class StraightEntryPath:
     side_margin: float
     heading_limit: float
 
-    def clearance(self, heading, progress, remaining, deviation=0.):
+    def clearance(self, heading, progress, remaining, deviation=0., *, displacement=None):
         if (not all(math.isfinite(v) for v in (heading, progress, remaining, deviation))
                 or progress < 0 or remaining < 0 or deviation < 0
                 or abs(heading) > self.heading_limit):
+            return -math.inf
+        if displacement is not None and (
+                len(displacement) != 2
+                or not all(math.isfinite(v) for v in displacement)
+                or math.hypot(*displacement) > progress+.003):
             return -math.inf
         worst = 0.
         for center, _, observed_heading in self.observations:
@@ -123,6 +128,12 @@ class StraightEntryPath:
                 for x in (-.2295, .2295):
                     a, b = future-x, self.half_width
                     offset = progress*math.sin(observed_heading)-center
+                    if displacement is not None:
+                        # Measured reverse/left displacement in the initial
+                        # body frame. Its sign is position, not uncertainty.
+                        reverse, left = displacement
+                        offset = (reverse*math.sin(observed_heading)
+                                  + left*math.cos(observed_heading)-center)
                     angles = [low, high]
                     for sign in (-1, 1):
                         critical = math.atan2(a, sign*b)

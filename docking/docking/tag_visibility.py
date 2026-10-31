@@ -59,6 +59,9 @@ class TagVisibilityGuard:
         self.last_reason = 'no rectified CameraInfo received'
         self.last_limited = False
         self.last_log_at = -math.inf
+        self.opposed_yaw_since = None
+        self.opposed_yaw_seen_at = None
+        self.recovering_view = False
         self.subscription = node.create_subscription(
             CameraInfo, str(node.get_parameter('apriltag_view_camera_info_topic').value),
             self._callback, 5)
@@ -118,8 +121,39 @@ class TagVisibilityGuard:
                 raise ValueError(f'tag corners already cropped: bounds={initial}')
             initial_room = clearance(initial)
             if abs(linear) < 1e-10 and abs(angular) < 1e-10:
+                self.opposed_yaw_since = None
                 self.last_reason = 'stationary verification; tag corners visible'
                 return 0., 0.
+
+            motion = getattr(self.node, 'motion', None)
+            observed = math.nan
+            if motion is not None and motion.imu_is_fresh():
+                observed = motion.current_imu_yaw_rate()
+            outward_mismatch = False
+            if (math.isfinite(observed)
+                    and initial_room < fraction*info.width):
+                if (abs(observed) > .025
+                        and observed*angular < 0.):
+                    actual_bounds = image_bounds(
+                        tag, transform, info, size, linear, observed, .25, axle_x)
+                    if clearance(actual_bounds) < initial_room-1:
+                        outward_mismatch = True
+            if outward_mismatch:
+                now = time.monotonic()
+                started = getattr(self, 'opposed_yaw_since', None)
+                seen = getattr(self, 'opposed_yaw_seen_at', None)
+                if started is None or seen is None or now-seen > .3:
+                    started = now
+                self.opposed_yaw_since, self.opposed_yaw_seen_at = started, now
+                if now-started >= .2:
+                    # Command prediction alone assumes the requested turn
+                    # has already taken effect. Trial013's gyro and image
+                    # kept turning outward despite an inward wheel command.
+                    # Settle while still visible; add no blind recovery turn.
+                    self.recovering_view = True
+            else:
+                self.opposed_yaw_since = None
+                self.opposed_yaw_seen_at = None
 
             def safe(v, w):
                 rooms = [initial_room]
@@ -131,6 +165,39 @@ class TagVisibilityGuard:
                 # Retain an existing soft-margin deficit only while recovering.
                 return (min(rooms) >= 0 if initial_room >= 0 else
                         min(rooms) >= initial_room-1 and rooms[-1] > initial_room+1)
+
+            def recenter_command():
+                t = transform.translation
+                axis = rotation(transform.rotation)[:, 2]
+                bearing = math.atan2(tag.pose.position.y-t.y, tag.pose.position.x-t.x)
+                camera_yaw = math.atan2(axis[1], axis[0])
+                error = math.atan2(math.sin(bearing-camera_yaw), math.cos(bearing-camera_yaw))
+                cap = float(self.node.get_parameter('tag_centerline_angular_speed').value)
+                if max_angular_speed is not None:
+                    cap = min(cap, max_angular_speed)
+                if not math.isfinite(cap) or cap <= 0:
+                    raise ValueError('invalid view recovery speed limit')
+                return max(-cap, min(cap, .8*error))
+
+            if getattr(self, 'recovering_view', False):
+                if not math.isfinite(observed):
+                    raise ValueError('fresh IMU required for tag view recovery')
+                # A momentarily zero gyro does not mean the tag is safely
+                # back in view. Keep translation zero until an extra soft
+                # margin is restored; only turn toward the still-visible tag.
+                if initial_room >= fraction*info.width:
+                    self.recovering_view = False
+                else:
+                    still_outward = (abs(observed) > .025 and clearance(image_bounds(
+                        tag, transform, info, size, 0., observed, .25, axle_x)) < initial_room-1)
+                    recovery = recenter_command()
+                    turn = (recovery if not still_outward and abs(recovery) > 1e-4
+                            and safe(0., recovery) else 0.)
+                    self.last_limited = True
+                    self.last_reason = ('waiting for measured outward yaw to settle near image edge'
+                                        if still_outward else 'restoring tag view with zero linear speed')
+                    self.report_limited()
+                    return 0., turn
 
             for factor in (1., .75, .5, .25, 0.):
                 if factor == 0 and abs(linear) < .006 and abs(angular) > 1e-4:
@@ -144,17 +211,7 @@ class TagVisibilityGuard:
                     return linear, angular*factor
             # Recover visibility by facing the tag rather than chasing a
             # nearby virtual point. No translation accompanies this turn.
-            t = transform.translation
-            axis = rotation(transform.rotation)[:, 2]
-            bearing = math.atan2(tag.pose.position.y-t.y, tag.pose.position.x-t.x)
-            camera_yaw = math.atan2(axis[1], axis[0])
-            error = math.atan2(math.sin(bearing-camera_yaw), math.cos(bearing-camera_yaw))
-            cap = float(self.node.get_parameter('tag_centerline_angular_speed').value)
-            if max_angular_speed is not None:
-                cap = min(cap, max_angular_speed)
-            if not math.isfinite(cap) or cap <= 0:
-                raise ValueError('invalid view recovery speed limit')
-            recovery = max(-cap, min(cap, .8*error))
+            recovery = recenter_command()
             if abs(recovery) > 1e-4 and safe(0., recovery):
                 self.last_limited = True
                 self.last_reason = f'recentering tag in view; bounds={tuple(round(v, 1) for v in initial)}'
